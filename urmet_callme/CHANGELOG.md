@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Stable SIP instance id for the 2Voice door helper** - liblinphone was inventing a new
+  `+sip.instance` UUID on every start (its config lives in `/tmp` and is wiped with the container),
+  so each restart *added* a registrar binding instead of replacing ours. Dead contacts lingered for
+  the full expiry and Flexisip forked incoming calls to all of them. The helper now gets a
+  deterministic UUID derived from the account and place, like the Node SIP client already does.
+
 ## 1.0.4
 
 - **Phase-B door-open is audio-only** - 1083/58A-family stations (the `mac` header path) accept an

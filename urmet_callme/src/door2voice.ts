@@ -8,11 +8,24 @@
 // and drive it over stdin -- each press then pays only the call-setup time. opendoor registers once,
 // reads digits ('1' door / '2' gate) from stdin, opens per line, and prints `RESULT <d> ok|fail`.
 import { ChildProcess, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { Place } from "./callme.js";
 import { logger } from "./logger.js";
 
 const log = logger("door2voice");
+
+/** A stable RFC 5626 instance id for a place's opendoor helper. liblinphone otherwise invents a
+ *  random one per run (its config lives in a /tmp dir the container wipes), so each restart ADDED a
+ *  binding to the shared account rather than replacing ours, and the registrar kept forking calls to
+ *  the dead ones until they expired. Same trick as SipClient's instance(): derive it from the
+ *  account so it survives restarts. */
+function instanceUuid(user: string, placeId: string): string {
+  const h = createHash("md5")
+    .update(`urmet-opendoor:${user}:${placeId}`)
+    .digest("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
 
 const DIGIT: Record<"door" | "gate", string> = { door: "1", gate: "2" };
 // Per-open wait for opendoor's RESULT line. opendoor's own worst case (no media) is ~40 s, so give a
@@ -147,6 +160,7 @@ export class TwoVoiceService {
         OPENDOOR_DATA_DIR: dataDir,
         OPENDOOR_KEEPALIVE_MS: String(this.keepaliveMs),
         OPENDOOR_PREWARM_HOLD_MS: String(this.prewarmHoldMs),
+        OPENDOOR_UUID: instanceUuid(p.incomingUser, p.id),
         ...(mac ? { OPENDOOR_MAC: mac } : {}),
       },
       stdio: ["pipe", "pipe", "inherit"],

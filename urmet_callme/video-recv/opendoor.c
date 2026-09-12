@@ -21,6 +21,7 @@
  *
  * Usage: opendoor <in-username> <in-password> <out-sip-uri> <dtmf-digit>
  *   env: OPENDOOR_DATA_DIR (writable, unique per place - liblinphone's sqlite/config),
+ *        OPENDOOR_UUID (stable +sip.instance id, so a restart REPLACES our registrar binding),
  *        OPENDOOR_TIMEOUT (overall seconds, default 40), OPENDOOR_DEBUG=1 (SIP trace).
  * Targets the same liblinphone C API (Debian trixie: liblinphone-dev) as recv.c.
  */
@@ -527,6 +528,16 @@ int main(int argc, char **argv) {
   /* The station's TLS cert chain isn't ours to validate. */
   linphone_core_verify_server_certificates(lc, FALSE);
   linphone_core_verify_server_cn(lc, FALSE);
+
+  /* STABLE RFC 5626 instance id. liblinphone keeps its `+sip.instance` UUID in `[misc] uuid` and
+   * generates a random one when it is missing -- and our config lives in a per-place /tmp dir that
+   * the container wipes, so every restart registered a NEW binding on the shared account instead of
+   * replacing the old one. They then linger for the full 3600s expiry, and the registrar forks
+   * incoming calls to all of them. A caller-supplied, deterministic uuid makes re-registration
+   * replace our own binding. Must be set BEFORE linphone_core_start. */
+  const char *uuid = getenv("OPENDOOR_UUID");
+  if (uuid && *uuid)
+    linphone_config_set_string(linphone_core_get_config(lc), "misc", "uuid", uuid);
 
   linphone_core_start(lc);
 
