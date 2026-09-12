@@ -137,9 +137,9 @@ export class CallMe {
   async connect(): Promise<this> {
     log.info(`connecting: cloud login as ${this.email}`);
     const cloud = new Cloud();
-    await cloud.login(this.email, this.password);
-    log.info("cloud login OK; fetching SIP account (sipdata)");
-    this.instance = await cloud.sipAccount();
+    // login + sipdata, with a retry for the transient post-(re)install 302 (see loginAndSipAccount).
+    this.instance = await cloud.loginAndSipAccount(this.email, this.password);
+    log.info("cloud login OK; SIP account fetched (sipdata)");
     this.realm = this.instance.realm;
     log.info(
       `SIP account = ${this.instance.username} (pw ${redact(this.instance.password)}) realm ${this.realm}`,

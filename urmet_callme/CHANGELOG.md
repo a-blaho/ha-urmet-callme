@@ -1,12 +1,17 @@
 # Changelog
 
-## Unreleased
+## 1.0.5
 
-- **Stable SIP instance id for the 2Voice door helper** - liblinphone was inventing a new
+- **Stable SIP instance id for the liblinphone helpers** - liblinphone was inventing a new
   `+sip.instance` UUID on every start (its config lives in `/tmp` and is wiped with the container),
   so each restart *added* a registrar binding instead of replacing ours. Dead contacts lingered for
-  the full expiry and Flexisip forked incoming calls to all of them. The helper now gets a
-  deterministic UUID derived from the account and place, like the Node SIP client already does.
+  the full expiry and Flexisip forked incoming calls to all of them. Both the 2Voice door helper
+  (`opendoor`) and, with video on, the media receiver (`recv`) now get a deterministic UUID derived
+  from the account, like the Node SIP client already does - and the two use distinct ids so the door
+  and video helpers on a shared 2Voice account never displace each other's binding.
+- **No more fatal `sipdata HTTP 302` on start** - right after a (re)install the SIP-data fetch could
+  redirect before the login session settled, and the add-on treated it as fatal. It now re-logs in
+  and retries a couple of times, so it rides out the transient case instead of needing a restart.
 
 ## 1.0.4
 

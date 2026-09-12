@@ -615,6 +615,7 @@ int main(int argc, char **argv) {
             "  env (set by src/video.ts): RECV_H264_OUT=<fifo> (default /tmp/cam.h264), "
             "RECV_AUDIO_OUT=<fifo> (default /tmp/cam_audio.pcm; s16le 8k mono), "
             "RECV_DATA_DIR=<dir> (per-recv, MUST be unique), "
+            "RECV_UUID=<uuid> (stable +sip.instance id so a restart replaces our binding), "
             "RECV_HANGUP_URL=<url> (gateway cancel on idle), "
             "RECV_IDLE_SECONDS=<n> (default 10)\n"
             "  dev-only: RECV_SECONDS=<n> (auto-stop), RECV_DEBUG=1 (SIP trace)\n",
@@ -707,6 +708,16 @@ int main(int argc, char **argv) {
   /* The panel's TLS cert chain isn't ours to validate; don't block the spike on it. */
   linphone_core_verify_server_certificates(lc, FALSE);
   linphone_core_verify_server_cn(lc, FALSE);
+
+  /* STABLE RFC 5626 instance id (same fix as opendoor.c). liblinphone stores its `+sip.instance`
+   * UUID in `[misc] uuid` and mints a random one when it is absent -- and our config lives in a
+   * per-recv /tmp dir the container wipes, so each restart/recall registered a NEW binding on the
+   * account instead of replacing the old one. On the shared 2Voice account (also holding opendoor +
+   * phones) those stale bindings linger for the full expiry and the registrar forks calls to them.
+   * RECV_UUID is a caller-supplied deterministic id (distinct from opendoor's), set BEFORE start. */
+  const char *rid = getenv("RECV_UUID");
+  if (rid && *rid)
+    linphone_config_set_string(linphone_core_get_config(lc), "misc", "uuid", rid);
 
   linphone_core_start(lc);
 

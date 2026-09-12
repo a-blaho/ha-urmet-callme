@@ -15,7 +15,7 @@ import { createServer, Server } from "node:http";
 import { Place } from "./callme.js";
 import { macHeaderOf } from "./door2voice.js";
 import { logger } from "./logger.js";
-import { Go2rtcPorts, webrtcListen } from "./video.js";
+import { Go2rtcPorts, deterministicUuid, webrtcListen } from "./video.js";
 
 const log = logger("video2v");
 const GO2RTC_CFG = "/tmp/go2rtc.yaml"; // only ONE video service runs at a time (see index.ts)
@@ -134,6 +134,9 @@ export class TwoVoiceVideoService {
         ...process.env,
         RECV_CALL_URI: `sip:${cam.place.outgoingUser}@${this.realm}`, // OUTGOING auto_insertion target
         ...(mac ? { RECV_MAC: mac } : {}), // 58A: dial with `mac` instead of `auto_insertion`
+        // Stable instance id, DISTINCT from opendoor's (which registers the same channel account for
+        // door-open) so the two helpers hold separate bindings instead of replacing each other.
+        RECV_UUID: deterministicUuid(`urmet-recv:${cam.place.incomingUser}:${cam.place.id}`),
         RECV_TARGET_FILE: targetFile, // line 0 = H.264 FIFO, line 1 = PCM FIFO
         RECV_DATA_DIR: dataDir,
         RECV_IDLE_SECONDS: String(RECV_IDLE_SECONDS),

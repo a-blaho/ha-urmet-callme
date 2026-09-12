@@ -11,6 +11,7 @@
 // The door station serves ~one video call at a time, so switching cameras BYEs the current call
 // then re-calls on the same account. See ../video-recv/INTEGRATION.md.
 import { ChildProcess, execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, Server } from "node:http";
 import { AvailableDevice, CallMe } from "./callme.js";
@@ -19,6 +20,16 @@ import { logger } from "./logger.js";
 
 const log = logger("video");
 const GO2RTC_CFG = "/tmp/go2rtc.yaml";
+
+/** A stable RFC 5626 `+sip.instance` UUID derived from `seed`, so a liblinphone helper keeps the
+ *  SAME instance id across restarts (its `/tmp` config is wiped with the container). Without this a
+ *  restart/recall ADDS a registrar binding instead of replacing ours, and the registrar forks calls
+ *  to the stale ones until they expire (see recv.c / opendoor.c). Callers pass distinct seeds
+ *  (`urmet-recv:...` vs `urmet-opendoor:...`) so co-registered helpers never collide. */
+export function deterministicUuid(seed: string): string {
+  const h = createHash("md5").update(seed).digest("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
 
 /** Ports the embedded go2rtc binds. Configurable so the add-on can coexist with a user's OWN go2rtc
  *  add-on (which typically owns 1984/8554/8555). Under host networking these bind directly on the
@@ -229,6 +240,9 @@ export class VideoService {
         ...process.env,
         RECV_TARGET_FILE: TARGET_FILE, // per-call output FIFOs (line 0 = H.264, line 1 = PCM)
         RECV_DATA_DIR: dataDir,
+        // Stable instance id: this single recv registers account B across respawns/camera switches;
+        // without it each restart would leave a stale binding on B (see deterministicUuid).
+        RECV_UUID: deterministicUuid(`urmet-recv:${this.sharedBUser}`),
         // No cam index: there's one call at a time; the handler maps these to the current slotHolder.
         RECV_HANGUP_URL: `http://127.0.0.1:${this.callPort}/hangup`,
         RECV_CONNECTED_URL: `http://127.0.0.1:${this.callPort}/connected`,
