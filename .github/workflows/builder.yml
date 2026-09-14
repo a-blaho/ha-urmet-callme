@@ -39,6 +39,12 @@ jobs:
           v=$(grep -E '^version:' urmet_callme/config.yaml | sed -E 's/^version:[[:space:]]*"?([^"]+)"?.*/\1/')
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Building version: $v"
+          # A v* tag must name the version in config.yaml: the image tag the Supervisor pulls
+          # comes from config.yaml, so a mismatched git tag would publish under the wrong version.
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$v" ]]; then
+            echo "::error::git tag ${GITHUB_REF#refs/tags/} does not match config.yaml version $v"
+            exit 1
+          fi
 
       - name: Prepare build matrix
         id: matrix

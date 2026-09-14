@@ -8,11 +8,11 @@
 // and drive it over stdin -- each press then pays only the call-setup time. opendoor registers once,
 // reads digits ('1' door / '2' gate) from stdin, opens per line, and prints `RESULT <d> ok|fail`.
 import { ChildProcess, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { Place } from "./callme.js";
 import { logger } from "./logger.js";
 import { waitForExit } from "./proc.js";
+import { sanitize, stableUuid } from "./util.js";
 
 const log = logger("door2voice");
 
@@ -21,20 +21,14 @@ const log = logger("door2voice");
  *  binding to the shared account rather than replacing ours, and the registrar kept forking calls to
  *  the dead ones until they expired. Same trick as SipClient's instance(): derive it from the
  *  account so it survives restarts. */
-function instanceUuid(user: string, placeId: string): string {
-  const h = createHash("md5")
-    .update(`urmet-opendoor:${user}:${placeId}`)
-    .digest("hex");
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
-}
+const instanceUuid = (user: string, placeId: string) =>
+  stableUuid(`urmet-opendoor:${user}:${placeId}`);
 
 const DIGIT: Record<"door" | "gate", string> = { door: "1", gate: "2" };
 // Per-open wait for opendoor's RESULT line. opendoor's own worst case (no media) is ~40 s, so give a
 // little more before we give up on the reply (the helper stays alive regardless -- no kill needed).
 const OPEN_TIMEOUT_MS = 45000;
 const RESPAWN_MS = 3000; // auto-restart a helper that died (e.g. registration dropped)
-
-const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9_]/g, "_");
 
 /** The station's MAC in `mac`-header form (colons), when its account IS a MAC. Those are the "phase B"
  *  devices (the 1083/58A family): the cloud does not list them, the app builds their account from the

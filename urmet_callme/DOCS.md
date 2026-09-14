@@ -1,6 +1,6 @@
 # Urmet CallMe (Unofficial) - Home Assistant Add-on
 
-Unlock Urmet **CallMe** (Ipercom) doors from Home Assistant, get doorbell-ring events, and
+Unlock Urmet **CallMe** (Ipercom and 2Voice) doors from Home Assistant, get doorbell-ring events, and
 (optionally) stream the entrance cameras. It logs into the Urmet cloud with your app credentials,
 **auto-discovers your entrances**, and exposes each door/gate as a Home Assistant `button` entity
 via MQTT. Door-open + doorbell are pure TypeScript/Node; the optional **video** feature embeds

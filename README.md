@@ -65,6 +65,20 @@ repository.yaml      HA add-on repository descriptor
 LICENSE              GPLv3
 ```
 
+## Development
+
+```bash
+cd urmet_callme && npm ci
+npm run typecheck   # tsc over src/ including the tests
+npm test            # node:test unit tests (src/**/*.test.ts, not shipped in the image)
+npm run build       # dist/ as the image builds it
+```
+
+CI (`.github/workflows/ci.yml`) runs those plus a compile of the two liblinphone helpers on Ubuntu
+24.04, a config.yaml/package.json/CHANGELOG version check and shellcheck, on every pull request and
+push to `main`. Images are built and pushed only by a `v<version>` tag (`builder.yml`), which must
+match `config.yaml`. To try a change on your own Home Assistant first, see `urmet_callme/deploy-local.sh`.
+
 ## License
 
 This project is licensed **GPL-3.0-or-later** (see [LICENSE](LICENSE)) - the video path links
@@ -74,7 +88,7 @@ grants no rights to, Urmet's application or intellectual property.
 ### Third-party components (bundled in the built image)
 
 The container image installs these unmodified from the distribution / upstream at build time; their
-source is available from the upstreams below (and, for the Debian packages, from Debian's source
+source is available from the upstreams below (and, for the Ubuntu packages, from Ubuntu's source
 mirrors):
 
 - **liblinphone / mediastreamer2 / ortp / belle-sip / bctoolbox** - GPLv3 - https://gitlab.linphone.org/BC/public

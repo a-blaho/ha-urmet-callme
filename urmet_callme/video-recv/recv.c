@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later (links liblinphone, GPLv3) */
 /*
  * recv.c - the embedded liblinphone media receiver. SHIPPED: compiled into the add-on's video
- * image (see ../Dockerfile) and spawned per camera by src/video.ts (the VideoService).
+ * image (see ../Dockerfile) and spawned ONCE by src/video.ts (the VideoService): a single
+ * receiver serves every camera, one call at a time.
  *
  * liblinphone (mediastreamer2) is the ONLY stack that made the Urmet relay actually stream the
  * panel's H.264 - pure-Node and baresip both got 0 media. So the
- * media leg embeds real liblinphone here, driven by the Node/TS control plane. Per camera, this
- * program registers a dedicated SIP account B, auto-answers the panel's INVITE, and taps the
+ * media leg embeds real liblinphone here, driven by the Node/TS control plane. This program
+ * registers the shared dedicated SIP account B, auto-answers the panel's INVITE, and taps the
  * received media WITHOUT decoding/re-encoding:
  *   - H.264: a custom mediastreamer "decoder" filter depacketizes (rfc3984) to Annex-B and
  *     writes the byte stream to a FIFO (RECV_H264_OUT).
@@ -20,7 +21,7 @@
  * reader for RECV_IDLE_SECONDS) plus a gateway cancel_call_req curled via RECV_HANGUP_URL.
  *
  * Usage: recv <B-username> <B-password>   (see the env vars documented at main()).
- * Targets the liblinphone C API on Debian trixie (liblinphone-dev + mediastreamer2-plugin-openh264).
+ * Targets the liblinphone C API on Ubuntu 24.04 (liblinphone-dev + mediastreamer2-plugin-openh264).
  */
 #include <linphone/core.h>
 #include <mediastreamer2/msfilter.h>

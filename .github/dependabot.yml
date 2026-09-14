@@ -1,0 +1,20 @@
+# Keeps the small dependency surface current: the control plane's npm deps, the workflow actions,
+# and the base image. go2rtc is NOT covered here (it is pinned by version + sha256 in the Dockerfile
+# and must be bumped deliberately, see the comment there).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /urmet_callme
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-and-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /urmet_callme
+    schedule:
+      interval: monthly

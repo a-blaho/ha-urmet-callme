@@ -26,6 +26,31 @@ export function familyOf(uidType: string): Family {
   return "unknown";
 }
 
+/** The entrances in a `configuration_read` / `residentDoors` reply. The inner `response` is a JSON
+ *  STRING on real gateways (the app double-decodes it) but an object on some firmware, so both are
+ *  accepted. An entry with neither door_name nor gate_name is still listed (it can still ring). */
+export function parseDoors(reply: any, placeId: string): Door[] {
+  const doors: Door[] = [];
+  for (const item of reply?.data?.response ?? []) {
+    if (item.type !== "residentDoors") continue;
+    const inner =
+      typeof item.response === "string"
+        ? JSON.parse(item.response)
+        : item.response;
+    for (const d of inner ?? []) {
+      doors.push({
+        placeId,
+        doorId: d.id,
+        name: d.device_name,
+        hasDoor: !!d.door_name,
+        hasGate: !!d.gate_name,
+        topology: d.device_topology || "",
+      });
+    }
+  }
+  return doors;
+}
+
 /** Options for a device (camera) call/cancel request. */
 interface DeviceCallOpts {
   topologicalCode: string;
@@ -522,25 +547,7 @@ export class CallMe {
     });
     if (reply?.result !== 0)
       throw new Error(`list_doors failed: ${JSON.stringify(reply)}`);
-    const doors: Door[] = [];
-    for (const item of reply.data?.response ?? []) {
-      if (item.type !== "residentDoors") continue;
-      const inner =
-        typeof item.response === "string"
-          ? JSON.parse(item.response)
-          : item.response;
-      for (const d of inner) {
-        doors.push({
-          placeId: place.id,
-          doorId: d.id,
-          name: d.device_name,
-          hasDoor: !!d.door_name,
-          hasGate: !!d.gate_name,
-          topology: d.device_topology || "",
-        });
-      }
-    }
-    return doors;
+    return parseDoors(reply, place.id);
   }
 
   /** List the place's callable devices (cameras, intercoms) via get_available_devices_req.
@@ -598,7 +605,8 @@ export class CallMe {
         vds_types: opts.vdsTypes ?? "",
       },
     });
-    log.info(`${typeReq} -> ${gw}: ${JSON.stringify(body)}`);
+    log.info(`${typeReq} -> ${gw}`);
+    log.debug(`${typeReq} body: ${JSON.stringify(body)}`);
     // Reply (for call_device_req) is the panel's INVITE, not a correlated MESSAGE, so don't
     // wait for one - just confirm the send.
     const { status } = await this.sip.sendCallme(gw, body, false);

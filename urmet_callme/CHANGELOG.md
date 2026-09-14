@@ -31,6 +31,11 @@
   process exits. Previously the exit raced both: entities could stay "available" after a stop, and
   an un-BYE'd camera call stayed busy on the panel until its session timer.
 
+- Camera/door request bodies are now logged at `debug` (the `info` line keeps only the request type
+  and gateway).
+- Repo: CI on pull requests and pushes (type-check, unit tests, helper compile, version/changelog
+  and shellcheck guards), a release-tag/version guard, Dependabot, and the first unit tests.
+
 - **Hardened the embedded go2rtc** - with video on, its API listens on the host network without a
   password (the WebRTC card cannot send one), and a bare go2rtc API lets anyone on the LAN run a
   command inside the add-on (an `exec:`/`echo:` stream). go2rtc now loads only the modules the add-on

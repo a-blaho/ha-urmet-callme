@@ -1,0 +1,68 @@
+name: CI
+
+# Runs on every pull request and push to main (the release build in builder.yml only runs on a
+# v* tag, so without this a broken commit was first noticed when tagging a release).
+#   - control plane: install, type-check (tests included), unit tests, production build
+#   - helpers: compile recv.c / opendoor.c against the same liblinphone the image uses (Ubuntu 24.04)
+#   - repo checks: add-on version == package.json version, a changelog entry exists for it,
+#     shellcheck on the two shell scripts
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  control-plane:
+    name: Type-check, test, build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: urmet_callme
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # same major as the image (nodesource setup_22.x)
+          cache: npm
+          cache-dependency-path: urmet_callme/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  helpers:
+    name: Compile liblinphone helpers
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: urmet_callme
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install liblinphone-dev (the image's Ubuntu 24.04 packages)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config liblinphone-dev
+      - name: Compile recv and opendoor (same flags as the Dockerfile)
+        run: |
+          cc -O2 -Wall video-recv/recv.c -llinphone -lbctoolbox -lbellesip -lmediastreamer -lortp -o /tmp/recv
+          cc -O2 -Wall video-recv/opendoor.c -llinphone -lbctoolbox -lbellesip -lmediastreamer -lortp -o /tmp/opendoor
+
+  repo-checks:
+    name: Version, changelog, shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add-on version matches package.json and has a changelog entry
+        run: |
+          cfg=$(grep -E '^version:' urmet_callme/config.yaml | sed -E 's/^version:[[:space:]]*"?([^"]+)"?.*/\1/')
+          pkg=$(node -p "require('./urmet_callme/package.json').version")
+          echo "config.yaml: $cfg  package.json: $pkg"
+          [ "$cfg" = "$pkg" ] || { echo "::error::config.yaml version ($cfg) != package.json version ($pkg)"; exit 1; }
+          grep -qE "^## $cfg\$" urmet_callme/CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md has no '## $cfg' section"; exit 1; }
+      - name: shellcheck
+        run: shellcheck -S warning urmet_callme/stream.sh urmet_callme/deploy-local.sh

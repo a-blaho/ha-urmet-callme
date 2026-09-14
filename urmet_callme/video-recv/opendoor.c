@@ -23,7 +23,7 @@
  *   env: OPENDOOR_DATA_DIR (writable, unique per place - liblinphone's sqlite/config),
  *        OPENDOOR_UUID (stable +sip.instance id, so a restart REPLACES our registrar binding),
  *        OPENDOOR_TIMEOUT (overall seconds, default 40), OPENDOOR_DEBUG=1 (SIP trace).
- * Targets the same liblinphone C API (Debian trixie: liblinphone-dev) as recv.c.
+ * Targets the same liblinphone C API (Ubuntu 24.04: liblinphone-dev) as recv.c.
  */
 #include <linphone/core.h>
 #include <mediastreamer2/msfilter.h>

@@ -1,7 +1,7 @@
 #include <tunables/global>
 
 # AppArmor profile for the Urmet CallMe add-on. The profile name MUST match the add-on slug.
-# The image is a plain Debian base with tini as init (config.yaml init: true). The control plane is
+# The image is a plain Ubuntu 24.04 base with tini as init (config.yaml init: true). The control plane is
 # Node.js, which spawns ffmpeg, go2rtc and the liblinphone helpers (recv, opendoor). Those children
 # run under this same profile (ix = inherit), so the confinement applies to the whole process tree.
 # It is intentionally permissive on files/network/capabilities (the add-on needs outbound TLS/SIP,

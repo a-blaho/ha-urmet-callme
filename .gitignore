@@ -1,3 +1,11 @@
 node_modules
 dist
 .dev-data
+
+# Safety net: the reverse-engineering material lives in a separate repo and is Urmet IP.
+*.apk
+*.xapk
+callme/
+# macOS
+.DS_Store
+._*

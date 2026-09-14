@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test \"src/**/*.test.ts\"",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "deploy": "./deploy-local.sh"

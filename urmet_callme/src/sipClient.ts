@@ -4,6 +4,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as tls from "node:tls";
 import { logger } from "./logger.js";
+import { stableUuid } from "./util.js";
 
 const log = logger("sip");
 
@@ -215,10 +216,8 @@ export class SipClient {
   }
   /** Stable per-account instance UUID (RFC 5626). */
   private instance(): string {
-    if (!this.instanceId) {
-      const h = md5(`urmet-callme:${this.username}`);
-      this.instanceId = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
-    }
+    if (!this.instanceId)
+      this.instanceId = stableUuid(`urmet-callme:${this.username}`);
     return this.instanceId;
   }
   private via(branch: string) {
