@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { Place } from "./callme.js";
 import { logger } from "./logger.js";
+import { waitForExit } from "./proc.js";
 
 const log = logger("door2voice");
 
@@ -264,8 +265,11 @@ export class TwoVoiceService {
     return true;
   }
 
-  stop(): void {
+  /** Stop every helper; resolves once they exited (opendoor BYEs a held keep-alive/pre-warm call
+   *  on the way out) or after a bounded wait. */
+  async stop(): Promise<void> {
     this.stopping = true;
+    const children: ChildProcess[] = [];
     for (const h of this.helpers.values()) {
       for (const p of h.pending) clearTimeout(p.timer);
       h.pending = [];
@@ -276,7 +280,9 @@ export class TwoVoiceService {
         /* ignore */
       }
       h.child?.kill("SIGTERM");
+      if (h.child) children.push(h.child);
     }
     this.helpers.clear();
+    await Promise.all(children.map((c) => waitForExit(c, 2500)));
   }
 }

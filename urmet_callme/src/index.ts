@@ -257,35 +257,35 @@ async function main() {
     log.warn(`ingress panel failed to start: ${(e as Error).message}`);
   }
 
-  // Single shutdown path (video children first so recv/go2rtc get SIGTERM, then MQTT). One set
-  // of handlers avoids the earlier bug where the MQTT handler's process.exit() pre-empted the
+  // Single shutdown path, ORDERED and AWAITED: the helpers get SIGTERM and a bounded moment to send
+  // their in-dialog BYEs (a call left un-BYE'd stays busy on the panel until its session timer),
+  // then MQTT publishes the retained "offline" and disconnects cleanly, then we exit. A hard
+  // deadline keeps a stuck helper from holding the stop past the Supervisor's own timeout. One
+  // set of handlers avoids the earlier bug where the MQTT handler's process.exit() pre-empted the
   // separately-registered video handler and left recv/go2rtc running.
-  const shutdown = (sig: string) => {
+  let stopping = false;
+  const shutdown = async (sig: string) => {
+    if (stopping) return;
+    stopping = true;
     log.info(`shutdown (${sig})`);
-    try {
-      video?.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      video2v?.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      twoVoice?.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      bridge?.stop();
-    } catch {
-      /* ignore */
-    }
+    setTimeout(() => {
+      log.warn("shutdown deadline reached; exiting");
+      process.exit(0);
+    }, 6000).unref();
+    const results = await Promise.allSettled([
+      video?.stop(),
+      video2v?.stop(),
+      twoVoice?.stop(),
+    ]);
+    for (const r of results)
+      if (r.status === "rejected")
+        log.warn(`shutdown: ${(r.reason as Error)?.message ?? r.reason}`);
+    await bridge?.stop();
+    log.info("shutdown complete");
     process.exit(0);
   };
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 
   // maintenance: keepalive + expiry-driven re-register (SIP + doorbell listeners). Each client
   // refreshes when half its REGISTRAR-GRANTED expiry has elapsed (sip.dueForReregister()), not on a

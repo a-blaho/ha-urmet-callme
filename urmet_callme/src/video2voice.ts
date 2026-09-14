@@ -16,6 +16,7 @@ import { Place } from "./callme.js";
 import { macHeaderOf } from "./door2voice.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { logger } from "./logger.js";
+import { waitForExit } from "./proc.js";
 import { deterministicUuid } from "./video.js";
 
 const log = logger("video2v");
@@ -181,14 +182,18 @@ export class TwoVoiceVideoService {
     });
   }
 
-  stop() {
+  /** Stop go2rtc and every live recv; resolves once they exited (each BYEs its call on SIGTERM)
+   *  or after a bounded wait, so the caller can exit the process without cutting a BYE short. */
+  async stop(): Promise<void> {
     this.stopping = true;
     this.server?.close();
-    for (const r of this.recvs.values()) {
+    this.go2rtc?.stop();
+    const live = [...this.recvs.values()];
+    this.recvs.clear();
+    for (const r of live) {
       r.removeAllListeners("exit");
       r.kill("SIGTERM");
     }
-    this.recvs.clear();
-    this.go2rtc?.stop();
+    await Promise.all(live.map((r) => waitForExit(r, 2500)));
   }
 }

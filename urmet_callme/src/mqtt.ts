@@ -365,12 +365,19 @@ export class MqttBridge {
     }
   }
 
-  stop() {
+  /** Mark the entities unavailable and disconnect. AWAITED: the retained "offline" must be acked
+   *  before the process exits, because a clean DISCONNECT discards the broker-side will -- exiting
+   *  early used to leave every entity "available" after a stop until the next start. */
+  async stop(): Promise<void> {
+    if (!this.client) return;
     try {
-      this.client.publish(this.availTopic, "offline", { retain: true });
-      this.client.end();
-    } catch {
-      /* */
+      await this.client.publishAsync(this.availTopic, "offline", {
+        retain: true,
+        qos: 1,
+      });
+      await this.client.endAsync();
+    } catch (e) {
+      log.warn(`MQTT shutdown: ${(e as Error).message}`);
     }
   }
 }

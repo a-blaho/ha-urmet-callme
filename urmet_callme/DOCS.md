@@ -87,10 +87,10 @@ warms up, then the image appears - so give a freshly-opened camera ~10 s. At nig
 also simply be dark.
 
 **One camera at a time.** The door system serves **one video call at a time**, so the add-on shows
-one camera at a time. Opening a camera takes about 6–7 s to the first picture (the panel's INVITE
-plus its keyframe), and switching to the other camera about 7–8 s: the add-on hangs up the current
+one camera at a time. Opening a camera takes about 5–6 s to the first picture (the panel's INVITE
+plus its keyframe), and switching to the other camera about 6–7 s: the add-on hangs up the current
 call, waits for the panel to confirm, and places the next one, the same sequence the official app
-uses. Going **back** to a camera you left less than ~10 s ago is faster (~2–3 s) because the call is
+uses. Going **back** to a camera you left less than ~10 s ago is faster (~2 s) because the call is
 still up and is reused. So:
 
 - If you want **both** cameras, put them on **separate dashboard views/tabs** so only one streams

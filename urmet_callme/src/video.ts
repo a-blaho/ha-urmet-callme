@@ -18,6 +18,7 @@ import { AvailableDevice, CallMe } from "./callme.js";
 import { Cloud } from "./cloud.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { logger } from "./logger.js";
+import { isAlive, waitForExit } from "./proc.js";
 
 const log = logger("video");
 
@@ -54,6 +55,10 @@ const SWITCH_SETTLE_MS = 600;
 // How long cancel() waits for recv to confirm the call is over before giving up and moving on. A
 // BYE round-trip through the relay is a few hundred ms; anything longer means recv had no call.
 const END_WAIT_MS = 2500;
+// How long to wait for the panel's INVITE after a call_device_req before treating it as withheld.
+const BUSY_WAIT_MS = 8000;
+// At shutdown: how long to let recv finish its in-dialog BYE (recv.c pumps it for ~1 s on SIGTERM).
+const STOP_WAIT_MS = 2500;
 
 /** A persisted SIP account B (shared across cameras - one video call at a time). */
 interface StoredAccount {
@@ -95,6 +100,7 @@ export class VideoService {
   private endWaiters: Array<() => void> = []; // cancel()s waiting for recv's /ended ping
   private placedAt = new Map<number, number>(); // camera -> epoch ms its call_device_req went out (timing)
   private busyTimers = new Map<number, ReturnType<typeof setTimeout>>(); // no-INVITE watchdogs
+  private retried = new Set<number>(); // cameras whose withheld INVITE was already retried once
   private opChain: Promise<unknown> = Promise.resolve(); // serializes call/cancel (see serialize)
   private stopping = false;
   private server?: Server; // the /call + /hangup control endpoint (closed in stop())
@@ -280,22 +286,38 @@ export class VideoService {
   // Arm/cancel the "no INVITE arrived" watchdog for a camera. If recv never reports media (no
   // /connected) within the window, the panel silently withheld the INVITE -- which is how a busy
   // camera (or a monitor not set to "remote") manifests; there's no error message from the panel.
+  // A healthy panel answers in ~1-2 s (measured), so BUSY_WAIT_MS is generous. The FIRST expiry
+  // retries once: the slot is still ours and the viewer (go2rtc's exec) is still waiting on the
+  // FIFO, so a fresh call_device_req (after a gateway cancel of the ringing one) turns a transient
+  // "busy" -- e.g. the Urmet app briefly held the camera -- into a ~10 s recovery instead of the
+  // viewer sitting black until go2rtc's 60 s producer timeout. The second expiry gives up and frees
+  // the slot so the other camera can be viewed.
   private armBusyTimer(i: number) {
     this.clearBusyTimer(i);
     this.busyTimers.set(
       i,
       setTimeout(() => {
         this.busyTimers.delete(i);
+        if (this.connected.has(i)) return; // landed meanwhile
+        const retry = !this.retried.has(i) && this.slotHolder === i;
         log.warn(
-          `camera [${i}] ${this.cams[i]?.dev.name}: no video after 10s - the panel didn't send ` +
-            `the call. Likely BUSY (the Urmet app or another viewer has THIS camera) or the ` +
-            `indoor monitor isn't set to "remote".`,
+          `camera [${i}] ${this.cams[i]?.dev.name}: no video after ${BUSY_WAIT_MS / 1000}s - the panel ` +
+            `didn't send the call. Likely BUSY (the Urmet app or another viewer has THIS camera) or ` +
+            `the indoor monitor isn't set to "remote".${retry ? " Retrying once." : ""}`,
         );
+        if (retry) {
+          this.retried.add(i);
+          // placeCall() cancels the ringing attempt at the gateway (never connected) and re-calls.
+          this.serialize(() => this.placeCall(i)).catch((e) =>
+            log.error(`video retry [${i}] failed: ${(e as Error).message}`),
+          );
+          return;
+        }
         // This camera claimed the single slot but never streamed (dead/busy) - free it so another
         // camera can be viewed instead of being blocked behind a camera that isn't working.
         if (this.slotHolder === i && !this.connected.has(i))
           this.slotHolder = null;
-      }, 10000),
+      }, BUSY_WAIT_MS),
     );
   }
 
@@ -333,8 +355,7 @@ export class VideoService {
     // SIGUSR1 ever sent and every later switch silently skipped the BYE -- the panel then kept the
     // old call, liblinphone PAUSED it when the next INVITE arrived, and that zombie on-hold call
     // blocked every following camera request for minutes. This was the "inconsistent switching".)
-    const recvAlive =
-      !!this.recv && this.recv.exitCode === null && this.recv.signalCode === null;
+    const recvAlive = isAlive(this.recv);
     // Wait for recv's /ended ping when it really holds a dialog: the next call_device_req must go
     // out AFTER the BYE is answered (the app's sequence), not race it.
     const ended = this.liveCall !== null ? this.waitForEnd() : null;
@@ -448,6 +469,7 @@ export class VideoService {
         // recv reported media running -> the call really connected; cancel the busy watchdog.
         this.connected.add(idx);
         this.liveCall = idx;
+        this.retried.delete(idx); // a fresh retry budget for the next attempt
         this.clearBusyTimer(idx);
         const placed = this.placedAt.get(idx);
         log.info(
@@ -525,13 +547,19 @@ export class VideoService {
     });
   }
 
-  stop() {
+  /** Stop go2rtc and recv. Resolves once recv has exited (it sends the in-dialog BYE for a live
+   *  call on SIGTERM) or after STOP_WAIT_MS -- the caller must not exit the process before then, or
+   *  the BYE never leaves and the panel keeps the camera call busy until its session timer. */
+  async stop(): Promise<void> {
     this.stopping = true;
     for (const t of this.busyTimers.values()) clearTimeout(t);
     this.busyTimers.clear();
     this.server?.close();
-    this.recv?.removeAllListeners("exit");
-    this.recv?.kill("SIGTERM");
     this.go2rtc?.stop();
+    const recv = this.recv;
+    recv?.removeAllListeners("exit");
+    recv?.kill("SIGTERM");
+    const clean = await waitForExit(recv, STOP_WAIT_MS);
+    if (!clean) log.warn(`recv did not exit within ${STOP_WAIT_MS}ms; the panel may hold the call`);
   }
 }

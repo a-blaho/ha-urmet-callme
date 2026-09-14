@@ -267,7 +267,14 @@ static MSFilterDesc tap_desc = {
     .postprocess = NULL,
     .uninit = tap_uninit,
     .methods = tap_methods,
-    .flags = 0,
+    /* IS_PUMP: the ticker then calls tap_process on EVERY tick, not only when RTP is queued on our
+     * input. Without it the priming black stream (see g_black) could not start until the panel's
+     * FIRST packet arrived -- which is the keyframe itself, ~2 s after the streams start -- so the
+     * "early" track advertisement happened ~30 ms before the real picture and bought nothing.
+     * Measured 2026-09-14: one black frame reached the viewer, then the picture. As a pump the tap
+     * primes from the moment the graph runs, so ffmpeg/go2rtc/the viewer are fully set up while the
+     * panel is still warming up, and the real keyframe is shown as soon as it lands. */
+    .flags = MS_FILTER_IS_PUMP,
 };
 
 /* ---- Audio tap: liblinphone decodes the received audio (Opus/PCMU/...) to PCM; this minimal

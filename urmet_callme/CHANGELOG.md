@@ -19,6 +19,17 @@
   "hang up on exit" step never ran; teardown is the helper's reader-idle timer, as it always was
   in practice, and no orphaned ffmpeg is left behind.
 - Switch timing is logged at `info` (BYE round-trip, re-call gap, time to media) for diagnosis.
+- **Earlier picture on a cold open / switch.** The media helper's black priming stream (which lets
+  ffmpeg and go2rtc set up the track before the panel's first keyframe) could not start until the
+  panel's first packet arrived, which *is* the keyframe, so it bought ~30 ms. The tap now runs as a
+  pump filter and primes from the moment the call's media starts, ~2 s earlier.
+- **Withheld INVITE is retried once.** When the panel does not send the camera call within 8 s
+  (typically the Urmet app briefly holding that camera), the add-on cancels the ringing attempt and
+  re-calls once, instead of leaving the viewer black until go2rtc's 60 s producer timeout.
+- **Clean shutdown.** Stopping the add-on now waits for the media/door helpers to send their
+  in-dialog BYEs (up to 2.5 s) and for the retained MQTT "offline" to be acknowledged before the
+  process exits. Previously the exit raced both: entities could stay "available" after a stop, and
+  an un-BYE'd camera call stayed busy on the panel until its session timer.
 
 - **Hardened the embedded go2rtc** - with video on, its API listens on the host network without a
   password (the WebRTC card cannot send one), and a bare go2rtc API lets anyone on the LAN run a
