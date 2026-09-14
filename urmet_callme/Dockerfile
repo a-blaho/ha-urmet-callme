@@ -12,7 +12,7 @@
 # SINGLE-STAGE on purpose: a multi-stage split shrinks the image but (a) doubles the apt phase and
 # (b) separates the compile-time and run-time liblinphone/mediastreamer -- another place the fragile
 # media stack can drift. Keep single-stage until video is re-verified; optimize size later, via beta.
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
