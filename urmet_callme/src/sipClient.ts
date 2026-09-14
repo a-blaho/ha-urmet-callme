@@ -165,7 +165,10 @@ export class SipClient {
         },
       );
       this.socket.on("data", (d) => {
-        this.recvBuf = Buffer.concat([this.recvBuf, d]);
+        // The socket has no encoding set, so `d` is always a Buffer at runtime; newer @types/node
+        // type the event as Buffer | string, hence the guard.
+        const chunk = typeof d === "string" ? Buffer.from(d) : d;
+        this.recvBuf = Buffer.concat([this.recvBuf, chunk]);
         this.drain();
       });
       this.socket.on("error", (e) => {

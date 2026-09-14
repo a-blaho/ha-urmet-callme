@@ -10,6 +10,11 @@ updates:
     groups:
       npm-minor-and-patch:
         update-types: ["minor", "patch"]
+    ignore:
+      # @types/node must track the RUNTIME major (Node 22 in the Dockerfile's nodesource setup):
+      # newer majors describe APIs the image's Node does not have. Bump both together.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -18,3 +23,8 @@ updates:
     directory: /urmet_callme
     schedule:
       interval: monthly
+    ignore:
+      # The base image is an LTS release chosen for its liblinphone packages: newer Ubuntu series
+      # (25.04 onward) dropped liblinphone entirely, and NodeSource only supports LTS releases.
+      # Moving the base is a manual job (re-check liblinphone-dev, nodesource, the link flags).
+      - dependency-name: "ubuntu"
