@@ -31,7 +31,7 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read add-on version (the tag the Supervisor pulls)
         id: version
@@ -64,7 +64,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build and push ${{ matrix.arch }}
         uses: home-assistant/builder/actions/build-image@2026.09.0
