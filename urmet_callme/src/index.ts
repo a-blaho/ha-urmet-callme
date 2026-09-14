@@ -3,10 +3,11 @@
 import { readFileSync } from "node:fs";
 import { CallMe, Door } from "./callme.js";
 import { TwoVoiceDoor, TwoVoiceService } from "./door2voice.js";
+import { Go2rtcPorts } from "./go2rtc.js";
 import { startIngressServer } from "./ingress.js";
 import { logger, setLevel } from "./logger.js";
 import { MqttBridge } from "./mqtt.js";
-import { Go2rtcPorts, VideoService } from "./video.js";
+import { VideoService } from "./video.js";
 import { TwoVoiceVideoService } from "./video2voice.js";
 
 const log = logger("main");
@@ -131,13 +132,30 @@ async function main() {
       `unrecognized device model(s): ${unknownPlaces.map((p) => `${p.id}(uid_type=${p.uidType})`).join(", ")} - not exposed`,
     );
 
-  let doors: Door[] = [];
-  if (ipercomPlaces.length) {
-    doors = await callme.listDoors(ipercomPlaces[0].id);
-    log.info(
-      `discovered ${doors.length} IPERCOM entrance(s): ${doors.map((d) => `${d.doorId}:${d.name}(door=${d.hasDoor},gate=${d.hasGate})`).join(", ")}`,
-    );
+  // Entrances of EVERY IPERCOM place (an account can hold several: two apartments, a second
+  // building). Each place resolves its own gateway; one unreachable place is logged and skipped
+  // so the others still get their doors. If every place fails, keep the old behaviour and abort,
+  // so the failure is visible as a stopped add-on rather than a silently door-less one.
+  const doors: Door[] = [];
+  let lastError: Error | undefined;
+  for (const place of ipercomPlaces) {
+    try {
+      const found = await callme.listDoors(place.id);
+      doors.push(...found);
+      log.info(
+        `discovered ${found.length} IPERCOM entrance(s) on place ${place.id} (${place.name}): ` +
+          found
+            .map((d) => `${d.doorId}:${d.name}(door=${d.hasDoor},gate=${d.hasGate})`)
+            .join(", "),
+      );
+    } catch (e) {
+      lastError = e as Error;
+      log.error(
+        `place ${place.id} (${place.name}): entrance discovery failed: ${lastError.message}`,
+      );
+    }
   }
+  if (ipercomPlaces.length && !doors.length && lastError) throw lastError;
 
   // 2Voice doorbells: a doorbell `event` entity per 2Voice place (its ring arrives on the channel
   // account with the OUT/calling-station username in the From). Independent of 2Voice door-open.
@@ -212,6 +230,7 @@ async function main() {
       if (ipercomPlaces.length) {
         video = new VideoService(
           callme,
+          ipercomPlaces.map((p) => p.id),
           cfg.email,
           cfg.password,
           cfg.go2rtcPorts,

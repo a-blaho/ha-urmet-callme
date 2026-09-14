@@ -503,6 +503,10 @@ static time_t g_last_vfu = 0;  /* last keyframe nudge, to rate-limit to ~1/s */
  * one. This is how the control plane (src/video.ts) switches/closes cameras: a clean in-dialog BYE
  * from account B to the door station (a BYE only -- no gateway cancel_call_req). */
 static volatile sig_atomic_t g_hangup_req = 0;
+/* SIGUSR2: a NEW reader just attached to a call that is already streaming (the control plane reused
+ * the live call instead of re-calling -- the instant flip-back). Ask the panel for a keyframe so the
+ * new reader decodes now rather than at the panel's next periodic IDR. */
+static volatile sig_atomic_t g_vfu_req = 0;
 
 /* 2Voice OUTGOING mode. When RECV_CALL_URI is set, instead of waiting for an inbound INVITE (the
  * IPERCOM split-account flow) we register the given account and PLACE an outgoing auto_insertion
@@ -515,6 +519,7 @@ static int g_placed = 0; /* placed the outgoing call already (place it exactly o
 
 static void on_sigint(int _sig) { (void)_sig; g_running = 0; }
 static void on_sigusr1(int _sig) { (void)_sig; g_hangup_req = 1; }
+static void on_sigusr2(int _sig) { (void)_sig; g_vfu_req = 1; }
 
 static void on_reg_state(LinphoneCore *lc, LinphoneProxyConfig *cfg,
                          LinphoneRegistrationState state, const char *message) {
@@ -544,6 +549,17 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
        * ring forked to this registration -- the Node doorbell listener handles rings). */
       printf("[recv] ignoring inbound INVITE (outgoing mode)\n");
       fflush(stdout);
+      break;
+    }
+    /* ONE call at a time. If a call is still up, the control plane failed to end it before placing
+     * the next one (it waits for our RECV_ENDED_URL ping, so this should not happen). Accepting
+     * would make liblinphone PAUSE the live call: the panel then holds a zombie on-hold call that
+     * blocks every later camera request until its session timer expires (minutes). Decline
+     * instead, loudly -- a failed view is recoverable, a zombie call is not. */
+    if (g_call) {
+      printf("[recv] DECLINING inbound INVITE: a call is already up (control plane did not BYE it)\n");
+      fflush(stdout);
+      linphone_call_decline(call, LinphoneReasonBusy);
       break;
     }
     /* Diagnostic: which physical panel (INVITE From = its topological code) is calling which of
@@ -595,6 +611,10 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     g_last_drain = 0;
     g_stop_at = 0;
     g_video_deadline = 0;
+    /* Tell the control plane the dialog is really over (our BYE was answered, or the panel hung
+     * up). A camera SWITCH waits for this before placing the next call, like the app does (BYE ->
+     * 200 OK -> next call_device_req), instead of racing the BYE with the new request. */
+    fire_url("RECV_ENDED_URL");
     /* Inbound (IPERCOM): stay registered for the next call. Outgoing (2Voice on-demand): our one
      * call ended (viewer left / idle) -> exit so the control plane respawns us on the next view. */
     if (g_call_uri[0]) {
@@ -617,6 +637,8 @@ int main(int argc, char **argv) {
             "RECV_DATA_DIR=<dir> (per-recv, MUST be unique), "
             "RECV_UUID=<uuid> (stable +sip.instance id so a restart replaces our binding), "
             "RECV_HANGUP_URL=<url> (gateway cancel on idle), "
+            "RECV_CONNECTED_URL=<url> (pinged at StreamsRunning), "
+            "RECV_ENDED_URL=<url> (pinged when the call is over), "
             "RECV_IDLE_SECONDS=<n> (default 10)\n"
             "  dev-only: RECV_SECONDS=<n> (auto-stop), RECV_DEBUG=1 (SIP trace)\n",
             argv[0]);
@@ -638,6 +660,7 @@ int main(int argc, char **argv) {
   signal(SIGINT, on_sigint);
   signal(SIGTERM, on_sigint);
   signal(SIGUSR1, on_sigusr1); /* control plane: hang up the current call, stay registered */
+  signal(SIGUSR2, on_sigusr2); /* control plane: new reader on the live call -> request a keyframe */
 
   LinphoneFactory *factory = linphone_factory_get();
 
@@ -774,9 +797,6 @@ int main(int argc, char **argv) {
   linphone_account_unref(account);
 
   printf("[recv] registering %s over %s ...\n", identity, server);
-  printf("[recv] now trigger the call from the Mac:\n");
-  printf("       npm run spike:video -- call %s <camIdx>\n", user);
-  printf("[recv] Ctrl-C to stop.\n");
   fflush(stdout);
 
   while (g_running) {
@@ -822,6 +842,19 @@ int main(int argc, char **argv) {
         linphone_call_terminate(g_call);
         g_last_drain = 0;
         g_video_deadline = 0;
+      } else {
+        printf("[recv] SIGUSR1 with no call up -> nothing to end\n");
+        fflush(stdout);
+      }
+    }
+    /* A reader re-attached to the live call (flip-back): one keyframe nudge so it decodes at once. */
+    if (g_vfu_req) {
+      g_vfu_req = 0;
+      if (g_call) {
+        linphone_call_send_vfu_request(g_call);
+        send_pfu_info(g_call);
+        printf("[recv] SIGUSR2 -> keyframe requested for the re-attached reader\n");
+        fflush(stdout);
       }
     }
     /* Nudge for a keyframe until the tap reports an IDR. Needed when two cameras stream at once:

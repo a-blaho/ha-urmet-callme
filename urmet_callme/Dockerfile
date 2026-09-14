@@ -16,6 +16,15 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# go2rtc is PINNED and checksum-verified, not "latest". src/go2rtc.ts hardens its LAN-facing API with
+# go2rtc config keys (app.modules, api.allow_paths, exec.allow_paths); go2rtc silently ignores keys it
+# doesn't know, so an unpinned upgrade that renamed one would quietly re-open the API. Bump the
+# version deliberately: update BOTH sha256s (sha256sum of go2rtc_linux_amd64 / go2rtc_linux_arm64
+# from the release) and re-check those keys still exist.
+ARG GO2RTC_VERSION=1.9.14
+ARG GO2RTC_SHA256_AMD64=32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6
+ARG GO2RTC_SHA256_ARM64=359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50
+
 # NOTE: linphone-cli is REQUIRED (not just for its binaries): it pulls linphone-common, which ships
 # /usr/share/belr/grammars/identity_grammar. Without it liblinphone FATALs ("Unable to load Identity
 # Address grammar") and recv crash-loops. liblinphone-dev alone only provides the sdp/vcard grammars.
@@ -30,8 +39,15 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends nodejs \
  && command -v npm \
  && node --version \
+ && arch="$(dpkg --print-architecture)" \
+ && case "$arch" in \
+      amd64) sum="$GO2RTC_SHA256_AMD64" ;; \
+      arm64) sum="$GO2RTC_SHA256_ARM64" ;; \
+      *) echo "no go2rtc checksum for $arch" >&2; exit 1 ;; \
+    esac \
  && curl -fsSL -o /usr/local/bin/go2rtc \
-      "https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_$(dpkg --print-architecture)" \
+      "https://github.com/AlexxIT/go2rtc/releases/download/v${GO2RTC_VERSION}/go2rtc_linux_${arch}" \
+ && echo "$sum  /usr/local/bin/go2rtc" | sha256sum -c - \
  && chmod +x /usr/local/bin/go2rtc \
  && rm -rf /var/lib/apt/lists/* /tmp/nodesource.sh
 

@@ -66,8 +66,16 @@ is the path that works.
    you get a black screen ~half the time.
 
 Audio plays after a **one-click unmute** (browser autoplay policy) - telephone quality (8 kHz
-G.711 upsampled), enough to hear a visitor. go2rtc's own UI at `http://<your-ha-host>:1984` also
-plays every stream (handy for testing).
+G.711 upsampled), enough to hear a visitor. go2rtc's own stream pages at `http://<your-ha-host>:1984`
+also play every stream (handy for testing); its config/log/add-stream pages are disabled (see below).
+
+**What is reachable on your LAN.** With video on, the add-on's go2rtc listens on the host network
+without a password (the WebRTC card cannot send one), so it is locked down instead: only the
+modules and API paths the card and the stream pages need are enabled, the stream list and player
+pages work but the config editor, log, restart and exit endpoints do not exist, and the only
+program go2rtc is allowed to run is the add-on's own stream script. Anyone on your LAN can still
+*watch* the cameras through port `1984`/`8554`, exactly as they could through the card, so keep
+the add-on on a trusted network. The API port is not something to forward from the internet.
 
 **Audio works fully on desktop browsers.** On **mobile** (the HA companion app _and_ mobile
 browsers), unmuting can freeze the feed and reload it back to muted - a known limitation of the
@@ -79,16 +87,15 @@ warms up, then the image appears - so give a freshly-opened camera ~10 s. At nig
 also simply be dark.
 
 **One camera at a time.** The door system serves **one video call at a time**, so the add-on shows
-one camera at a time. Opening a camera fresh (after the other has been idle) is reliable - a few
-seconds to first picture. **Switching quickly between the two cameras is slower and variable
-(roughly 5–35 s)**: after one call ends the panel takes a variable amount of time before it will
-serve the next camera. (The official app switches faster and more consistently - ~9 s - so this is
-likely something we could still improve, not a hard limit; it's just not solved yet.) So:
+one camera at a time. Opening a camera takes about 6–7 s to the first picture (the panel's INVITE
+plus its keyframe), and switching to the other camera about 7–8 s: the add-on hangs up the current
+call, waits for the panel to confirm, and places the next one, the same sequence the official app
+uses. Going **back** to a camera you left less than ~10 s ago is faster (~2–3 s) because the call is
+still up and is reused. So:
 
-- If you mostly watch **one** entrance, put just that camera on your dashboard.
-- If you want **both**, put them on **separate dashboard views/tabs** (so only one streams at a
-  time) and expect a wait when you switch to the other. Two always-visible cards aren't recommended
-  - only one will be live.
+- If you want **both** cameras, put them on **separate dashboard views/tabs** so only one streams
+  at a time. Two always-visible cards aren't recommended - they would keep displacing each other,
+  and only one can be live.
 
 The stream includes **one-way audio** (hear the visitor); two-way (talk-back) is not implemented yet.
 

@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- **Camera switching is now consistent** (Ipercom video). Switching between two cameras used to
+  take anywhere from 5 s to never (a 60 s "unavailable" from go2rtc), because the previous call was
+  almost never hung up: the hang-up signal to the media helper was sent only once per helper
+  lifetime (a Node `ChildProcess.killed` misuse), so the panel kept the old call, put it on hold
+  when the next camera's call arrived, and that zombie on-hold call blocked every following camera
+  request for minutes. Fixed: the hang-up is sent every time, the control plane waits for the helper
+  to confirm the call is really over before placing the next one (the app's BYE → 200 OK → next
+  request sequence), the helper declines a second call instead of pausing the live one, and the
+  slot bookkeeping no longer lets a re-call of the same camera skip the switch path. Measured on a
+  real panel: a switch now shows video in 7–8 s every time (it was 7 s on a good run and 60 s+
+  on a bad one).
+- **Instant flip-back.** Re-opening a camera within ~10 s of leaving it reuses the still-live call
+  (with a keyframe nudge) instead of hanging up and re-calling: video in ~2.5 s instead of ~7 s.
+- The go2rtc producer script now `exec`s ffmpeg. go2rtc stops producers with SIGKILL, so the old
+  "hang up on exit" step never ran; teardown is the helper's reader-idle timer, as it always was
+  in practice, and no orphaned ffmpeg is left behind.
+- Switch timing is logged at `info` (BYE round-trip, re-call gap, time to media) for diagnosis.
+
+- **Hardened the embedded go2rtc** - with video on, its API listens on the host network without a
+  password (the WebRTC card cannot send one), and a bare go2rtc API lets anyone on the LAN run a
+  command inside the add-on (an `exec:`/`echo:` stream). go2rtc now loads only the modules the add-on
+  uses, registers only the API paths the card and the stream pages need (no config editor, log,
+  restart or exit endpoints), and may only run the add-on's own stream script. Its config is also
+  regenerated on every (re)start so a tampered file never survives. The cameras remain viewable
+  from the LAN as before; go2rtc's config/log pages are gone from the ingress panel.
+- **go2rtc is pinned (1.9.14) and checksum-verified** in the image instead of `latest`, so a
+  future go2rtc release cannot silently change behaviour (or drop the hardening keys) in a rebuild.
+- **Accounts with several Ipercom places** - entrances are now discovered on **every** Ipercom
+  place, not just the first, and each camera call goes to its own place's gateway. Previously a
+  second apartment/building got no door buttons, and on a mixed 2Voice + Ipercom account video
+  could try to resolve a gateway on the 2Voice place and fail. A place whose gateway is unreachable
+  is skipped with an error instead of blocking the others.
+
 ## 1.0.5
 
 - **Stable SIP instance id for the liblinphone helpers** - liblinphone was inventing a new

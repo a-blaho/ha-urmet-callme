@@ -16,10 +16,10 @@ import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, Server } from "node:http";
 import { AvailableDevice, CallMe } from "./callme.js";
 import { Cloud } from "./cloud.js";
+import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { logger } from "./logger.js";
 
 const log = logger("video");
-const GO2RTC_CFG = "/tmp/go2rtc.yaml";
 
 /** A stable RFC 5626 `+sip.instance` UUID derived from `seed`, so a liblinphone helper keeps the
  *  SAME instance id across restarts (its `/tmp` config is wiped with the container). Without this a
@@ -31,26 +31,6 @@ export function deterministicUuid(seed: string): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
 }
 
-/** Ports the embedded go2rtc binds. Configurable so the add-on can coexist with a user's OWN go2rtc
- *  add-on (which typically owns 1984/8554/8555). Under host networking these bind directly on the
- *  host, so they must be free. The `api` port is the one the WebRTC card's `server:` points at. */
-export interface Go2rtcPorts {
-  api: number;
-  rtsp: number;
-  webrtc: number;
-  // Optional LAN IP to advertise as the WebRTC ICE candidate. Needed only in bridge networking (no
-  // host_network): go2rtc otherwise advertises its internal Docker IP, which the browser can't reach.
-  // With host networking this is empty (go2rtc sees the real interface itself).
-  candidateIp?: string;
-}
-
-/** The go2rtc `webrtc:` config line - adds an explicit ICE candidate when candidateIp is set
- *  (bridge networking), otherwise just listens (host networking, go2rtc gathers its own). */
-export function webrtcListen(ports: Go2rtcPorts): string {
-  return ports.candidateIp
-    ? `webrtc: { listen: ":${ports.webrtc}", candidates: [ "${ports.candidateIp}:${ports.webrtc}" ] }`
-    : `webrtc: { listen: ":${ports.webrtc}" }`;
-}
 // How long recv keeps a call alive after its FIFO stops being drained (viewer gone) before it
 // hangs up. This clock only starts once streaming actually begins (recv.c starts it at the first
 // keyframe, not at "streams running"), so it measures a genuine reader gap, not startup. Long
@@ -68,9 +48,12 @@ const TARGET_FILE = "/tmp/recv_target";
 // After an active switch displaces a camera, ignore that camera's own /call for this long, so two
 // simultaneously-visible cards can't ping-pong the single slot back and forth.
 const SWITCH_DEBOUNCE_MS = 4000;
-// Gap between the BYE and the re-call on an active switch -- just enough for the BYE to reach the
-// panel before the next INVITE.
-const SWITCH_SETTLE_MS = 400;
+// Gap between the END of the previous call (recv's /ended ping: our BYE was answered) and the
+// re-call on an active switch. The app sends its next call_device_req ~0.6s after the BYE's 200 OK.
+const SWITCH_SETTLE_MS = 600;
+// How long cancel() waits for recv to confirm the call is over before giving up and moving on. A
+// BYE round-trip through the relay is a few hundred ms; anything longer means recv had no call.
+const END_WAIT_MS = 2500;
 
 /** A persisted SIP account B (shared across cameras - one video call at a time). */
 interface StoredAccount {
@@ -82,13 +65,14 @@ interface StoredAccount {
 }
 
 interface Cam {
+  placeId: string; // the IPERCOM place this camera belongs to (its gateway takes the call)
   dev: AvailableDevice;
   fifo: string; // per-camera Annex-B (H.264) FIFO
   afifo: string; // per-camera audio FIFO (raw PCM s16le 8k mono; recv forces G.711)
 }
 
 export class VideoService {
-  private go2rtc?: ChildProcess;
+  private go2rtc?: Go2rtcProcess;
   private cams: Cam[] = [];
   // SINGLE SHARED SIP account + SINGLE recv for ALL camera calls, ONE VIDEO CALL AT A TIME. One
   // account is used and cameras are switched with an in-dialog BYE + an immediate re-call on the
@@ -105,6 +89,11 @@ export class VideoService {
   private displacedAt = new Map<number, number>(); // camera -> epoch ms it was last switched away (debounce)
   private streaming = new Set<number>(); // cameras with a call currently placed (bookkeeping)
   private connected = new Set<number>(); // cameras whose recv reported media running
+  // The camera whose call recv holds RIGHT NOW (set on /connected, cleared on /ended). This is the
+  // ground truth for "is there a dialog to BYE / to reuse", independent of our own bookkeeping.
+  private liveCall: number | null = null;
+  private endWaiters: Array<() => void> = []; // cancel()s waiting for recv's /ended ping
+  private placedAt = new Map<number, number>(); // camera -> epoch ms its call_device_req went out (timing)
   private busyTimers = new Map<number, ReturnType<typeof setTimeout>>(); // no-INVITE watchdogs
   private opChain: Promise<unknown> = Promise.resolve(); // serializes call/cancel (see serialize)
   private stopping = false;
@@ -113,6 +102,7 @@ export class VideoService {
 
   constructor(
     private callme: CallMe,
+    private placeIds: string[], // the IPERCOM places whose cameras to serve (never a 2Voice place)
     private email: string,
     private password: string,
     private ports: Go2rtcPorts,
@@ -120,10 +110,23 @@ export class VideoService {
 
   async start(): Promise<boolean> {
     const realm = this.callme.realm;
-    const devices = (await this.callme.listDevices()).filter(
-      (d) => d.callType === "calling_station",
-    );
-    if (!devices.length) {
+    // Cameras from EVERY IPERCOM place, each remembering its place: every call/cancel must name the
+    // place explicitly so it goes to THAT place's gateway. (CallMe's place-less default is the
+    // cloud's first place, which on a multi-place or mixed account is not necessarily an IPERCOM
+    // one.) A place whose gateway is unreachable is skipped, not fatal for the others.
+    const found: { placeId: string; dev: AvailableDevice }[] = [];
+    for (const placeId of this.placeIds) {
+      try {
+        const devices = await this.callme.listDevices(placeId);
+        for (const dev of devices)
+          if (dev.callType === "calling_station") found.push({ placeId, dev });
+      } catch (e) {
+        log.warn(
+          `place ${placeId}: camera discovery failed (${(e as Error).message}); skipping its cameras`,
+        );
+      }
+    }
+    if (!found.length) {
       log.warn("no camera devices (calling_station) found; video not started");
       return false;
     }
@@ -161,22 +164,26 @@ export class VideoService {
     this.sharedBUri = `sip:${a.username}@${realm}`;
     log.info(`shared camera account B: ${reuse ? "reused" : "created"}`);
 
-    for (let i = 0; i < devices.length; i++) {
+    for (let i = 0; i < found.length; i++) {
       this.cams.push({
-        dev: devices[i],
+        placeId: found[i].placeId,
+        dev: found[i].dev,
         fifo: `/tmp/urmet_cam_${i}.h264`,
         afifo: `/tmp/urmet_cam_${i}.pcm`,
       });
     }
     log.info(
-      `cameras: ${this.cams.map((c, i) => `[${i}] ${c.dev.name}`).join(", ")}`,
+      `cameras: ${this.cams.map((c, i) => `[${i}] ${c.dev.name} (place ${c.placeId})`).join(", ")}`,
     );
     // Bind the control endpoint FIRST so its (ephemeral) port is known before recv/go2rtc use it.
     await this.serveCallEndpoint();
     this.spawnRecv(a.password);
 
-    writeFileSync(GO2RTC_CFG, this.go2rtcConfig());
-    this.spawnGo2rtc();
+    // go2rtc: one on-demand stream per camera, hardened config (see go2rtc.ts), auto-respawned.
+    this.go2rtc = new Go2rtcProcess(() =>
+      go2rtcConfig(this.cams.length, this.callPort, this.ports),
+    );
+    this.go2rtc.start();
     log.info(
       `video ready: go2rtc api :${this.ports.api}, rtsp :${this.ports.rtsp}, webrtc :${this.ports.webrtc}; control :${this.callPort}; ${this.cams.length} camera(s)`,
     );
@@ -199,19 +206,6 @@ export class VideoService {
         `could not persist video accounts (${(e as Error).message}); will re-create next start`,
       );
     }
-  }
-
-  // go2rtc, auto-respawned like recv (a crash otherwise leaves video dead until add-on restart).
-  private spawnGo2rtc() {
-    if (this.stopping) return;
-    this.go2rtc = spawn("go2rtc", ["-config", GO2RTC_CFG], {
-      stdio: "inherit",
-    });
-    this.go2rtc.on("exit", (c) => {
-      if (this.stopping) return;
-      log.warn(`go2rtc exited (code ${c}); respawning in 3s`);
-      setTimeout(() => this.spawnGo2rtc(), 3000);
-    });
   }
 
   // The SINGLE media receiver, registered as the shared account. It answers whatever camera call the
@@ -246,6 +240,7 @@ export class VideoService {
         // No cam index: there's one call at a time; the handler maps these to the current slotHolder.
         RECV_HANGUP_URL: `http://127.0.0.1:${this.callPort}/hangup`,
         RECV_CONNECTED_URL: `http://127.0.0.1:${this.callPort}/connected`,
+        RECV_ENDED_URL: `http://127.0.0.1:${this.callPort}/ended`, // dialog over -> a switch may re-call
         RECV_IDLE_SECONDS: String(RECV_IDLE_SECONDS),
       },
       stdio: "inherit",
@@ -270,33 +265,8 @@ export class VideoService {
     }
   }
 
-  private go2rtcConfig(): string {
-    // One stream per camera. stream.sh emits H.264 + BOTH AAC and Opus audio tracks, so go2rtc
-    // serves the right codec per consumer from this single stream -- AAC to HA's Generic Camera /
-    // HLS, Opus to WebRTC (iframe / go2rtc UI / WebRTC cards). No separate `_webrtc` stream and no
-    // `ffmpeg:<stream>` transcode chain (that raced the on-demand exec producer and 404'd). All
-    // viewers point at `urmet_cam_<i>`.
-    // starttimeout: how long go2rtc waits for stream.sh's ffmpeg to connect back via RTSP before
-    // giving up with "exec: timeout" (default 30s, RTSP mode, added go2rtc v1.9.14). An active
-    // SWITCH to a second camera can exceed 30s: BYE the current call + settle + the panel's slow,
-    // variable post-teardown INVITE (~5-35s) + the camera's keyframe/black warm-up. Raise it to 60s
-    // so a slow switch still lands instead of erroring the consumer out.
-    const streams = this.cams
-      .map(
-        (_, i) =>
-          `  urmet_cam_${i}: "exec:/app/stream.sh ${i} {output} ${this.callPort}#starttimeout=60"`,
-      )
-      .join("\n");
-    return [
-      "streams:",
-      streams,
-      `api: { listen: ":${this.ports.api}" }`,
-      `rtsp: { listen: ":${this.ports.rtsp}" }`,
-      webrtcListen(this.ports),
-      "",
-    ].join("\n");
-  }
-
+  // The call options for camera i; every call/cancel also passes this.cams[i].placeId so the
+  // request goes to THAT place's gateway (see start()).
   private optsFor(i: number) {
     const cam = this.cams[i];
     return {
@@ -342,7 +312,10 @@ export class VideoService {
   // this is a no-op unless i is the current camera. On the SAME shared account the panel frees the
   // channel instantly, so the next camera's call connects fast (this is the whole point of the
   // single-account model -- with separate accounts the switch cost ~30-40s of "busy").
-  private async cancel(i: number) {
+  // `keepSlot`: placeCall() re-calling the SAME camera must keep owning the slot across its own
+  // teardown, or a concurrent /call for another camera sees a free slot and skips the switch path
+  // (no BYE for this one -> two calls stacked on account B).
+  private async cancel(i: number, keepSlot = false) {
     if (!this.cams[i]) return;
     // Ignore a stale hangup for a camera that isn't the current one (there's only one live call).
     if (
@@ -354,24 +327,39 @@ export class VideoService {
     const wasConnected = this.connected.has(i);
     this.clearBusyTimer(i);
     this.connected.delete(i);
-    // Poke the shared recv: if it holds a call it sends the in-dialog BYE (the teardown);
-    // if not, SIGUSR1 is a no-op. Covers the race where the dialog is up but /connected hasn't landed.
-    if (this.recv && !this.recv.killed) {
+    // Poke the shared recv: if it holds a call it sends the in-dialog BYE (the teardown); if not,
+    // SIGUSR1 is a no-op. Send it EVERY time the process is alive. (Do NOT gate on
+    // ChildProcess.killed: Node sets that after ANY successful kill(), so it went true on the first
+    // SIGUSR1 ever sent and every later switch silently skipped the BYE -- the panel then kept the
+    // old call, liblinphone PAUSED it when the next INVITE arrived, and that zombie on-hold call
+    // blocked every following camera request for minutes. This was the "inconsistent switching".)
+    const recvAlive =
+      !!this.recv && this.recv.exitCode === null && this.recv.signalCode === null;
+    // Wait for recv's /ended ping when it really holds a dialog: the next call_device_req must go
+    // out AFTER the BYE is answered (the app's sequence), not race it.
+    const ended = this.liveCall !== null ? this.waitForEnd() : null;
+    if (recvAlive) {
       try {
-        this.recv.kill("SIGUSR1"); // -> recv.c on_sigusr1 -> linphone_call_terminate (in-dialog BYE)
+        this.recv!.kill("SIGUSR1"); // -> recv.c on_sigusr1 -> linphone_call_terminate (in-dialog BYE)
       } catch (e) {
         log.warn(`recv BYE failed: ${(e as Error).message}`);
       }
     }
-    if (wasConnected) {
+    if (ended) {
+      const t0 = Date.now();
+      const ok = await ended;
       log.info(
-        `ended video call to [${i}] ${this.cams[i].dev.name} (recv BYE)`,
+        `ended video call to [${i}] ${this.cams[i].dev.name} (recv BYE ${ok ? `answered in ${Date.now() - t0}ms` : `not confirmed within ${END_WAIT_MS}ms`})`,
+      );
+    } else if (wasConnected) {
+      log.info(
+        `ended video call to [${i}] ${this.cams[i].dev.name} (recv had no dialog)`,
       );
     } else {
       // Never connected: the panel may still be ringing the door station with no INVITE to our
       // recv (nothing to BYE) -> abort it at the gateway.
       try {
-        await this.callme.cancelCall(this.optsFor(i));
+        await this.callme.cancelCall(this.optsFor(i), this.cams[i].placeId);
         log.info(
           `cancelled ringing video call to [${i}] ${this.cams[i].dev.name}`,
         );
@@ -380,7 +368,22 @@ export class VideoService {
       }
     }
     this.streaming.delete(i);
-    if (this.slotHolder === i) this.slotHolder = null; // free the single video slot for the next camera
+    if (this.slotHolder === i && !keepSlot) this.slotHolder = null; // free the single video slot
+  }
+
+  // Resolve true when recv pings /ended, false after END_WAIT_MS.
+  private waitForEnd(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.endWaiters = this.endWaiters.filter((w) => w !== done);
+        resolve(false);
+      }, END_WAIT_MS);
+      const done = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      this.endWaiters.push(done);
+    });
   }
 
   // Run call-control ops ONE AT A TIME, in arrival order, so a camera's own /call and /hangup
@@ -397,9 +400,25 @@ export class VideoService {
   // call of its OWN first so we don't stack a duplicate on the same account B. Serialized via
   // serialize(); never call directly.
   private async placeCall(idx: number) {
-    if (this.streaming.has(idx)) await this.cancel(idx); // stale prior call for THIS camera -> clean BYE
+    // REUSE a live call: the viewer of THIS camera came back (or go2rtc restarted its producer)
+    // while recv still holds the call -- within recv's reader-idle window. Nothing to BYE, nothing
+    // to re-call: the new ffmpeg just reads the FIFO. Nudge one keyframe so it decodes at once
+    // instead of at the panel's next periodic IDR. This is the instant flip-back.
+    if (this.liveCall === idx && this.connected.has(idx)) {
+      log.info(
+        `reusing live video call to [${idx}] ${this.cams[idx].dev.name} (keyframe nudge)`,
+      );
+      try {
+        this.recv?.kill("SIGUSR2");
+      } catch {
+        /* recv gone; its respawn path recovers */
+      }
+      return;
+    }
+    if (this.streaming.has(idx)) await this.cancel(idx, true); // stale prior call for THIS camera -> clean BYE, keep the slot
     this.writeTarget(idx); // point the shared recv at THIS camera's FIFOs before it answers
-    await this.callme.callDevice(this.optsFor(idx));
+    this.placedAt.set(idx, Date.now());
+    await this.callme.callDevice(this.optsFor(idx), this.cams[idx].placeId);
     this.streaming.add(idx);
     log.info(`placed video call to [${idx}] ${this.cams[idx].dev.name}`);
     // Watchdog: if recv doesn't report media within a few seconds, the panel never sent the
@@ -428,20 +447,34 @@ export class VideoService {
       if (u.pathname === "/connected") {
         // recv reported media running -> the call really connected; cancel the busy watchdog.
         this.connected.add(idx);
+        this.liveCall = idx;
         this.clearBusyTimer(idx);
+        const placed = this.placedAt.get(idx);
         log.info(
-          `camera [${idx}] ${this.cams[idx].dev.name}: video established`,
+          `camera [${idx}] ${this.cams[idx].dev.name}: video established` +
+            (placed ? ` (${Date.now() - placed}ms after the request)` : ""),
         );
+        return void res.writeHead(200).end("ok");
+      }
+      if (u.pathname === "/ended") {
+        // recv's dialog is over (our BYE answered, or the panel hung up). Release whoever waits in
+        // cancel(); a call the PANEL ended on its own just drops out of the live bookkeeping.
+        // (`connected` is left to cancel(): clearing it here would make the follow-up /hangup of a
+        // normal idle teardown look like a never-connected call and send a needless gateway cancel.)
+        const was = this.liveCall;
+        this.liveCall = null;
+        const waiters = this.endWaiters;
+        this.endWaiters = [];
+        for (const w of waiters) w();
+        if (!waiters.length && was !== null)
+          log.info(`video call to [${was}] ${this.cams[was].dev.name} ended (by the panel or recv idle)`);
         return void res.writeHead(200).end("ok");
       }
       if (u.pathname !== "/call") return void res.writeHead(404).end();
 
       // ONE VIDEO CALL AT A TIME, with an ACTIVE SWITCH. If another camera holds the slot, BYE the
-      // current call, let the BYE reach the panel (SWITCH_SETTLE_MS), then re-call this camera on
-      // the same shared account. NOTE: switching cameras is slow/variable (~5-35s) regardless of
-      // this settle -- after a teardown the panel enters a variable "busy" window before it will
-      // serve the next camera. This is not a proven hard limit (the panel is capable of a
-      // consistent ~9s switch); the variance is an open item, not something the settle fixes.
+      // current call, wait for recv to confirm the dialog is over (cancel() awaits /ended), settle
+      // SWITCH_SETTLE_MS like the app, then re-call this camera on the same shared account.
       // Debounce the just-displaced camera briefly so two overlapping viewers can't ping-pong the
       // slot back and forth (only relevant if both cards are visible at once; with cameras on
       // separate views this never triggers). Claim the slot synchronously so concurrent /call
@@ -458,9 +491,11 @@ export class VideoService {
         log.info(
           `switching video: [${prev}] ${this.cams[prev].dev.name} -> [${idx}] ${this.cams[idx].dev.name}`,
         );
+        const t0 = now;
         this.serialize(async () => {
-          await this.cancel(prev); // in-dialog BYE on the shared account
-          await new Promise((r) => setTimeout(r, SWITCH_SETTLE_MS)); // let the BYE reach the panel
+          await this.cancel(prev); // in-dialog BYE on the shared account, awaited to its end
+          await new Promise((r) => setTimeout(r, SWITCH_SETTLE_MS)); // the app's post-BYE gap
+          log.info(`switch: previous call down, re-calling after ${Date.now() - t0}ms`);
           await this.placeCall(idx); // fresh call on the SAME account after the panel has released
         }).catch((e) =>
           log.error(`video switch [${idx}] failed: ${(e as Error).message}`),
@@ -497,7 +532,6 @@ export class VideoService {
     this.server?.close();
     this.recv?.removeAllListeners("exit");
     this.recv?.kill("SIGTERM");
-    this.go2rtc?.removeAllListeners("exit"); // don't let the exit handler respawn during shutdown
-    this.go2rtc?.kill("SIGTERM");
+    this.go2rtc?.stop();
   }
 }

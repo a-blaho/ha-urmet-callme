@@ -14,11 +14,11 @@ import { writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { createServer, Server } from "node:http";
 import { Place } from "./callme.js";
 import { macHeaderOf } from "./door2voice.js";
+import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { logger } from "./logger.js";
-import { Go2rtcPorts, deterministicUuid, webrtcListen } from "./video.js";
+import { deterministicUuid } from "./video.js";
 
 const log = logger("video2v");
-const GO2RTC_CFG = "/tmp/go2rtc.yaml"; // only ONE video service runs at a time (see index.ts)
 const RECV_IDLE_SECONDS = 10; // recv hangs up (and exits) after no FIFO reader for this long
 
 interface Cam {
@@ -28,7 +28,7 @@ interface Cam {
 }
 
 export class TwoVoiceVideoService {
-  private go2rtc?: ChildProcess;
+  private go2rtc?: Go2rtcProcess;
   private cams: Cam[] = [];
   private recvs = new Map<number, ChildProcess>(); // camera idx -> its live recv (absent = idle)
   private server?: Server;
@@ -65,42 +65,15 @@ export class TwoVoiceVideoService {
     // Bind the control endpoint FIRST so we know its (ephemeral) port before writing the go2rtc
     // config -- stream.sh receives it as argv $3.
     await this.serveCallEndpoint();
-    writeFileSync(GO2RTC_CFG, this.go2rtcConfig());
-    this.spawnGo2rtc();
+    // go2rtc: one on-demand stream per camera, hardened config (see go2rtc.ts), auto-respawned.
+    this.go2rtc = new Go2rtcProcess(() =>
+      go2rtcConfig(this.cams.length, this.callPort, this.ports),
+    );
+    this.go2rtc.start();
     log.info(
       `2Voice video ready: go2rtc api :${this.ports.api}, rtsp :${this.ports.rtsp}, webrtc :${this.ports.webrtc}; control :${this.callPort}; ${this.cams.length} camera(s)`,
     );
     return true;
-  }
-
-  private go2rtcConfig(): string {
-    // One stream per camera, named urmet_cam_<i> to match the WebRTC card config (same as IPERCOM),
-    // so the dashboard setup is identical regardless of family. #starttimeout=60 rides out the
-    // register + auto_insertion answer + keyframe warm-up.
-    const streams = this.cams
-      .map(
-        (_, i) =>
-          `  urmet_cam_${i}: "exec:/app/stream.sh ${i} {output} ${this.callPort}#starttimeout=60"`,
-      )
-      .join("\n");
-    return [
-      "streams:",
-      streams,
-      `api: { listen: ":${this.ports.api}" }`,
-      `rtsp: { listen: ":${this.ports.rtsp}" }`,
-      webrtcListen(this.ports),
-      "",
-    ].join("\n");
-  }
-
-  private spawnGo2rtc() {
-    if (this.stopping) return;
-    this.go2rtc = spawn("go2rtc", ["-config", GO2RTC_CFG], { stdio: "inherit" });
-    this.go2rtc.on("exit", (c) => {
-      if (this.stopping) return;
-      log.warn(`go2rtc exited (code ${c}); respawning in 3s`);
-      setTimeout(() => this.spawnGo2rtc(), 3000);
-    });
   }
 
   // Spawn recv in OUTGOING mode for camera i: register the place's channel account and place the
@@ -216,7 +189,6 @@ export class TwoVoiceVideoService {
       r.kill("SIGTERM");
     }
     this.recvs.clear();
-    this.go2rtc?.removeAllListeners("exit");
-    this.go2rtc?.kill("SIGTERM");
+    this.go2rtc?.stop();
   }
 }

@@ -1,9 +1,16 @@
 #!/bin/sh
 # go2rtc exec source target. go2rtc runs this on the first viewer of a camera stream and kills
 # it when idle. It (1) asks the control plane to place the call for this camera (recv answers and
-# taps the raw H.264 + PCM audio to FIFOs), (2) muxes them to go2rtc's {output} RTSP -- video
-# RE-ENCODED to a clean CFR stream (see below; NOT copied), audio normalized + encoded to Opus/AAC,
-# and (3) on exit, calls /hangup so the control plane ends the call (recv sends an in-dialog BYE).
+# taps the raw H.264 + PCM audio to FIFOs), then (2) execs ffmpeg to mux them to go2rtc's {output}
+# RTSP -- video RE-ENCODED to a clean CFR stream (see below; NOT copied), audio normalized + encoded
+# to Opus/AAC.
+#
+# TEARDOWN is NOT done here. go2rtc stops an exec producer by cancelling a Go CommandContext, which
+# is a SIGKILL: no trap ever runs, so a "curl /hangup on exit" step (an earlier version of this
+# script) never fired -- the call always ended via recv's reader-idle timer instead. So this script
+# `exec`s ffmpeg (ffmpeg IS the process go2rtc kills, no orphan left behind) and the call ends when
+# recv sees no FIFO reader for RECV_IDLE_SECONDS. That idle window is also what makes a re-open of
+# the same camera instant (the control plane reuses the still-live call, see video.ts placeCall).
 #
 #   $1 = camera index    $2 = {output} RTSP url provided by go2rtc    $3 = control port (optional)
 CAM="$1"
@@ -52,7 +59,7 @@ fi
 # recv.c g_black), so ffmpeg has a stream immediately; without these flags it still waits out
 # analyzeduration (~5s) and the on-demand WebRTC negotiation locks in a trackless black session.
 # With them, ffmpeg advertises the video track within a fraction of a second of the first frame.
-ffmpeg -hide_banner -loglevel warning \
+exec ffmpeg -hide_banner -loglevel warning \
   -analyzeduration 0 -probesize 32768 \
   -use_wallclock_as_timestamps 1 -f h264 -i "$FIFO" \
   -use_wallclock_as_timestamps 1 -f s16le -ar 8000 -ac 1 -i "$AFIFO" \
@@ -61,10 +68,4 @@ ffmpeg -hide_banner -loglevel warning \
   -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p \
     -vsync cfr -r 25 -g 50 -crf 20 -maxrate 1500k -bufsize 1500k \
   -c:a:0 aac -c:a:1 libopus -ar 48000 -ac 1 -b:a 64k \
-  -rtsp_transport tcp -f rtsp "$OUTPUT" &
-FF=$!
-trap 'kill "$FF" 2>/dev/null' INT TERM
-wait "$FF" 2>/dev/null
-
-# Viewer gone (ffmpeg exited or go2rtc killed us): end the call at the gateway.
-curl -fsS "http://127.0.0.1:${CALL_PORT}/hangup?cam=${CAM}" >/dev/null 2>&1 || true
+  -rtsp_transport tcp -f rtsp "$OUTPUT"
