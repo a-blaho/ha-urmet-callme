@@ -24,7 +24,7 @@ jobs:
         working-directory: urmet_callme
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22 # same major as the image (nodesource setup_22.x)
           cache: npm
