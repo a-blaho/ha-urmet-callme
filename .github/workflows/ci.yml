@@ -23,7 +23,7 @@ jobs:
       run:
         working-directory: urmet_callme
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 22 # same major as the image (nodesource setup_22.x)
@@ -41,7 +41,7 @@ jobs:
       run:
         working-directory: urmet_callme
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install liblinphone-dev (the image's Ubuntu 24.04 packages)
         run: |
           sudo apt-get update
@@ -55,7 +55,7 @@ jobs:
     name: Version, changelog, shellcheck
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Add-on version matches package.json and has a changelog entry
         run: |
           cfg=$(grep -E '^version:' urmet_callme/config.yaml | sed -E 's/^version:[[:space:]]*"?([^"]+)"?.*/\1/')
