@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.6
 
 - **Camera switching is now consistent** (Ipercom video). Switching between two cameras used to
   take anywhere from 5 s to never (a 60 s "unavailable" from go2rtc), because the previous call was
