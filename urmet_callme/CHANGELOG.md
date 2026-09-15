@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.7
+
+- **2Voice camera audio** (the "video works but the sound is silence" report on 2Voice stations).
+  Two things were unlike the official app's camera call: the add-on offered audio recvonly, which
+  the station answered with sendonly (liblinphone then reported *PausedByRemote* right after
+  *Connected*) and never sent audio for, and the station keeps its microphone closed until the
+  viewer "opens the audio", which the app does by sending an in-call DTMF `4` (`1`/`2` are door
+  and gate, `3` the next camera). The camera call now offers audio sendrecv like the app and sends
+  the open-audio digit once the streams are running. Ipercom panels were never affected. This
+  mirrors the app's behaviour from its code and has not yet been confirmed on a 2Voice station:
+  if your camera is still silent, please open an issue with a `log_level: debug` log of one call.
+- **Audio diagnostics.** The negotiated audio/video direction is logged for every camera call, every
+  mid-call direction change from the panel is logged, each call ends with an audio RTP packet total
+  (0 received = the panel sent nothing), and `log_level: debug` adds a 5-second audio RTP/RTCP
+  counter line plus liblinphone's SIP trace.
+
 ## 1.0.6
 
 - **Camera switching is now consistent** (Ipercom video). Switching between two cameras used to

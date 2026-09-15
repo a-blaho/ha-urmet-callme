@@ -13,6 +13,11 @@ export function setLevel(l?: string): void {
   if (k in RANK) threshold = RANK[k];
 }
 
+/** True at `log_level: debug`; the media helpers get their own trace switch from it. */
+export function isDebug(): boolean {
+  return threshold <= RANK.debug;
+}
+
 /** Redact a secret for logs: keep first/last 2 chars. */
 export function redact(s?: string): string {
   if (!s) return "(none)";

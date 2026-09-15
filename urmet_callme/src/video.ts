@@ -17,7 +17,7 @@ import { createServer, Server } from "node:http";
 import { AvailableDevice, CallMe } from "./callme.js";
 import { Cloud } from "./cloud.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
-import { logger } from "./logger.js";
+import { isDebug, logger } from "./logger.js";
 import { isAlive, waitForExit } from "./proc.js";
 
 const log = logger("video");
@@ -248,6 +248,8 @@ export class VideoService {
         RECV_CONNECTED_URL: `http://127.0.0.1:${this.callPort}/connected`,
         RECV_ENDED_URL: `http://127.0.0.1:${this.callPort}/ended`, // dialog over -> a switch may re-call
         RECV_IDLE_SECONDS: String(RECV_IDLE_SECONDS),
+        // log_level debug -> recv's own trace (SIP trace + per-5s audio RTP counters).
+        ...(isDebug() ? { RECV_DEBUG: "1" } : {}),
       },
       stdio: "inherit",
     });

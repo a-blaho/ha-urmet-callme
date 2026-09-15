@@ -431,19 +431,98 @@ static MSFilterDesc awrite_desc = {
     .flags = 0,
 };
 
+/* ---- Capture side: silence ----
+ * liblinphone insists on a capture filter whenever the audio stream is sendrecv, which the 2Voice
+ * camera call is (the station only sends audio when offered sendrecv, like the app does). This
+ * pump source keeps that graph fed with a steady 8 kHz mono s16le silence, 20 ms per block, paced
+ * by the ticker; the encoder then sends silent G.711 the station ignores. The Ipercom answer stays
+ * recvonly, so there the capture graph never runs. (Two-way audio would plug a microphone feed in
+ * here; it is not implemented.) */
+typedef struct {
+  int rate;
+  int nch;
+  uint64_t start_ms; /* ticker time at the first process() */
+  int64_t produced;  /* frames produced so far (per channel) */
+} AudioSrc;
+
+static void aread_init(MSFilter *f) {
+  AudioSrc *s = ms_new0(AudioSrc, 1);
+  s->rate = 8000;
+  s->nch = 1;
+  f->data = s;
+}
+
+static void aread_process(MSFilter *f) {
+  AudioSrc *s = (AudioSrc *)f->data;
+  uint64_t now = f->ticker->time;
+  if (!s->start_ms) { s->start_ms = now; return; }
+  const int block = s->rate / 50; /* 20 ms of frames */
+  int64_t due = (int64_t)((now - s->start_ms) * (uint64_t)s->rate / 1000) - s->produced;
+  if (due > s->rate / 5) { /* fell behind (ticker stall): skip rather than burst */
+    s->produced += due - block;
+    due = block;
+  }
+  while (due >= block) {
+    size_t bytes = (size_t)block * 2 * (size_t)s->nch;
+    mblk_t *m = allocb(bytes, 0);
+    memset(m->b_wptr, 0, bytes);
+    m->b_wptr += bytes;
+    ms_queue_put(f->outputs[0], m);
+    s->produced += block;
+    due -= block;
+  }
+}
+
+static void aread_uninit(MSFilter *f) { ms_free(f->data); }
+
+static int aread_set_sr(MSFilter *f, void *a) { ((AudioSrc *)f->data)->rate = *(int *)a; return 0; }
+static int aread_get_sr(MSFilter *f, void *a) { *(int *)a = ((AudioSrc *)f->data)->rate; return 0; }
+static int aread_set_nch(MSFilter *f, void *a) { ((AudioSrc *)f->data)->nch = *(int *)a; return 0; }
+static int aread_get_nch(MSFilter *f, void *a) { *(int *)a = ((AudioSrc *)f->data)->nch; return 0; }
+
+static MSFilterMethod aread_methods[] = {
+    {MS_FILTER_SET_SAMPLE_RATE, aread_set_sr},
+    {MS_FILTER_GET_SAMPLE_RATE, aread_get_sr},
+    {MS_FILTER_SET_NCHANNELS, aread_set_nch},
+    {MS_FILTER_GET_NCHANNELS, aread_get_nch},
+    {0, NULL}};
+
+static MSFilterDesc aread_desc = {
+    .id = MS_FILTER_PLUGIN_ID,
+    .name = "PCMTapReader",
+    .text = "Silence capture source (keeps a sendrecv audio graph fed), ticker-paced",
+    .category = MS_FILTER_OTHER,
+    .ninputs = 0,
+    .noutputs = 1,
+    .init = aread_init,
+    .process = aread_process,
+    .uninit = aread_uninit,
+    .methods = aread_methods,
+    .flags = MS_FILTER_IS_PUMP,
+};
+
+static const char *dir_name(LinphoneMediaDirection d) {
+  switch (d) {
+  case LinphoneMediaDirectionInactive: return "inactive";
+  case LinphoneMediaDirectionSendOnly: return "sendonly";
+  case LinphoneMediaDirectionRecvOnly: return "recvonly";
+  case LinphoneMediaDirectionSendRecv: return "sendrecv";
+  default: return "invalid";
+  }
+}
+
 /* A minimal sound card whose writer is awrite; setting it as the playback device routes
  * liblinphone's decoded audio into our FIFO. It also advertises CAPTURE with a void-source
  * reader: liblinphone insists on a valid capture card at audio-stream setup even for a recvonly
  * answer (else "Failed to find audio device matching default input sound card" aborts the audio
- * stream). We answer recvonly, so the capture graph never runs -- the void source is just a
- * placeholder to satisfy the lookup. */
+ * stream); the reader is the silence source above, used when the graph does run (2Voice). */
 static MSFilter *pcm_create_writer(MSSndCard *card) {
   (void)card;
   return ms_factory_create_filter_from_desc(g_factory, &awrite_desc);
 }
 static MSFilter *pcm_create_reader(MSSndCard *card) {
   (void)card;
-  return ms_factory_create_filter(g_factory, MS_VOID_SOURCE_ID);
+  return ms_factory_create_filter_from_desc(g_factory, &aread_desc); /* silence, see above */
 }
 static MSSndCard *pcm_new(void);
 static MSSndCard *pcm_duplicate(MSSndCard *obj) { (void)obj; return pcm_new(); }
@@ -501,6 +580,7 @@ static void send_pfu_info(LinphoneCall *call) {
 }
 
 static LinphoneCall *g_call = NULL; /* the active call, if any */
+static int g_audio_opened = 0;      /* 2Voice: the open-audio DTMF went out for this call */
 static volatile sig_atomic_t g_running = 1;
 static int g_max_seconds = 0;  /* RECV_SECONDS: auto-stop after this long call (0=off) */
 static time_t g_stop_at = 0;
@@ -578,6 +658,11 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     const char *outfifo = getenv("RECV_H264_OUT");
     printf("[recv] INVITE FROM %s -> stream %s\n",
            fromu ? fromu : "?", outfifo ? outfifo : "?");
+    {
+      const LinphoneCallParams *rp = linphone_call_get_remote_params(call);
+      printf("[recv] panel's audio offer: %s\n",
+             rp ? dir_name(linphone_call_params_get_audio_direction(rp)) : "?");
+    }
     printf("[recv] incoming call -> answering (audio+video recvonly, H264 tap + PCM tap)\n");
     fflush(stdout);
     LinphoneCallParams *p = linphone_core_create_call_params(lc, call);
@@ -593,6 +678,29 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
   }
   case LinphoneCallStreamsRunning: {
     printf("[recv] streams running -> tapping H264\n");
+    {
+      const LinphoneCallParams *cp = linphone_call_get_current_params(call);
+      const LinphoneCallParams *rp = linphone_call_get_remote_params(call);
+      printf("[recv] negotiated audio direction: %s (remote %s), video %s\n",
+             cp ? dir_name(linphone_call_params_get_audio_direction(cp)) : "?",
+             rp ? dir_name(linphone_call_params_get_audio_direction(rp)) : "?",
+             cp ? dir_name(linphone_call_params_get_video_direction(cp)) : "?");
+    }
+    /* 2Voice (outgoing) camera call: the station keeps the audio closed until the viewer "opens"
+     * it. The app does that with an in-call DTMF '4' (UCFCallManager.OPEN_AUDIO_DTMF, sent from
+     * executeOpenAutoinsertionAudio once StreamsRunning) -- '1'/'2' being door/gate and '3' the
+     * next camera. Send it once per call, right here, like opendoor sends the door digit.
+     * RECV_OPEN_AUDIO_DTMF overrides the digit; empty disables. */
+    if (g_call_uri[0] && !g_audio_opened) {
+      const char *d = getenv("RECV_OPEN_AUDIO_DTMF");
+      char digit = d ? d[0] : '4';
+      g_audio_opened = 1;
+      if (digit) {
+        LinphoneStatus st = linphone_call_send_dtmf(call, digit);
+        printf("[recv] open-audio DTMF '%c' sent (SIP INFO) -> %s\n", digit,
+               st == 0 ? "ok" : "FAILED");
+      }
+    }
     fflush(stdout);
     /* Do NOT start the reader-idle clock yet. With tap-gating we write NOTHING until the first
      * keyframe, so counting this pre-keyframe wait as "no reader" would tear the call down before
@@ -612,8 +720,18 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     break;
   }
   case LinphoneCallEnd:
-  case LinphoneCallError:
+  case LinphoneCallError: {
     printf("[recv] call ended: %s\n", message ? message : "");
+    /* One line of audio RTP accounting per call: "recv 0 pkts" = the panel never sent audio
+     * (SIP/direction problem); packets in but a silent tap = a decode/routing problem. */
+    LinphoneCallStats *st = linphone_call_get_audio_stats(call);
+    if (st) {
+      const rtp_stats_t *r = linphone_call_stats_get_rtp_stats(st);
+      printf("[recv] audio rtp totals: recv %llu pkts (%llu B), sent %llu pkts\n",
+             (unsigned long long)r->packet_recv, (unsigned long long)r->recv,
+             (unsigned long long)r->packet_sent);
+      linphone_call_stats_unref(st);
+    }
     fflush(stdout);
     if (g_call == call) g_call = NULL;
     g_last_drain = 0;
@@ -631,6 +749,21 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
       g_running = 0;
     }
     break;
+  }
+  case LinphoneCallPausedByRemote:
+  case LinphoneCallUpdatedByRemote:
+  case LinphoneCallPaused:
+  case LinphoneCallResuming:
+  case LinphoneCallUpdating: {
+    /* Direction changes mid-call are the interesting part on 2Voice (the station re-INVITEs), so
+     * say what the remote is now offering. liblinphone accepts remote updates on its own. */
+    const LinphoneCallParams *rp = linphone_call_get_remote_params(call);
+    printf("[recv]   remote now offers audio %s, video %s\n",
+           rp ? dir_name(linphone_call_params_get_audio_direction(rp)) : "?",
+           rp ? dir_name(linphone_call_params_get_video_direction(rp)) : "?");
+    fflush(stdout);
+    break;
+  }
   default:
     break;
   }
@@ -646,6 +779,8 @@ int main(int argc, char **argv) {
             "RECV_UUID=<uuid> (stable +sip.instance id so a restart replaces our binding), "
             "RECV_HANGUP_URL=<url> (gateway cancel on idle), "
             "RECV_CONNECTED_URL=<url> (pinged at StreamsRunning), "
+            "RECV_OPEN_AUDIO_DTMF=<digit> (2Voice: in-call digit that opens the station's audio, "
+            "default 4; empty = none), "
             "RECV_ENDED_URL=<url> (pinged when the call is over), "
             "RECV_IDLE_SECONDS=<n> (default 10)\n"
             "  dev-only: RECV_SECONDS=<n> (auto-stop), RECV_DEBUG=1 (SIP trace)\n",
@@ -699,6 +834,10 @@ int main(int argc, char **argv) {
 
   /* Use the expected User-Agent (harmless inbound; the 2Voice station may gate outgoing calls on it). */
   linphone_core_set_user_agent(lc, "UrmetCallForwarding-Android", NULL);
+  /* DTMF as SIP INFO, not RFC 2833 -- what the 2Voice station expects (same as opendoor.c). Used
+   * for the open-audio digit on the 2Voice camera call (see on_call_state StreamsRunning). */
+  linphone_core_set_use_info_for_dtmf(lc, TRUE);
+  linphone_core_set_use_rfc2833_for_dtmf(lc, FALSE);
 
   /* A fresh in-memory core has TLS transport disabled (tls_port=0), so a transport=tls
    * REGISTER never binds a channel. Enable TLS on a random port; drop UDP/TCP. */
@@ -760,7 +899,7 @@ int main(int argc, char **argv) {
     for (int i = 0; snd && snd[i]; i++) {
       if (strstr(snd[i], "pcmtap")) {
         linphone_core_set_playback_device(lc, snd[i]);
-        linphone_core_set_capture_device(lc, snd[i]); /* placeholder mic; recvonly = never runs */
+        linphone_core_set_capture_device(lc, snd[i]); /* our silence source (runs only on a sendrecv call) */
         printf("[recv] audio devices -> %s (playback + capture)\n", snd[i]);
         fflush(stdout);
         break;
@@ -819,7 +958,12 @@ int main(int argc, char **argv) {
       LinphoneAddress *to = linphone_factory_create_address(f2, g_call_uri);
       LinphoneCallParams *p = linphone_core_create_call_params(lc, NULL);
       linphone_call_params_enable_audio(p, TRUE);
-      linphone_call_params_set_audio_direction(p, LinphoneMediaDirectionRecvOnly);
+      /* Audio SENDRECV, as the app offers it (UCFCallManager.inviteAddress never touches the audio
+       * direction). Offering recvonly made the station answer sendonly, which liblinphone reports
+       * as PausedByRemote right after Connected, and the station then never sent audio RTP (the
+       * "video works, PCM is silence" report on 2Voice). Our capture side is silence, so the
+       * station just gets silent G.711 from us. */
+      linphone_call_params_set_audio_direction(p, LinphoneMediaDirectionSendRecv);
       linphone_call_params_enable_video(p, TRUE);
       linphone_call_params_set_video_direction(p, LinphoneMediaDirectionRecvOnly);
       if (linphone_core_media_encryption_supported(lc, LinphoneMediaEncryptionSRTP))
@@ -831,6 +975,7 @@ int main(int argc, char **argv) {
       const char *mac = getenv("RECV_MAC");
       if (mac && *mac) linphone_call_params_add_custom_header(p, "mac", mac);
       g_keyframe_seen = 0; /* gate output until this call's first IDR */
+      g_audio_opened = 0;
       g_call = to ? linphone_core_invite_address_with_params(lc, to, p) : NULL;
       linphone_call_params_unref(p);
       if (to) linphone_address_unref(to);
@@ -902,6 +1047,28 @@ int main(int argc, char **argv) {
       linphone_call_terminate(g_call);
       g_last_drain = 0;
       fire_url("RECV_HANGUP_URL");
+    }
+    /* With RECV_DEBUG, the audio RTP/RTCP counters every 5 s: packet_recv rising = the panel's
+     * audio arrives (a silent tap is then a decode problem); rtcp in with a non-zero RTT = the
+     * panel's stack sees our stream. */
+    if (g_call && getenv("RECV_DEBUG")) {
+      static time_t last_stats = 0;
+      time_t now = time(NULL);
+      if (now - last_stats >= 5) {
+        last_stats = now;
+        LinphoneCallStats *st = linphone_call_get_audio_stats(g_call);
+        if (st) {
+          const rtp_stats_t *r = linphone_call_stats_get_rtp_stats(st);
+          printf("[recv] audio rtp: sent %llu pkts, recv %llu pkts, rtcp in %llu, rtt %.0f ms, "
+                 "sender loss %.1f%%\n",
+                 (unsigned long long)r->packet_sent, (unsigned long long)r->packet_recv,
+                 (unsigned long long)r->recv_rtcp_packets,
+                 linphone_call_stats_get_round_trip_delay(st) * 1000.0,
+                 linphone_call_stats_get_sender_loss_rate(st));
+          fflush(stdout);
+          linphone_call_stats_unref(st);
+        }
+      }
     }
     if (g_call && g_stop_at && time(NULL) >= g_stop_at) {
       printf("[recv] reached RECV_SECONDS=%d -> hanging up\n", g_max_seconds);

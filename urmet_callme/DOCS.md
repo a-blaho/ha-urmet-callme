@@ -150,7 +150,7 @@ Everything is logged to the add-on log, timestamped and tagged by component
 (`[main] [cloud] [callme] [sip] [mqtt] [video]`, plus `[recv]` from the video receiver):
 
 - `info` (default): login, SIP registration, gateway resolution, discovered entrances, every open (which door + result), MQTT connect, reconnects, inbound calls.
-- `debug`: full SIP request/response trace, cloud HTTP calls, message bodies - useful for diagnosing. Inbound calls (if the panel ever forwards to this account) log a `[sip] INBOUND CALL: …` line.
+- `debug`: full SIP request/response trace, cloud HTTP calls, message bodies - useful for diagnosing. Inbound calls (if the panel ever forwards to this account) log a `[sip] INBOUND CALL: …` line. With video on, the media helper also traces its SIP and logs audio RTP/RTCP counters every 5 s (`[recv] audio rtp: …`); every camera call logs its negotiated directions and ends with an audio packet total, so a silent camera can be told apart as "the panel sent no audio" versus "audio arrived but was not decoded".
 
 Passwords/tokens are redacted.
 
