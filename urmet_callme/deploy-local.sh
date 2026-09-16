@@ -31,7 +31,7 @@ fi
 HA_HOST="${1:-${HA_HOST:-homeassistant.local}}"
 HA_USER="${HA_USER:-root}"
 HA_PORT="${HA_PORT:-22}"
-HA_ADDONS="${HA_ADDONS:-/addons}"          # local add-ons share (the SSH/Samba add-on maps this)
+HA_ADDONS="${HA_ADDONS:-auto}"             # "auto" = ask the box (see the resolution below)
 HA_KEY="${HA_KEY:-$HOME/.ssh/homeassistant}"
 DRY_RUN="${DRY_RUN:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -76,6 +76,22 @@ fi
 
 # --- preflight: can we actually reach the box and write to /addons? ---
 echo "Checking SSH to $HA_USER@$HA_HOST:$HA_PORT (you may be asked for your key's passphrase) ..."
+
+# WHICH directory does this Supervisor actually build local add-ons from? Newer Supervisors
+# migrated from /addons to /local_apps (their CLI now warns "The use of 'addons' is deprecated,
+# please use 'apps' instead" and their log says supervisor.apps.app). They build from
+# /local_apps and IGNORE /addons -- so deploying to /addons on such a box looks like it worked,
+# the Supervisor even reports "Build ... done", and the container keeps running the previous
+# code. That silent staleness is very expensive to debug, so ask the box instead of guessing.
+if [ "$HA_ADDONS" = auto ]; then
+  HA_ADDONS="$(ssh "${SSH_OPTS[@]}" "$HA_USER@$HA_HOST" \
+    'if [ -d /local_apps ]; then echo /local_apps; else echo /addons; fi')" || {
+      echo "error: could not reach $HA_USER@$HA_HOST to detect the local add-ons directory." >&2
+      exit 1; }
+  case "$HA_ADDONS" in /local_apps|/addons) ;; *)
+      echo "error: unexpected add-ons directory '$HA_ADDONS' reported by the box." >&2; exit 1;; esac
+  echo "Local add-ons directory on the box: $HA_ADDONS"
+fi
 if ! ssh "${SSH_OPTS[@]}" "$HA_USER@$HA_HOST" "mkdir -p '$HA_ADDONS'"; then
   cat >&2 <<EOF
 error: could not SSH to $HA_USER@$HA_HOST:$HA_PORT with key auth, or '$HA_ADDONS' isn't writable.

@@ -1,18 +1,51 @@
 # Changelog
 
+## 1.0.10
+
+- **The camera stream ran at half speed, and that is what killed the audio.** Raw Annex-B H.264
+  carries no timestamps, so ffmpeg built the timeline from a frame count at an assumed 25 fps while
+  the panel actually delivers about 12.5, leaving the media clock advancing at ~0.5x. Two
+  consequences: the picture fell further behind real time the longer you watched, and the transcode
+  loop consumed the audio FIFO at half the rate the media helper fills it, so the backlog overflowed
+  and every buffer was dropped. That is what is heard as the sound dying a few seconds into a call
+  while the picture keeps updating. Every frame is now stamped from the wall clock
+  (`setpts=RTCTIME`) before the constant-framerate step. `-use_wallclock_as_timestamps 1` is meant
+  to do exactly this and does on ffmpeg 8, but is a no-op for raw H.264 on the ffmpeg 6.1 this image
+  ships (measured: 0.53x with it, 1.00x with setpts), and unlike declaring a fixed input rate it
+  stays correct at whatever rate the panel happens to send (0.99-1.00x at 6, 13 and 25 fps).
+  Measured over a 3-minute call on a real panel: 25 fps at 1.00x with no audio dropped at all,
+  against audio that previously died after ~9.5 s (1.0.8) or ~53 s (1.0.9).
+- The producer now logs its own throughput every 30 s when `log_level: debug` is set (`fps=`,
+  `speed=`). That is what identified the bug above: a `speed=` below 1.0x means the stream is
+  falling behind real time and something downstream must be discarded to keep up.
+
 ## 1.0.9
 
-- **Camera audio is silent while the video plays, on slow hosts.** The panel's audio was being
-  received and decoded correctly and then thrown away: ffmpeg reads each input on its own thread
-  into a queue that is only 8 packets deep by default, and on a slow host that queue overflows.
-  The demux thread then stops reading the media helper's audio FIFO, so every buffer the helper
-  writes fails with EAGAIN and is dropped, which is why the viewer hears nothing while the picture
-  keeps updating. Both inputs now get a 512-packet queue, which is many seconds of buffer and costs
-  a few MB. This is ffmpeg's own diagnosis rather than a guess: on a 2Voice installation it
-  reported `Thread message queue blocking; consider raising the thread_queue_size option (current
-  value: 8)` on *both* inputs, in the same call where the PCM tap logged repeated stalls and the
-  decoded audio clearly contained speech. (1.0.8 deliberately shipped without these queues because
-  no evidence then justified them; the diagnostics added in 1.0.8 are what produced the evidence.)
+- **Camera audio went silent a few seconds into every call** (all panel types; present at least as
+  far back as 1.0.6). ffmpeg reads each input on its own thread into a queue that is only 8 packets
+  deep by default. That was too shallow here: a few seconds in, the demux thread stopped draining
+  the media helper's audio FIFO, so every decoded buffer was refused with EAGAIN and dropped. The
+  panel's audio was arriving and being decoded correctly the whole time and simply thrown away,
+  which is why the picture kept updating while the sound died, and why the stream still *looks*
+  healthy: the resampler fills the gap with silence. Both inputs now get a 512-packet queue.
+  Measured on a real panel: audio used to stop for good after about 9.5 s, and now streams cleanly
+  for about 50 s, after which any drop recovers instead of sticking. ffmpeg diagnosed this itself
+  once its output was visible: `Thread message queue blocking; consider raising the
+  thread_queue_size option (current value: 8)`.
+- **The camera stream no longer uses the removed `-vsync` option.** It had been there since the
+  first release and worked only because the image's ffmpeg (6.1) still tolerates the deprecated
+  spelling. On ffmpeg 7 or newer the option is gone and the producer dies instantly with
+  `Unrecognized option 'vsync'`, so every camera would go black the moment the base image moved.
+  It now uses `-fps_mode cfr`, verified accepted on the image's own ffmpeg.
+- **Diagnostics for silent-audio reports.** `log_level: debug` now also shows the stream producers'
+  own ffmpeg messages (go2rtc forwards an exec producer's stderr only when asked for it), and the
+  PCM tap reports when its FIFO stops or resumes being drained, at any log level. The ffmpeg
+  warning that identified the bug above was invisible on every installation until this was added.
+- The camera re-encode uses `ultrafast` instead of `veryfast`, measured ~1.7x cheaper for the same
+  bitrate ceiling.
+- `deploy-local.sh` now asks the box which directory it serves local add-ons from. Newer Supervisors
+  migrated from `/addons` to `/local_apps` and build only from the latter, so deploying to `/addons`
+  reported success, logged `Build ... done`, and silently kept running the previous image.
 
 ## 1.0.8
 

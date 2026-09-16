@@ -31,6 +31,17 @@ if ! curl -fsS -m 20 "http://127.0.0.1:${CALL_PORT}/call?cam=${CAM}" >/dev/null 
   exit 1
 fi
 
+# TIMELINE: stamp every video frame with the WALL CLOCK (setpts=RTCTIME) before the CFR step.
+# Raw Annex-B has no timestamps, so ffmpeg builds the timeline from a frame count at an assumed
+# 25 fps. The panel actually delivers ~12.5 fps, so the timeline advanced at HALF real time: the
+# view fell further behind the longer you watched, and -- because the transcode loop then
+# consumed audio at half the rate the helper produces it -- the audio FIFO backed up and its
+# buffers were dropped, which is heard as the sound dying a few seconds into every call.
+# `-use_wallclock_as_timestamps 1` is meant to prevent this and DOES on ffmpeg 8, but is a no-op
+# for raw H.264 on the ffmpeg 6.1 this image ships; measured 0.53x with it, 1.00x with setpts.
+# setpts is also rate-agnostic: 0.99-1.00x whether the panel sends 6, 13 or 25 fps, whereas
+# declaring a fixed input -r is only correct at the one rate it was tuned for.
+#
 # Video: RE-ENCODE to a constant-framerate stream. The panel's H.264 is small (CIF 352x288,
 # ~200 kbps, mostly P-frames with an IDR ~every 0.7-2 s). The problem with passing it through
 # (`-c:v copy`) is TIMING: raw Annex-B carries no timestamps, so stamping by arrival wall-clock
@@ -71,13 +82,13 @@ fi
 # recv.c g_black), so ffmpeg has a stream immediately; without these flags it still waits out
 # analyzeduration (~5s) and the on-demand WebRTC negotiation locks in a trackless black session.
 # With them, ffmpeg advertises the video track within a fraction of a second of the first frame.
-exec ffmpeg -hide_banner -loglevel warning \
+exec ffmpeg -hide_banner -loglevel warning -stats -stats_period 30 \
   -analyzeduration 0 -probesize 32768 -thread_queue_size 512 \
   -use_wallclock_as_timestamps 1 -f h264 -i "$FIFO" \
   -thread_queue_size 512 \
   -use_wallclock_as_timestamps 1 -f s16le -ar 8000 -ac 1 -i "$AFIFO" \
-  -filter_complex "[1:a]aresample=async=1,asplit=2[a0][a1]" \
-  -map 0:v -map "[a0]" -map "[a1]" \
+  -filter_complex "[0:v]setpts=(RTCTIME-RTCSTART)/(TB*1000000)[v];[1:a]aresample=async=1,asplit=2[a0][a1]" \
+  -map "[v]" -map "[a0]" -map "[a1]" \
   -c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline -pix_fmt yuv420p \
     -fps_mode cfr -r 25 -g 50 -crf 20 -maxrate 1500k -bufsize 1500k \
   -c:a:0 aac -c:a:1 libopus -ar 48000 -ac 1 -b:a 64k \
