@@ -56,21 +56,25 @@ fi
 # neither is a lossy re-transcode of the other. recv forces G.711 -> PCM is ALWAYS 8 kHz mono
 # s16le (hardcode; raw s16le has no header).
 # streams: 0 = H.264 (re-encoded, CFR 25), 1 = AAC, 2 = Opus.
-# NOTE on input queues: raising -thread_queue_size was tried as a fix for a "video plays, audio is
-# silent" report and is NOT in here, because nothing justified it -- ffmpeg never emitted the
-# "Thread message queue blocking" warning that says the default is too small, and the queues cost
-# buffered RAM on the 1 GB hosts where that report came from. If that warning ever does show up
-# (it needs log_level: debug, which forwards the producer's stderr), raise it then, on evidence.
-# ultrafast keeps the encode well inside real time on small ARM hosts (CIF at 25 fps is cheap; the
-# 1.5 Mbps ceiling bounds the bitrate cost of the faster preset).
+# -thread_queue_size on BOTH inputs. ffmpeg demuxes each input in its own thread into a queue, and
+# on a slow host that queue overflows at its default depth of 8 packets: the demux thread then stops
+# reading the FIFO, recv's writes hit EAGAIN, and every buffer it wrote is dropped -- the panel's
+# audio is decoded correctly and then thrown away, so the viewer gets silence while video still
+# plays. This is not a guess: a 2Voice user on slow hardware reported ffmpeg saying so itself on
+# both inputs, "Thread message queue blocking; consider raising the thread_queue_size option
+# (current value: 8)", in the same call where the PCM tap logged repeated stalls. 512 packets is
+# many seconds of buffer on either input and costs a few MB, which is affordable on a 1 GB host.
+# ultrafast keeps the encode cheap on small ARM hosts (CIF at 25 fps; the 1.5 Mbps ceiling bounds
+# the bitrate cost of the faster preset).
 # -analyzeduration 0 -probesize 32k: don't spend the default ~5s analyzing the H.264 input before
 # announcing the output track. recv feeds a continuous black keyframe stream from call-start (see
 # recv.c g_black), so ffmpeg has a stream immediately; without these flags it still waits out
 # analyzeduration (~5s) and the on-demand WebRTC negotiation locks in a trackless black session.
 # With them, ffmpeg advertises the video track within a fraction of a second of the first frame.
 exec ffmpeg -hide_banner -loglevel warning \
-  -analyzeduration 0 -probesize 32768 \
+  -analyzeduration 0 -probesize 32768 -thread_queue_size 512 \
   -use_wallclock_as_timestamps 1 -f h264 -i "$FIFO" \
+  -thread_queue_size 512 \
   -use_wallclock_as_timestamps 1 -f s16le -ar 8000 -ac 1 -i "$AFIFO" \
   -filter_complex "[1:a]aresample=async=1,asplit=2[a0][a1]" \
   -map 0:v -map "[a0]" -map "[a1]" \

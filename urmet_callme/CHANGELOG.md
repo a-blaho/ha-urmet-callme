@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.9
+
+- **Camera audio is silent while the video plays, on slow hosts.** The panel's audio was being
+  received and decoded correctly and then thrown away: ffmpeg reads each input on its own thread
+  into a queue that is only 8 packets deep by default, and on a slow host that queue overflows.
+  The demux thread then stops reading the media helper's audio FIFO, so every buffer the helper
+  writes fails with EAGAIN and is dropped, which is why the viewer hears nothing while the picture
+  keeps updating. Both inputs now get a 512-packet queue, which is many seconds of buffer and costs
+  a few MB. This is ffmpeg's own diagnosis rather than a guess: on a 2Voice installation it
+  reported `Thread message queue blocking; consider raising the thread_queue_size option (current
+  value: 8)` on *both* inputs, in the same call where the PCM tap logged repeated stalls and the
+  decoded audio clearly contained speech. (1.0.8 deliberately shipped without these queues because
+  no evidence then justified them; the diagnostics added in 1.0.8 are what produced the evidence.)
+
 ## 1.0.8
 
 - **Diagnostics for the "video plays but the audio is silent" case.** `log_level: debug` now also
