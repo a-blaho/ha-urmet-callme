@@ -84,6 +84,7 @@ export function go2rtcConfig(
   cameras: number,
   callPort: number,
   ports: Go2rtcPorts,
+  debug = false, // add-on log_level debug: also surface the producers' stderr (ffmpeg warnings)
 ): string {
   const streams: string[] = [];
   for (let i = 0; i < cameras; i++)
@@ -96,6 +97,9 @@ export function go2rtcConfig(
     `exec: { allow_paths: ${yamlList([STREAM_SCRIPT])} }`,
     `rtsp: { listen: ":${ports.rtsp}" }`,
     webrtcListen(ports),
+    // go2rtc forwards an exec producer's stderr to its log ONLY when the exec module logs at debug;
+    // without this ffmpeg's own warnings (input EOF, encoder falling behind) are never seen.
+    ...(debug ? ["log: { exec: debug }"] : []),
     "streams:",
     ...streams,
     "",

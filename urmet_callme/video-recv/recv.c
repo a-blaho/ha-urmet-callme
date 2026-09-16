@@ -302,6 +302,7 @@ typedef struct {
   long win_samp;    /* samples accumulated this window */
   double win_sumabs; /* sum of |sample| this window (avg level; no sqrt/-lm needed) */
   int win_peak;     /* peak |sample| this window */
+  int stalled;      /* last window: every write dropped (nothing draining the FIFO) */
 } AudioTap;
 
 static void awrite_init(MSFilter *f) {
@@ -383,6 +384,20 @@ static void awrite_process(MSFilter *f) {
    * downstream (ffmpeg/go2rtc). */
   if (s->win_samp >= s->rate && s->rate > 0) {
     long avg = s->win_samp ? (long)(s->win_sumabs / (double)s->win_samp) : 0;
+    /* Reader health, logged on TRANSITIONS so it is visible at any log level: a whole window
+     * dropped means nothing is reading the PCM FIFO -- ffmpeg gone (the viewer left; the H.264
+     * idle timer will end the call) or ffmpeg alive but not consuming audio (its video encode is
+     * behind real time and its audio input queue is full: see stream.sh's -thread_queue_size). */
+    int all_dropped = s->win_frames > 0 && s->win_dropped >= s->win_frames;
+    if (all_dropped && !s->stalled) {
+      printf("[atap] PCM FIFO not being drained: every audio buffer dropped this second "
+             "(no reader, or ffmpeg not consuming audio)\n");
+      fflush(stdout);
+    } else if (!all_dropped && s->stalled) {
+      printf("[atap] PCM FIFO draining again\n");
+      fflush(stdout);
+    }
+    s->stalled = all_dropped;
     fprintf(stderr,
             "[atap] audio ~1s: %ld buf, avg=%ld peak=%d (of 32768), total=%ldB dropped=%ld\n",
             s->win_frames, avg, s->win_peak, s->bytes, s->win_dropped);

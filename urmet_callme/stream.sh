@@ -39,10 +39,12 @@ fi
 # at go2rtc but only ~7 fps surviving to an ffmpeg consumer, and far fewer to a browser) -- the
 # "very low framerate" symptom. Copy can't fix this cleanly (a fixed input `-r` would desync from
 # the real-time audio). So decode and re-encode with a real-time reference (wall-clock input PTS)
-# and `-vsync cfr`: libx264 emits clean, monotonic, evenly-paced timestamps at a true CFR, staying
+# and `-fps_mode cfr` (the documented replacement for `-vsync`, which ffmpeg 7 REMOVED; the image
+# ships 6.1, where both work): libx264 emits clean, monotonic, evenly-paced timestamps at a true
+# CFR, staying
 # anchored to the real-time (audio) timeline. This also yields a proper GOP (small P-frames +
 # periodic keyframe) that go2rtc/WebRTC CAN adapt down on a constrained link -- so it fixes the
-# cellular stutter too. Re-encoding CIF is cheap: at CIF with veryfast + CRF 20 + a 1.5 Mbps
+# cellular stutter too. Re-encoding CIF is cheap: at CIF with ultrafast + CRF 20 + a 1.5 Mbps
 # ceiling the picture is clean and CPU is light. `-tune zerolatency` keeps latency low; baseline +
 # yuv420p keep it WebRTC-friendly.
 # Audio: the panel's PCM arrives at recv in bursts/gaps (recv drops buffers under back-pressure).
@@ -54,6 +56,13 @@ fi
 # neither is a lossy re-transcode of the other. recv forces G.711 -> PCM is ALWAYS 8 kHz mono
 # s16le (hardcode; raw s16le has no header).
 # streams: 0 = H.264 (re-encoded, CFR 25), 1 = AAC, 2 = Opus.
+# NOTE on input queues: raising -thread_queue_size was tried as a fix for a "video plays, audio is
+# silent" report and is NOT in here, because nothing justified it -- ffmpeg never emitted the
+# "Thread message queue blocking" warning that says the default is too small, and the queues cost
+# buffered RAM on the 1 GB hosts where that report came from. If that warning ever does show up
+# (it needs log_level: debug, which forwards the producer's stderr), raise it then, on evidence.
+# ultrafast keeps the encode well inside real time on small ARM hosts (CIF at 25 fps is cheap; the
+# 1.5 Mbps ceiling bounds the bitrate cost of the faster preset).
 # -analyzeduration 0 -probesize 32k: don't spend the default ~5s analyzing the H.264 input before
 # announcing the output track. recv feeds a continuous black keyframe stream from call-start (see
 # recv.c g_black), so ffmpeg has a stream immediately; without these flags it still waits out
@@ -65,7 +74,7 @@ exec ffmpeg -hide_banner -loglevel warning \
   -use_wallclock_as_timestamps 1 -f s16le -ar 8000 -ac 1 -i "$AFIFO" \
   -filter_complex "[1:a]aresample=async=1,asplit=2[a0][a1]" \
   -map 0:v -map "[a0]" -map "[a1]" \
-  -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p \
-    -vsync cfr -r 25 -g 50 -crf 20 -maxrate 1500k -bufsize 1500k \
+  -c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline -pix_fmt yuv420p \
+    -fps_mode cfr -r 25 -g 50 -crf 20 -maxrate 1500k -bufsize 1500k \
   -c:a:0 aac -c:a:1 libopus -ar 48000 -ac 1 -b:a 64k \
   -rtsp_transport tcp -f rtsp "$OUTPUT"

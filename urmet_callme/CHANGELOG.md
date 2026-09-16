@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.8
+
+- **Diagnostics for the "video plays but the audio is silent" case.** `log_level: debug` now also
+  shows the stream producers' own ffmpeg messages (go2rtc forwards an exec producer's stderr only
+  when asked for it), and the PCM tap reports when its FIFO stops or resumes being drained, at any
+  log level. Together these say whether ffmpeg is alive, what it is complaining about, and whether
+  anything is reading the audio the panel sends.
+- **The camera stream no longer uses the removed `-vsync` option.** It has been there since the
+  first release and works only because the image's ffmpeg (6.1) still tolerates the deprecated
+  spelling. On ffmpeg 7 or newer the option is gone and the producer dies instantly with
+  `Unrecognized option 'vsync'`, so every camera would go black the moment the base image moved.
+  It now uses `-fps_mode cfr`, verified accepted on the image's own ffmpeg.
+- The camera re-encode uses `ultrafast` instead of `veryfast`, measured ~1.7x cheaper for the same
+  bitrate ceiling. That is headroom, **not** a fix for the silent-audio report, whose cause is
+  still open.
+
 ## 1.0.7
 
 - **2Voice camera audio** (the "video works but the sound is silence" report on 2Voice stations).

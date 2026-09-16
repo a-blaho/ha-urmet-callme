@@ -68,7 +68,7 @@ export class TwoVoiceVideoService {
     await this.serveCallEndpoint();
     // go2rtc: one on-demand stream per camera, hardened config (see go2rtc.ts), auto-respawned.
     this.go2rtc = new Go2rtcProcess(() =>
-      go2rtcConfig(this.cams.length, this.callPort, this.ports),
+      go2rtcConfig(this.cams.length, this.callPort, this.ports, isDebug()),
     );
     this.go2rtc.start();
     log.info(

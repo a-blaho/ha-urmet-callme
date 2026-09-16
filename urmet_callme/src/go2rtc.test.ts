@@ -27,6 +27,11 @@ test("go2rtcConfig emits one on-demand stream per camera with the call port", ()
   assert.ok(cfg.endsWith("\n"));
 });
 
+test("go2rtcConfig surfaces exec stderr only in debug", () => {
+  assert.ok(!go2rtcConfig(1, 1, ports).includes("log:"));
+  assert.match(go2rtcConfig(1, 1, ports, true), /^log: \{ exec: debug \}$/m);
+});
+
 test("webrtcListen adds a candidate only in bridge networking", () => {
   assert.equal(webrtcListen(ports), 'webrtc: { listen: ":8555" }');
   assert.equal(
