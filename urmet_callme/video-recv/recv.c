@@ -422,10 +422,8 @@ static void awrite_process(MSFilter *f) {
       fflush(stdout);
     }
     s->stalled = all_dropped;
-    fprintf(stderr,
-            "[atap] audio ~1s: %ld buf, avg=%ld peak=%d (of 32768), total=%ldB dropped=%ld\n",
-            s->win_frames, avg, s->win_peak, s->bytes, s->win_dropped);
-    fflush(stderr);
+    rlog("[atap] audio ~1s: %ld buf, avg=%ld peak=%d (of 32768), total=%ldB dropped=%ld\n",
+         s->win_frames, avg, s->win_peak, s->bytes, s->win_dropped);
     s->win_frames = 0;
     s->win_dropped = 0;
     s->win_samp = 0;

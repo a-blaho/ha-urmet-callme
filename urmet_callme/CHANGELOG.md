@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.12
+
+- **The per-second audio diagnostic line now carries a timestamp too.** 1.0.11 timestamped the
+  helper's log lines but missed two whose format string sat on the following line, and one of them
+  was `[atap] audio ~1s: ...` -- the very line you correlate against when chasing delayed or
+  dropped camera audio. It was also the last line still going to stderr rather than stdout, so its
+  position relative to the timestamped lines was not reliable. (The other missed one is the usage
+  text, which correctly stays untimestamped on stderr.)
+
 ## 1.0.11
 
 - **The media helper's log lines now carry a timestamp**, and all of them go to one stream. The
