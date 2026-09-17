@@ -38,8 +38,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <stdarg.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Timestamped log line. The helper's output used to carry no timestamp of its own while the control
+ * plane stamps every line and liblinphone stamps its own, so in the add-on log you could not tell
+ * when [recv]/[atap]/[tap] events happened relative to anything else -- which made diagnosing the
+ * order of "audio started", "first keyframe" and "ffmpeg attached" impossible from a user's log.
+ * Everything also goes to STDOUT now: [atap] on stderr and [recv] on stdout could appear out of
+ * order, since the two streams are buffered separately. */
+static void rlog(const char *fmt, ...) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  struct tm tm;
+  gmtime_r(&tv.tv_sec, &tm);
+  char when[24];
+  strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%S", &tm);
+  printf("%s.%03dZ ", when, (int)(tv.tv_usec / 1000));
+  va_list ap;
+  va_start(ap, fmt);
+  vprintf(fmt, ap);
+  va_end(ap);
+  fflush(stdout);
+}
+
 
 /* ---- H.264 tap: a custom mediastreamer "decoder" that does NOT decode. Registered as the
  * H264 decoder so liblinphone negotiates H264 recvonly and routes the received RTP to it.
@@ -72,7 +96,7 @@ static void load_black_frame(void) {
   const char *p = getenv("RECV_BLACK_FRAME");
   if (!p || !*p) p = "/app/black.h264";
   FILE *fp = fopen(p, "rb");
-  if (!fp) { fprintf(stderr, "[tap] no priming frame at %s (cold-start black not masked)\n", p); return; }
+  if (!fp) { rlog("[tap] no priming frame at %s (cold-start black not masked)\n", p); return; }
   fseek(fp, 0, SEEK_END);
   long sz = ftell(fp);
   fseek(fp, 0, SEEK_SET);
@@ -82,7 +106,7 @@ static void load_black_frame(void) {
     else { free(g_black); g_black = NULL; }
   }
   fclose(fp);
-  fprintf(stderr, "[tap] priming frame loaded: %zu bytes from %s\n", g_black_len, p);
+  rlog("[tap] priming frame loaded: %zu bytes from %s\n", g_black_len, p);
 }
 
 typedef struct {
@@ -172,7 +196,7 @@ static void tap_init(MSFilter *f) {
   if (!s->path[0]) snprintf(s->path, sizeof s->path, "%s", "/tmp/cam.h264");
   s->unpacker = rfc3984_new_with_factory(f->factory);
   f->data = s;
-  fprintf(stderr, "[tap] H264 tap decoder instantiated -> %s\n", s->path);
+  rlog("[tap] H264 tap decoder instantiated -> %s\n", s->path);
   fflush(stderr);
 }
 
@@ -187,7 +211,7 @@ static void tap_process(MSFilter *f) {
     int fd = open(s->path, O_RDWR | O_CREAT | O_NONBLOCK, 0644);
     if (fd >= 0) {
       s->fd = fd;
-      fprintf(stderr, "[tap] output stream opened\n");
+      rlog("[tap] output stream opened\n");
       fflush(stderr);
     }
   }
@@ -203,7 +227,7 @@ static void tap_process(MSFilter *f) {
     if (now - s->last_black_ms >= 40) { /* ~25 fps */
       write_black(s);
       if (s->last_black_ms == 0) {
-        fprintf(stderr, "[tap] priming black stream -> track advertised early\n");
+        rlog("[tap] priming black stream -> track advertised early\n");
         fflush(stderr);
       }
       s->last_black_ms = now;
@@ -220,7 +244,7 @@ static void tap_process(MSFilter *f) {
       int type = (n > 0) ? (nal->b_rptr[0] & 0x1F) : -1;
       if (type == 5) g_keyframe_seen = 1; /* IDR -> a decodable picture is now on the wire */
       if (s->nalus < 12) { /* diagnostic: log first NALs' type + size */
-        fprintf(stderr, "[tap] NAL #%ld type=%d size=%zu\n", s->nalus, type, n);
+        rlog("[tap] NAL #%ld type=%d size=%zu\n", s->nalus, type, n);
         fflush(stderr);
       }
       s->nalus++;
@@ -319,7 +343,7 @@ static void awrite_init(MSFilter *f) {
  * else means the codec forcing didn't take and stream.sh's hardcoded 8k/mono will be wrong. */
 static void awrite_announce(AudioTap *s) {
   if (s->announced) return;
-  fprintf(stderr, "[atap] PCM format: %d Hz, %d ch, s16le\n", s->rate, s->nch);
+  rlog("[atap] PCM format: %d Hz, %d ch, s16le\n", s->rate, s->nch);
   fflush(stderr);
   s->announced = 1;
 }
@@ -333,7 +357,7 @@ static void awrite_process(MSFilter *f) {
     int fd = open(s->path, O_RDWR | O_CREAT | O_NONBLOCK, 0644);
     if (fd >= 0) {
       s->fd = fd;
-      fprintf(stderr, "[atap] PCM stream opened -> %s (%d Hz, %d ch, s16le)\n",
+      rlog("[atap] PCM stream opened -> %s (%d Hz, %d ch, s16le)\n",
               s->path, s->rate, s->nch);
       fflush(stderr);
     }
@@ -390,11 +414,11 @@ static void awrite_process(MSFilter *f) {
      * behind real time and its audio input queue is full: see stream.sh's -thread_queue_size). */
     int all_dropped = s->win_frames > 0 && s->win_dropped >= s->win_frames;
     if (all_dropped && !s->stalled) {
-      printf("[atap] PCM FIFO not being drained: every audio buffer dropped this second "
+      rlog("[atap] PCM FIFO not being drained: every audio buffer dropped this second "
              "(no reader, or ffmpeg not consuming audio)\n");
       fflush(stdout);
     } else if (!all_dropped && s->stalled) {
-      printf("[atap] PCM FIFO draining again\n");
+      rlog("[atap] PCM FIFO draining again\n");
       fflush(stdout);
     }
     s->stalled = all_dropped;
@@ -627,7 +651,7 @@ static void on_sigusr2(int _sig) { (void)_sig; g_vfu_req = 1; }
 static void on_reg_state(LinphoneCore *lc, LinphoneProxyConfig *cfg,
                          LinphoneRegistrationState state, const char *message) {
   (void)lc; (void)cfg;
-  printf("[recv] registration: %s (%s)\n",
+  rlog("[recv] registration: %s (%s)\n",
          linphone_registration_state_to_string(state), message ? message : "");
   fflush(stdout);
   if (state == LinphoneRegistrationOk) g_reg_ok = 1;
@@ -636,21 +660,21 @@ static void on_reg_state(LinphoneCore *lc, LinphoneProxyConfig *cfg,
 static void on_global_state(LinphoneCore *lc, LinphoneGlobalState state,
                             const char *message) {
   (void)lc;
-  printf("[recv] global state: %s (%s)\n",
+  rlog("[recv] global state: %s (%s)\n",
          linphone_global_state_to_string(state), message ? message : "");
   fflush(stdout);
 }
 
 static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
                           LinphoneCallState state, const char *message) {
-  printf("[recv] call state: %s\n", linphone_call_state_to_string(state));
+  rlog("[recv] call state: %s\n", linphone_call_state_to_string(state));
   fflush(stdout);
   switch (state) {
   case LinphoneCallIncomingReceived: {
     if (g_call_uri[0]) {
       /* 2Voice OUTGOING mode: we place our own call; never answer an inbound INVITE (a doorbell
        * ring forked to this registration -- the Node doorbell listener handles rings). */
-      printf("[recv] ignoring inbound INVITE (outgoing mode)\n");
+      rlog("[recv] ignoring inbound INVITE (outgoing mode)\n");
       fflush(stdout);
       break;
     }
@@ -660,7 +684,7 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
      * blocks every later camera request until its session timer expires (minutes). Decline
      * instead, loudly -- a failed view is recoverable, a zombie call is not. */
     if (g_call) {
-      printf("[recv] DECLINING inbound INVITE: a call is already up (control plane did not BYE it)\n");
+      rlog("[recv] DECLINING inbound INVITE: a call is already up (control plane did not BYE it)\n");
       fflush(stdout);
       linphone_call_decline(call, LinphoneReasonBusy);
       break;
@@ -671,14 +695,14 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     const LinphoneAddress *from = linphone_call_get_remote_address(call);
     const char *fromu = from ? linphone_address_get_username(from) : NULL;
     const char *outfifo = getenv("RECV_H264_OUT");
-    printf("[recv] INVITE FROM %s -> stream %s\n",
+    rlog("[recv] INVITE FROM %s -> stream %s\n",
            fromu ? fromu : "?", outfifo ? outfifo : "?");
     {
       const LinphoneCallParams *rp = linphone_call_get_remote_params(call);
-      printf("[recv] panel's audio offer: %s\n",
+      rlog("[recv] panel's audio offer: %s\n",
              rp ? dir_name(linphone_call_params_get_audio_direction(rp)) : "?");
     }
-    printf("[recv] incoming call -> answering (audio+video recvonly, H264 tap + PCM tap)\n");
+    rlog("[recv] incoming call -> answering (audio+video recvonly, H264 tap + PCM tap)\n");
     fflush(stdout);
     LinphoneCallParams *p = linphone_core_create_call_params(lc, call);
     linphone_call_params_enable_audio(p, TRUE);
@@ -692,11 +716,11 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     break;
   }
   case LinphoneCallStreamsRunning: {
-    printf("[recv] streams running -> tapping H264\n");
+    rlog("[recv] streams running -> tapping H264\n");
     {
       const LinphoneCallParams *cp = linphone_call_get_current_params(call);
       const LinphoneCallParams *rp = linphone_call_get_remote_params(call);
-      printf("[recv] negotiated audio direction: %s (remote %s), video %s\n",
+      rlog("[recv] negotiated audio direction: %s (remote %s), video %s\n",
              cp ? dir_name(linphone_call_params_get_audio_direction(cp)) : "?",
              rp ? dir_name(linphone_call_params_get_audio_direction(rp)) : "?",
              cp ? dir_name(linphone_call_params_get_video_direction(cp)) : "?");
@@ -712,7 +736,7 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
       g_audio_opened = 1;
       if (digit) {
         LinphoneStatus st = linphone_call_send_dtmf(call, digit);
-        printf("[recv] open-audio DTMF '%c' sent (SIP INFO) -> %s\n", digit,
+        rlog("[recv] open-audio DTMF '%c' sent (SIP INFO) -> %s\n", digit,
                st == 0 ? "ok" : "FAILED");
       }
     }
@@ -736,13 +760,13 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
   }
   case LinphoneCallEnd:
   case LinphoneCallError: {
-    printf("[recv] call ended: %s\n", message ? message : "");
+    rlog("[recv] call ended: %s\n", message ? message : "");
     /* One line of audio RTP accounting per call: "recv 0 pkts" = the panel never sent audio
      * (SIP/direction problem); packets in but a silent tap = a decode/routing problem. */
     LinphoneCallStats *st = linphone_call_get_audio_stats(call);
     if (st) {
       const rtp_stats_t *r = linphone_call_stats_get_rtp_stats(st);
-      printf("[recv] audio rtp totals: recv %llu pkts (%llu B), sent %llu pkts\n",
+      rlog("[recv] audio rtp totals: recv %llu pkts (%llu B), sent %llu pkts\n",
              (unsigned long long)r->packet_recv, (unsigned long long)r->recv,
              (unsigned long long)r->packet_sent);
       linphone_call_stats_unref(st);
@@ -759,7 +783,7 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     /* Inbound (IPERCOM): stay registered for the next call. Outgoing (2Voice on-demand): our one
      * call ended (viewer left / idle) -> exit so the control plane respawns us on the next view. */
     if (g_call_uri[0]) {
-      printf("[recv] outgoing call ended -> exiting\n");
+      rlog("[recv] outgoing call ended -> exiting\n");
       fflush(stdout);
       g_running = 0;
     }
@@ -773,7 +797,7 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     /* Direction changes mid-call are the interesting part on 2Voice (the station re-INVITEs), so
      * say what the remote is now offering. liblinphone accepts remote updates on its own. */
     const LinphoneCallParams *rp = linphone_call_get_remote_params(call);
-    printf("[recv]   remote now offers audio %s, video %s\n",
+    rlog("[recv]   remote now offers audio %s, video %s\n",
            rp ? dir_name(linphone_call_params_get_audio_direction(rp)) : "?",
            rp ? dir_name(linphone_call_params_get_video_direction(rp)) : "?");
     fflush(stdout);
@@ -915,7 +939,7 @@ int main(int argc, char **argv) {
       if (strstr(snd[i], "pcmtap")) {
         linphone_core_set_playback_device(lc, snd[i]);
         linphone_core_set_capture_device(lc, snd[i]); /* our silence source (runs only on a sendrecv call) */
-        printf("[recv] audio devices -> %s (playback + capture)\n", snd[i]);
+        rlog("[recv] audio devices -> %s (playback + capture)\n", snd[i]);
         fflush(stdout);
         break;
       }
@@ -933,7 +957,7 @@ int main(int argc, char **argv) {
       const char *mime = linphone_payload_type_get_mime_type(pt);
       int keep = mime && (strcasecmp(mime, "PCMU") == 0 || strcasecmp(mime, "PCMA") == 0);
       linphone_payload_type_enable(pt, keep);
-      if (keep) { printf("[recv] audio codec kept: %s\n", mime); fflush(stdout); }
+      if (keep) { rlog("[recv] audio codec kept: %s\n", mime); fflush(stdout); }
     }
     bctbx_list_free(pts); /* free the list nodes only (safe across liblinphone ownership quirks) */
   }
@@ -958,7 +982,7 @@ int main(int argc, char **argv) {
   linphone_account_params_unref(ap);
   linphone_account_unref(account);
 
-  printf("[recv] registering %s over %s ...\n", identity, server);
+  rlog("[recv] registering %s over %s ...\n", identity, server);
   fflush(stdout);
 
   while (g_running) {
@@ -994,7 +1018,7 @@ int main(int argc, char **argv) {
       g_call = to ? linphone_core_invite_address_with_params(lc, to, p) : NULL;
       linphone_call_params_unref(p);
       if (to) linphone_address_unref(to);
-      printf("[recv] 2Voice video call placed (header: %s) -> %s\n",
+      rlog("[recv] 2Voice video call placed (header: %s) -> %s\n",
              (mac && *mac) ? "mac" : "none", g_call_uri);
       fflush(stdout);
     }
@@ -1005,13 +1029,13 @@ int main(int argc, char **argv) {
     if (g_hangup_req) {
       g_hangup_req = 0;
       if (g_call) {
-        printf("[recv] SIGUSR1 -> terminating current call (in-dialog BYE)\n");
+        rlog("[recv] SIGUSR1 -> terminating current call (in-dialog BYE)\n");
         fflush(stdout);
         linphone_call_terminate(g_call);
         g_last_drain = 0;
         g_video_deadline = 0;
       } else {
-        printf("[recv] SIGUSR1 with no call up -> nothing to end\n");
+        rlog("[recv] SIGUSR1 with no call up -> nothing to end\n");
         fflush(stdout);
       }
     }
@@ -1021,7 +1045,7 @@ int main(int argc, char **argv) {
       if (g_call) {
         linphone_call_send_vfu_request(g_call);
         send_pfu_info(g_call);
-        printf("[recv] SIGUSR2 -> keyframe requested for the re-attached reader\n");
+        rlog("[recv] SIGUSR2 -> keyframe requested for the re-attached reader\n");
         fflush(stdout);
       }
     }
@@ -1033,12 +1057,12 @@ int main(int argc, char **argv) {
     if (g_call && g_video_deadline) {
       time_t now = time(NULL);
       if (g_keyframe_seen) {
-        printf("[recv] keyframe received -> video started\n");
+        rlog("[recv] keyframe received -> video started\n");
         fflush(stdout);
         g_video_deadline = 0;
         if (!g_last_drain) g_last_drain = now;
       } else if (now >= g_video_deadline) {
-        printf("[recv] no keyframe within window -> hanging up (panel busy?)\n");
+        rlog("[recv] no keyframe within window -> hanging up (panel busy?)\n");
         fflush(stdout);
         g_video_deadline = 0;
         linphone_call_terminate(g_call);
@@ -1047,7 +1071,7 @@ int main(int argc, char **argv) {
         g_last_vfu = now;
         linphone_call_send_vfu_request(g_call); /* liblinphone's RTCP path */
         send_pfu_info(g_call);                  /* explicit SIP INFO media_control+xml (what lands) */
-        printf("[recv] requesting keyframe (VFU + INFO) -- no IDR yet\n");
+        rlog("[recv] requesting keyframe (VFU + INFO) -- no IDR yet\n");
         fflush(stdout);
       }
     }
@@ -1057,7 +1081,7 @@ int main(int argc, char **argv) {
      * gap. A SIP BYE alone won't free the door station's channel, so also ask the control
      * plane to send the gateway cancel_call_req. */
     if (g_call && g_last_drain && time(NULL) - g_last_drain >= g_idle_seconds) {
-      printf("[recv] no FIFO reader for %ds -> hanging up\n", g_idle_seconds);
+      rlog("[recv] no FIFO reader for %ds -> hanging up\n", g_idle_seconds);
       fflush(stdout);
       linphone_call_terminate(g_call);
       g_last_drain = 0;
@@ -1074,7 +1098,7 @@ int main(int argc, char **argv) {
         LinphoneCallStats *st = linphone_call_get_audio_stats(g_call);
         if (st) {
           const rtp_stats_t *r = linphone_call_stats_get_rtp_stats(st);
-          printf("[recv] audio rtp: sent %llu pkts, recv %llu pkts, rtcp in %llu, rtt %.0f ms, "
+          rlog("[recv] audio rtp: sent %llu pkts, recv %llu pkts, rtcp in %llu, rtt %.0f ms, "
                  "sender loss %.1f%%\n",
                  (unsigned long long)r->packet_sent, (unsigned long long)r->packet_recv,
                  (unsigned long long)r->recv_rtcp_packets,
@@ -1086,7 +1110,7 @@ int main(int argc, char **argv) {
       }
     }
     if (g_call && g_stop_at && time(NULL) >= g_stop_at) {
-      printf("[recv] reached RECV_SECONDS=%d -> hanging up\n", g_max_seconds);
+      rlog("[recv] reached RECV_SECONDS=%d -> hanging up\n", g_max_seconds);
       fflush(stdout);
       linphone_call_terminate(g_call);
       g_stop_at = 0;
@@ -1096,14 +1120,14 @@ int main(int argc, char **argv) {
   /* Hang up cleanly (BYE) so the door station frees the video channel; otherwise it stays
    * "busy" and won't ring again until its session timer expires. */
   if (g_call) {
-    printf("[recv] terminating active call (BYE)\n");
+    rlog("[recv] terminating active call (BYE)\n");
     linphone_call_terminate(g_call);
     for (int i = 0; i < 40 && g_call; i++) { /* pump iterate so the BYE actually goes out */
       linphone_core_iterate(lc);
       usleep(25 * 1000);
     }
   }
-  printf("[recv] shutting down\n");
+  rlog("[recv] shutting down\n");
   fflush(stdout);
   linphone_core_stop(lc);
   linphone_core_unref(lc);

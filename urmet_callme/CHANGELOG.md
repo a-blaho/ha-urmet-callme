@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.11
+
+- **The media helper's log lines now carry a timestamp**, and all of them go to one stream. The
+  control plane stamps every line it writes and liblinphone stamps its own, but the helper's
+  `[recv]`, `[atap]` and `[tap]` lines carried none, so in an add-on log there was no way to tell
+  when "audio started", "first keyframe" and "ffmpeg attached" happened relative to each other.
+  That ordering is exactly what is needed to diagnose a camera whose audio is delayed or drops out,
+  and it could previously only be guessed at from neighbouring liblinphone lines. `[atap]` also used
+  to go to stderr while `[recv]` went to stdout, which are buffered separately, so their relative
+  order in the log was not even reliable; everything is on stdout now.
+
 ## 1.0.10
 
 - **The camera stream ran at half speed, and that is what killed the audio.** Raw Annex-B H.264
