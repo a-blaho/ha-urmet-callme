@@ -75,6 +75,14 @@ fi
 # both inputs, "Thread message queue blocking; consider raising the thread_queue_size option
 # (current value: 8)", in the same call where the PCM tap logged repeated stalls. 512 packets is
 # many seconds of buffer on either input and costs a few MB, which is affordable on a 1 GB host.
+# The AUDIO queue is deliberately SMALL (32 packets ~ 2 s at 8 kHz mono; the raw demuxer reads
+# 1024-byte packets). A big audio queue does not just absorb hiccups, it HIDES LATENCY: whatever
+# is queued is older than what arrives next, and since the transcode loop consumes audio at the
+# rate its output timeline advances, a backlog built up before the video timeline starts never
+# drains -- it becomes a permanent offset. Measured on a real installation: audio ran 4.3 s
+# behind the picture with a 512-packet queue, while losing no samples at all mid-call. For a
+# doorbell a short gap is far better than hearing the visitor seconds late, so the audio side
+# gets a tight queue and the video side keeps a generous one.
 # ultrafast keeps the encode cheap on small ARM hosts (CIF at 25 fps; the 1.5 Mbps ceiling bounds
 # the bitrate cost of the faster preset).
 # -analyzeduration 0 -probesize 32k: don't spend the default ~5s analyzing the H.264 input before
@@ -85,7 +93,7 @@ fi
 exec ffmpeg -hide_banner -loglevel warning -stats -stats_period 30 \
   -analyzeduration 0 -probesize 32768 -thread_queue_size 512 \
   -use_wallclock_as_timestamps 1 -f h264 -i "$FIFO" \
-  -thread_queue_size 512 \
+  -thread_queue_size 32 \
   -use_wallclock_as_timestamps 1 -f s16le -ar 8000 -ac 1 -i "$AFIFO" \
   -filter_complex "[0:v]setpts=(RTCTIME-RTCSTART)/(TB*1000000)[v];[1:a]aresample=async=1,asplit=2[a0][a1]" \
   -map "[v]" -map "[a0]" -map "[a1]" \

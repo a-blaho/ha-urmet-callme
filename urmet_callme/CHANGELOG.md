@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.13
+
+- **Camera audio was playing seconds behind the picture; its buffer is now tight.** Measured on a
+  real installation: the audio timeline began 4.3 s before the video timeline and both then advanced
+  at real time, so the visitor was heard 4.3 s late for the entire call, with no samples lost at all.
+  The cause is that a large input queue hides latency rather than only absorbing hiccups -- whatever
+  is queued is older than what arrives next, and the transcode loop consumes audio at the rate its
+  output timeline advances, so a backlog accumulated before the video timeline starts never drains.
+  The audio input queue drops from 512 packets (up to ~32 s) to 32 (~2 s); video keeps 512. For a
+  doorbell a brief gap beats hearing someone seconds late.
+- Note this is a deliberate trade: with the tight queue a stall that previously went unnoticed can
+  now cause a short audible gap instead. If you see `dropped=` rising mid-call in the `[atap]` lines
+  at `log_level: debug`, please report it -- that is the signal this went too far.
+
 ## 1.0.12
 
 - **The per-second audio diagnostic line now carries a timestamp too.** 1.0.11 timestamped the
