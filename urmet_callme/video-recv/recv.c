@@ -642,6 +642,45 @@ static char g_call_uri[256] = "";
 static int g_reg_ok = 0; /* our registration reached Ok (gate for placing the outgoing call) */
 static int g_placed = 0; /* placed the outgoing call already (place it exactly once) */
 
+/* Door/gate tones over the LIVE camera call (RECV_COMMANDS=1: the control plane pipes our stdin and
+ * writes '1' door / '2' gate, one per line). On 2Voice the camera and the door are the SAME call --
+ * the app unlocks by sending the digit on the call it is viewing (UCFCallManager DOOR_DTMF /
+ * GATE_DTMF), and a second call from opendoor while ours is up would collide with it at the station.
+ * A tone that arrives before the streams run is queued and sent at StreamsRunning, like opendoor
+ * does, so a press during call setup is not lost. Each tone is answered on stdout with
+ * `RESULT <digit> ok|fail` (fail = no call to send it on), which the control plane parses. */
+static int g_cmds = 0;    /* reading tone commands from stdin */
+static int g_streams = 0; /* the current call reached StreamsRunning (tones can go out) */
+static char g_tone_q[8];  /* tones waiting for StreamsRunning */
+static int g_tone_qn = 0;
+
+static void send_tone(LinphoneCall *call, char digit) {
+  LinphoneStatus st = linphone_call_send_dtmf(call, digit);
+  rlog("[recv] DTMF '%c' sent on the camera call (SIP INFO) -> %s\n", digit,
+       st == 0 ? "ok" : "FAILED");
+  rlog("[recv] RESULT %c %s\n", digit, st == 0 ? "ok" : "fail");
+}
+
+static void fail_queued_tones(const char *why) {
+  for (int i = 0; i < g_tone_qn; i++) rlog("[recv] RESULT %c fail (%s)\n", g_tone_q[i], why);
+  g_tone_qn = 0;
+}
+
+/* Drain stdin (non-blocking): send a tone now if the call is up, queue it while the call is being
+ * set up, refuse it when there is no call at all -- the control plane then opens via opendoor. */
+static void read_tone_commands(void) {
+  for (;;) {
+    char c;
+    ssize_t n = read(STDIN_FILENO, &c, 1);
+    if (n == 0) { g_cmds = 0; break; } /* the control plane closed our stdin: stop polling */
+    if (n < 0) break;                  /* EAGAIN: nothing more right now */
+    if (c != '1' && c != '2') continue; /* newlines, anything else */
+    if (g_call && g_streams) send_tone(g_call, c);
+    else if (g_call && g_tone_qn < (int)sizeof g_tone_q) g_tone_q[g_tone_qn++] = c;
+    else rlog("[recv] RESULT %c fail (no call up)\n", c);
+  }
+}
+
 static void on_sigint(int _sig) { (void)_sig; g_running = 0; }
 static void on_sigusr1(int _sig) { (void)_sig; g_hangup_req = 1; }
 static void on_sigusr2(int _sig) { (void)_sig; g_vfu_req = 1; }
@@ -738,6 +777,10 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
                st == 0 ? "ok" : "FAILED");
       }
     }
+    /* Door/gate tones that arrived while the call was being set up go out now. */
+    g_streams = 1;
+    for (int i = 0; i < g_tone_qn; i++) send_tone(call, g_tone_q[i]);
+    g_tone_qn = 0;
     fflush(stdout);
     /* Do NOT start the reader-idle clock yet. With tap-gating we write NOTHING until the first
      * keyframe, so counting this pre-keyframe wait as "no reader" would tear the call down before
@@ -771,6 +814,8 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     }
     fflush(stdout);
     if (g_call == call) g_call = NULL;
+    g_streams = 0;
+    fail_queued_tones("call ended before media"); /* the control plane falls back to opendoor */
     g_last_drain = 0;
     g_stop_at = 0;
     g_video_deadline = 0;
@@ -819,7 +864,9 @@ int main(int argc, char **argv) {
             "RECV_OPEN_AUDIO_DTMF=<digit> (2Voice: in-call digit that opens the station's audio, "
             "default 4; empty = none), "
             "RECV_ENDED_URL=<url> (pinged when the call is over), "
-            "RECV_IDLE_SECONDS=<n> (default 10)\n"
+            "RECV_IDLE_SECONDS=<n> (default 10), "
+            "RECV_COMMANDS=1 (read door/gate tones '1'/'2' from stdin, one per line, and send them "
+            "on the live call; each is answered with 'RESULT <d> ok|fail' on stdout)\n"
             "  dev-only: RECV_SECONDS=<n> (auto-stop), RECV_DEBUG=1 (SIP trace)\n",
             argv[0]);
     return 2;
@@ -831,6 +878,13 @@ int main(int argc, char **argv) {
   { /* 2Voice: outgoing auto_insertion call target (empty -> inbound/IPERCOM mode) */
     const char *cu = getenv("RECV_CALL_URI");
     if (cu && *cu) snprintf(g_call_uri, sizeof g_call_uri, "%s", cu);
+  }
+  if (getenv("RECV_COMMANDS")) {
+    /* Only when the control plane pipes our stdin: O_NONBLOCK on an INHERITED stdin would change the
+     * shared file description, and an inherited /dev/null would read as a permanent EOF. */
+    int fl = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (fl >= 0 && fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK) == 0) g_cmds = 1;
+    else rlog("[recv] cannot read commands from stdin (%s)\n", strerror(errno));
   }
   load_black_frame(); /* canned keyframe for early track advertisement (see g_black) */
 
@@ -986,6 +1040,7 @@ int main(int argc, char **argv) {
   while (g_running) {
     linphone_core_iterate(lc);
     usleep(50 * 1000);
+    if (g_cmds) read_tone_commands(); /* door/gate tones for the live call (see g_cmds) */
     /* 2Voice OUTGOING mode: once registered, place the auto_insertion audio+video call (recvonly)
      * to the OUT account and tap it like an answered call. Placed exactly once; the process exits
      * when the call ends (see on_call_state End). Uses the same auto_insertion offer as opendoor. */

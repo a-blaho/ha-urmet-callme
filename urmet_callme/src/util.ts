@@ -14,3 +14,11 @@ export function stableUuid(seed: string): string {
   const h = createHash("md5").update(seed).digest("hex");
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
 }
+
+/** The `RESULT <digit> ok|fail` line the liblinphone helpers print per door/gate tone (opendoor
+ *  always; recv when it takes tones on the live camera call). Matched anywhere in the line: recv's
+ *  lines carry a timestamp prefix, opendoor's a `[opendoor]` tag, and a fail may carry a reason. */
+export function parseResult(line: string): { digit: "1" | "2"; ok: boolean } | null {
+  const m = /RESULT ([12]) (ok|fail)/.exec(line);
+  return m ? { digit: m[1] as "1" | "2", ok: m[2] === "ok" } : null;
+}

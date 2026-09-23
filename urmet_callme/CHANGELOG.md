@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.14
+
+- **Door and gate work while the camera is open (2Voice).** On 2Voice the camera and the door are
+  the same call: the station carries its video on the `auto_insertion` call the door tone is sent
+  on, and the official app unlocks by sending the tone on the call it is viewing. The add-on used to
+  place a *second* call to the station for a press while the camera call was up, and the two could
+  only collide there. A door/gate press now goes out as a tone on the live camera call when one is up
+  (a press during call setup is queued until the media runs) and falls back to the door helper's own
+  call when no camera call is up. In the other direction, a camera about to call first releases a
+  call the door helper is holding (a "… ready" pre-warm, or the keep-alive after an unlock), and
+  "… ready" is a no-op while the camera is up. Ipercom is unaffected: its door command is a cloud
+  message, independent of the camera call. Not yet confirmed on a 2Voice station -- if a press during
+  a preview fails, please open an issue with a `log_level: debug` log.
+- **"… hang up" button** per place with a camera (with `video: true`). Ends the place's live camera
+  call now, rather than ~10 s after the last viewer left, and on 2Voice also releases a call the door
+  helper is holding. Meant for automations and for a dashboard that hides the camera at the same
+  moment: a card still showing the camera reconnects on its own and places a new call.
+- The 2Voice camera teardown's SIGTERM backstop could never fire (it checked a flag Node sets after
+  any signal, including the hang-up signal sent just before it). Fixed.
+
 ## 1.0.13
 
 - **Camera audio was playing seconds behind the picture; its buffer is now tight.** Measured on a

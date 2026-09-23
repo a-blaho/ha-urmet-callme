@@ -25,10 +25,11 @@ one as a Home Assistant entity over MQTT.
   the panel rings, so automations can react (notify, turn on a camera, run a scene). Requires the
   indoor monitor set to "remote" (see the add-on docs). Notification only - the add-on never answers.
 - **Entrance camera streaming (optional).** One-way live video and audio from the cameras into Home
-  Assistant, viewed with the WebRTC Camera card. Off by default; enable with `video: true`.
+  Assistant, viewed with the WebRTC Camera card, with a "hang up" button per camera place. Off by
+  default; enable with `video: true`.
 - **2Voice support.** Non-Ipercom 2Voice systems open the door a different way (an in-call tone);
   when a 2Voice system is detected, door/gate unlock and a "ready" pre-warm button appear
-  automatically - no option to set.
+  automatically - no option to set. With video on, door and gate work on the live camera call.
 - **Camera panel.** When video is enabled, a page in the Home Assistant sidebar (via ingress) shows
   the live camera view. With video off it is blank - entity states and the add-on log report status.
 - **Local MQTT, cloud control.** Entities are published via Home Assistant's MQTT discovery; the door

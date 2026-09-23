@@ -12,9 +12,13 @@ import { mkdirSync } from "node:fs";
 import { Place } from "./callme.js";
 import { logger } from "./logger.js";
 import { waitForExit } from "./proc.js";
-import { sanitize, stableUuid } from "./util.js";
+import { parseResult, sanitize, stableUuid } from "./util.js";
 
 const log = logger("door2voice");
+
+/** Thrown by a video-call tone sender when there is no live camera call to send the tone on (it
+ *  ended just before, or before its media ran). open() then falls back to the door helper. */
+export class NoLiveCallError extends Error {}
 
 /** A stable RFC 5626 instance id for a place's opendoor helper. liblinphone otherwise invents a
  *  random one per run (its config lives in a /tmp dir the container wipes), so each restart ADDED a
@@ -69,6 +73,15 @@ interface Helper {
 export class TwoVoiceService {
   private helpers = new Map<string, Helper>(); // placeId -> its persistent opendoor
   private stopping = false;
+  /** Set by index.ts when 2Voice video is on. On 2Voice the camera and the door are the SAME
+   *  auto_insertion call: while the camera is being viewed, the station already has our call up, so
+   *  the door/gate tone must go on THAT call (the app does exactly this) -- a second call from
+   *  opendoor would collide with it at the station. Returns a promise when a camera call for the
+   *  place is up (resolving once the tone went out; rejecting with NoLiveCallError if the call turned
+   *  out to be gone, in which case open() falls back to opendoor), undefined when there is none. */
+  videoOpener?: (placeId: string, digit: string) => Promise<void> | undefined;
+  /** True while a camera call for the place is up (pre-warming is then pointless). */
+  videoLive?: (placeId: string) => boolean;
 
   constructor(
     private places: Place[],
@@ -199,20 +212,37 @@ export class TwoVoiceService {
       h.buf = h.buf.slice(nl + 1);
       if (!line) continue;
       log.info(line); // opendoor lines are already "[opendoor] …"
-      const m = /RESULT ([12]) (ok|fail)/.exec(line);
-      if (m && h.pending.length > 0) {
+      const r = parseResult(line);
+      if (r && h.pending.length > 0) {
         // opendoor reports RESULT in the order it received the tones -> match FIFO.
         const { resolve, reject, timer } = h.pending.shift()!;
         clearTimeout(timer);
-        if (m[2] === "ok") resolve();
+        if (r.ok) resolve();
         else reject(new Error("open failed (tone not delivered)"));
       }
     }
   }
 
-  /** Open a 2Voice door/gate via the pre-registered helper: write the DTMF digit to its stdin and
-   *  resolve when it reports RESULT ok (rejects on fail/timeout/dead helper). */
-  open(placeId: string, kind: "door" | "gate" = "door"): Promise<void> {
+  /** Open a 2Voice door/gate: on the live camera call when the camera is being viewed (see
+   *  videoOpener), otherwise via the pre-registered opendoor helper -- write the DTMF digit to its
+   *  stdin and resolve when it reports RESULT ok (rejects on fail/timeout/dead helper). */
+  async open(placeId: string, kind: "door" | "gate" = "door"): Promise<void> {
+    const digit = DIGIT[kind];
+    const viaVideo = this.videoOpener?.(placeId, digit);
+    if (viaVideo) {
+      log.info(`opening ${kind} on 2Voice place ${placeId} over the live camera call`);
+      try {
+        await viaVideo;
+        return;
+      } catch (e) {
+        if (!(e instanceof NoLiveCallError)) throw e;
+        log.info(`camera call for ${placeId} is gone (${e.message}); opening via the door helper`);
+      }
+    }
+    return this.openViaHelper(placeId, kind);
+  }
+
+  private openViaHelper(placeId: string, kind: "door" | "gate"): Promise<void> {
     const h = this.helpers.get(placeId);
     if (!h) return Promise.reject(new Error(`unknown 2Voice place ${placeId}`));
     if (!h.child || !h.child.stdin?.writable)
@@ -252,11 +282,27 @@ export class TwoVoiceService {
   prewarm(placeId: string): boolean {
     const h = this.helpers.get(placeId);
     if (!h || !h.child || !h.child.stdin?.writable) return false;
+    if (this.videoLive?.(placeId)) {
+      // The camera call IS the door call: an unlock press rides it. A pre-warm call now would only
+      // collide with it at the station.
+      log.info(`camera call for ${placeId} (${h.place.name}) is up; nothing to pre-warm`);
+      return true;
+    }
     log.info(
       `pre-warming 2Voice call for ${placeId} (${h.place.name}) on ring`,
     );
     h.child.stdin.write("W\n");
     return true;
+  }
+
+  /** Hang up a call the helper is holding (a pre-warm, or a keep-alive after an unlock) NOW rather
+   *  than on its own idle timer. Used by the "hang up" button and before the camera places its call
+   *  to the same station (the two would collide). No-op for an idle helper; a tone still queued for
+   *  the held call goes out before the hang-up (opendoor orders it so). */
+  release(placeId: string): void {
+    const h = this.helpers.get(placeId);
+    if (!h?.child?.stdin?.writable) return;
+    h.child.stdin.write("H\n");
   }
 
   /** Stop every helper; resolves once they exited (opendoor BYEs a held keep-alive/pre-warm call

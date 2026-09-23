@@ -99,6 +99,19 @@ still up and is reused. So:
 
 The stream includes **one-way audio** (hear the visitor); two-way (talk-back) is not implemented yet.
 
+**"… hang up" button.** With video on, each place with a camera gets a **"… hang up"** `button` that
+ends its live camera call immediately (on 2Voice it also releases a call the door helper is holding).
+Without it a call ends on its own about 10 s after the last viewer leaves, which is the normal way to
+"hang up": close the view. The button is for automations (ring → show the camera → open the door →
+hang up) and for dashboards that hide the camera at the same moment, e.g. a conditional card driven by
+a toggle, or a popup that closes. A card that is **still showing** the camera reconnects on its own and
+places a new call a few seconds later, so pressing hang up while keeping the card open does not stick.
+
+**Door / gate while watching.** On Ipercom the door command is a cloud message, independent of the
+camera call, so unlocking never disturbs the picture. On 2Voice the camera and the door are the *same*
+call, and a door/gate press while the camera is open is sent as a tone on that call (the official app
+does exactly this) - see the 2Voice section below.
+
 ### Door-open on 2Voice models (experimental)
 
 The default door-open path is for **Ipercom** panels (it sends a cloud command). **2Voice** systems
@@ -127,6 +140,17 @@ opens the call ahead of time (no tone) and holds it for `door_open_2voice_prewar
 door/gate press right after is instant. Trigger it from any automation - for example a doorbell ring,
 or opening your entry dashboard - so the call is already up when you unlock. If you don't press within
 the hold window, the call releases on its own.
+
+**With video on (2Voice).** The camera stream and the door open are the *same* call to the station, so
+the add-on never holds two. While the camera is open, a door/gate press sends its tone on the live
+camera call (as the app does when you unlock while viewing), so the picture stays up; a press during
+the camera's call setup waits for the media and goes out then. When no camera call is up, the press
+uses the door helper's own call as before. A camera about to connect first releases a call the door
+helper is holding (a "… ready" pre-warm, or the short keep-alive after an unlock), and "… ready" does
+nothing while the camera is up - the call is already there. This mirrors the app's behaviour and has
+not yet been confirmed on a 2Voice station: if a press during a preview does not open the door, please
+open an issue with a `log_level: debug` log (the `[recv] DTMF … sent on the camera call` line shows
+the tone going out).
 
 **Experimental / what to check:** the call is _meant_ to be silent (it should open the door without
 ringing your indoor monitor). If you test this, watch that your monitor stays quiet. Set

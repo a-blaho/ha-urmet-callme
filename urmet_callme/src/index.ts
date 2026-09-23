@@ -249,6 +249,40 @@ async function main() {
     }
   }
 
+  // 2Voice with video: the camera call IS the door call (one auto_insertion call per station), so
+  // the two services must not each hold one. A door/gate press while the camera is viewed sends its
+  // tone on the camera call; a camera about to call first releases any call the door helper holds
+  // (pre-warm / keep-alive); and "ready" is a no-op while the camera is up.
+  if (twoVoice && video2v) {
+    const tv = twoVoice;
+    const v2 = video2v;
+    tv.videoOpener = (placeId, digit) => v2.sendTone(placeId, digit);
+    tv.videoLive = (placeId) => v2.hasCall(placeId);
+    v2.onBeforeCall = (placeId) => tv.release(placeId);
+  }
+
+  // "Hang up" button per place with a camera: ends its live camera call now, and on 2Voice also any
+  // call the door helper holds. Published late because it needs the video service's camera list.
+  const served = video?.placesServed() ?? video2v?.placesServed() ?? [];
+  if (bridge && served.length) {
+    bridge.publishHangup(
+      served.map((placeId) => {
+        const p = callme.places.find((x) => x.id === placeId);
+        return {
+          placeId,
+          name: p?.name ?? placeId,
+          model: p?.family === "twovoice" ? "CallMe / 2Voice" : "CallMe / Ipercom",
+        };
+      }),
+      async (placeId) => {
+        const ended =
+          (await video?.hangup(placeId)) ?? video2v?.hangup(placeId) ?? false;
+        twoVoice?.release(placeId);
+        return ended;
+      },
+    );
+  }
+
   // Ingress panel (served through HA's authenticated proxy): the go2rtc camera UI when video is on,
   // otherwise blank (the entities/log already report status).
   try {

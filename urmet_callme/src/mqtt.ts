@@ -47,11 +47,20 @@ export interface TwoVoiceDoorbell {
   station: string; // the calling-station (OUT) username the ring's From carries
 }
 
+/** A place whose camera call the "hang up" button can end (published once video is up). */
+export interface HangupPlace {
+  placeId: string;
+  name: string;
+  model: string; // the place device's model string, so the entity joins the place's existing device
+}
+
 export class MqttBridge {
   private client!: MqttClient;
   private relays = new Map<string, Relay>(); // command_topic -> relay (IPERCOM open_door_req)
   private tvRelays = new Map<string, TvRelay>(); // command_topic -> 2Voice relay (opendoor/DTMF)
   private tvPrewarm = new Map<string, { placeId: string; name: string }>(); // command_topic -> place
+  private hangups = new Map<string, HangupPlace>(); // command_topic -> place whose call to end
+  private onHangup?: (placeId: string) => Promise<boolean>;
   private doorbells: Doorbell[] = [];
   private availTopic = "urmet/callme/availability";
   private prefix: string; // HA MQTT-discovery topic prefix (default "homeassistant")
@@ -203,6 +212,35 @@ export class MqttBridge {
       );
       this.client.subscribe(cmd);
     }
+  }
+
+  /** One "hang up" `button` per place with a camera, published once the video service is up (it
+   *  starts after the bridge, and only with `video: true`). A press ends the place's live camera
+   *  call at once instead of waiting for the reader-idle window; `handler` resolves whether a call
+   *  was up. */
+  publishHangup(places: HangupPlace[], handler: (placeId: string) => Promise<boolean>) {
+    this.onHangup = handler;
+    for (const p of places) {
+      const uid = sanitize(`urmet_${p.placeId}_hangup`);
+      const cmd = `urmet/callme/${uid}/set`;
+      this.hangups.set(cmd, p);
+      const cfg = {
+        name: `${p.name} hang up`,
+        unique_id: uid,
+        command_topic: cmd,
+        payload_press: "HANGUP",
+        icon: "mdi:phone-hangup",
+        availability_topic: this.availTopic,
+        device: this.deviceFor(p.placeId, p.name, p.model),
+      };
+      this.client.publish(
+        `${this.prefix}/button/${uid}/config`,
+        JSON.stringify(cfg),
+        { retain: true },
+      );
+      this.client.subscribe(cmd);
+    }
+    log.info(`published ${places.length} hang-up button(s)`);
   }
 
   /** One doorbell `event` entity per 2Voice place. The ring arrives on the channel account carrying
@@ -362,6 +400,17 @@ export class MqttBridge {
     if (warm && this.twoVoice) {
       log.info(`pre-warm ${payload} for ${warm.name} (2Voice)`);
       this.twoVoice.prewarm(warm.placeId); // fire-and-forget: opens the call, no tone
+      return;
+    }
+    const hang = this.hangups.get(topic);
+    if (hang && this.onHangup) {
+      log.info(`press ${payload} for ${hang.name} hang up`);
+      try {
+        const ended = await this.onHangup(hang.placeId);
+        log.info(`hang up ${hang.name}: ${ended ? "call ended" : "no camera call was up"}`);
+      } catch (e) {
+        log.error(`hang up ${hang.name} FAILED:`, (e as Error).message);
+      }
     }
   }
 

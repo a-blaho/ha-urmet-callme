@@ -409,6 +409,23 @@ export class VideoService {
     });
   }
 
+  /** The places with at least one camera stream. */
+  placesServed(): string[] {
+    return [...new Set(this.cams.map((c) => c.placeId))];
+  }
+
+  /** End the live camera call if it belongs to this place (the "hang up" button): the same
+   *  in-dialog BYE as a viewer leaving, just now rather than after the reader-idle window. Resolves
+   *  true once the call is down, false when no call of this place was up. Note a dashboard card
+   *  still showing the camera reconnects on its own and places a new call. */
+  async hangup(placeId: string): Promise<boolean> {
+    const i = this.slotHolder;
+    if (i === null || this.cams[i]?.placeId !== placeId) return false;
+    log.info(`hanging up the camera call [${i}] ${this.cams[i].dev.name}`);
+    await this.serialize(() => this.cancel(i));
+    return true;
+  }
+
   // Run call-control ops ONE AT A TIME, in arrival order, so a camera's own /call and /hangup
   // (which go2rtc can fire close together on a producer restart) can't interleave their place and
   // cancel out of order. This is just ordering; the one-at-a-time arbitration is in the /call handler.

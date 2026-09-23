@@ -1,6 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sanitize, stableUuid } from "./util.js";
+import { parseResult, sanitize, stableUuid } from "./util.js";
+
+// Both helpers' tone replies must parse, whatever surrounds the RESULT token.
+test("parseResult reads opendoor's and recv's RESULT lines", () => {
+  assert.deepEqual(parseResult("[opendoor] RESULT 1 ok"), { digit: "1", ok: true });
+  assert.deepEqual(parseResult("2026-09-23T10:00:00.123Z [recv] RESULT 2 ok"), {
+    digit: "2",
+    ok: true,
+  });
+  assert.deepEqual(parseResult("2026-09-23T10:00:00.123Z [recv] RESULT 1 fail (no call up)"), {
+    digit: "1",
+    ok: false,
+  });
+  assert.equal(parseResult("[opendoor] sent DTMF '1' (status 0)"), null);
+  assert.equal(parseResult("RESULT 4 ok"), null); // only door/gate digits are tone results
+});
 
 test("sanitize keeps [A-Za-z0-9_] and replaces the rest", () => {
   assert.equal(sanitize("urmet_ab-12.x@y z"), "urmet_ab_12_x_y_z");

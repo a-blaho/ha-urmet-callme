@@ -1,5 +1,5 @@
 name: Urmet CallMe (Unofficial)
-version: "1.0.13"
+version: "1.0.14"
 slug: urmet_callme
 description: Control your Urmet intercom from Home Assistant
 url: "https://github.com/a-blaho/ha-urmet-callme"

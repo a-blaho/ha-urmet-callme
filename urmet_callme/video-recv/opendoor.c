@@ -367,6 +367,7 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
   if (getenv("OPENDOOR_PREWARM_HOLD_MS")) prewarm_hold = atoll(getenv("OPENDOOR_PREWARM_HOLD_MS"));
   char queue[8]; /* tones waiting for StreamsRunning (the command that placed the call) */
   int qn = 0;
+  int release_req = 0; /* an 'H' arrived: BYE the held call once no tone is still waiting to go out */
 
   while (g_running) {
     linphone_core_iterate(lc);
@@ -393,6 +394,14 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
         }
         continue;
       }
+      if (c == 'H') {
+        /* Release (hang up): the user pressed "hang up", or the camera is about to place ITS call
+         * to this station and a held pre-warm/keep-alive call of ours would collide with it. A tone
+         * already queued for this call still goes out first (checked below); nothing is lost. */
+        release_req = 1;
+        warm_deadline = 0;
+        continue;
+      }
       if (c != '1' && c != '2') continue;
       if (g_call && g_streams) {
         send_tone(c, &last_activity, now); /* call up -> instant */
@@ -409,6 +418,15 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
     if (g_call && g_streams && qn > 0) {
       for (int i = 0; i < qn; i++) send_tone(queue[i], &last_activity, now);
       qn = 0;
+    }
+    /* Release requested and no tone is waiting on this call any more -> BYE now (not on idle). */
+    if (release_req && qn == 0) {
+      release_req = 0;
+      if (g_call) {
+        printf("[opendoor] release requested -> hanging up\n");
+        fflush(stdout);
+        bye_call(lc);
+      }
     }
     /* Placed but no media in time -> fail queued + tear down. */
     if (g_call && !g_streams && now - call_placed_at > OPENDOOR_STREAMS_TIMEOUT_MS) {
@@ -444,7 +462,8 @@ int main(int argc, char **argv) {
             "  single-shot: place one call, send <dtmf-digit> (1=door / 2=gate), exit.\n"
             "  OPENDOOR_PERSISTENT=1: register ONCE, then read digits ('1'/'2') from stdin, one open\n"
             "    per line, printing 'RESULT <d> ok|fail'; exit when stdin closes. (Faster: each press\n"
-            "    skips the SIP register.)\n"
+            "    skips the SIP register.) With OPENDOOR_KEEPALIVE_MS>0 also 'W' (pre-warm: open the\n"
+            "    call, no tone) and 'H' (release: hang up a held call now).\n"
             "  env: OPENDOOR_DATA_DIR=<dir> (unique per place), OPENDOOR_DEBUG=1 (SIP trace)\n",
             argv[0]);
     return 2;

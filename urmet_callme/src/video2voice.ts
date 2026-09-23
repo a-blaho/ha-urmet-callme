@@ -5,6 +5,11 @@
 // channel account, places an audio+video auto_insertion call, and taps the H.264/audio to go2rtc via
 // the SAME stream.sh pipeline as the IPERCOM receiver.
 //
+// Because the camera call IS the door call, a door/gate press while the camera is being viewed is
+// sent as a DTMF tone on recv's live call (sendTone; recv reads '1'/'2' on its stdin and answers
+// `RESULT <d> ok|fail`), exactly as the app unlocks while viewing. A second call from opendoor would
+// collide with ours at the station. TwoVoiceService routes presses here via its videoOpener hook.
+//
 // This is a slimmed video.ts: no shared account B (2Voice uses the channel account it already has), no
 // call_device_req/gateway, no slot-switching (each place is independent, one recv per place, spawned
 // on demand). The go2rtc + stream.sh + FIFO/keyframe machinery is shared with the IPERCOM path,
@@ -13,14 +18,18 @@ import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { createServer, Server } from "node:http";
 import { Place } from "./callme.js";
-import { macHeaderOf } from "./door2voice.js";
+import { macHeaderOf, NoLiveCallError } from "./door2voice.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { isDebug, logger } from "./logger.js";
-import { waitForExit } from "./proc.js";
+import { isAlive, waitForExit } from "./proc.js";
+import { parseResult } from "./util.js";
 import { deterministicUuid } from "./video.js";
 
 const log = logger("video2v");
 const RECV_IDLE_SECONDS = 10; // recv hangs up (and exits) after no FIFO reader for this long
+// How long a tone sent on the camera call may take to be confirmed. A tone on a running call is
+// answered at once; one queued during call setup waits for the station's media (a few seconds).
+const TONE_TIMEOUT_MS = 20000;
 
 interface Cam {
   place: Place;
@@ -28,13 +37,25 @@ interface Cam {
   afifo: string; // per-camera audio FIFO (raw PCM s16le 8k mono; recv forces G.711)
 }
 
+interface PendingTone {
+  resolve: () => void;
+  reject: (e: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class TwoVoiceVideoService {
   private go2rtc?: Go2rtcProcess;
   private cams: Cam[] = [];
   private recvs = new Map<number, ChildProcess>(); // camera idx -> its live recv (absent = idle)
+  private stdoutBuf = new Map<number, string>(); // camera idx -> recv stdout line-assembly buffer
+  // Tones written to a recv and awaiting its RESULT line, FIFO per camera (recv answers in order).
+  private pendingTones = new Map<number, PendingTone[]>();
   private server?: Server;
   private callPort = 0; // ephemeral control port (chosen at bind time; passed to stream.sh as argv $3)
   private stopping = false;
+  /** Set by index.ts: called right before a camera call is placed, so the door helper can release a
+   *  call it is holding to the same station (a pre-warm / keep-alive), which ours would collide with. */
+  onBeforeCall?: (placeId: string) => void;
 
   constructor(
     private places: Place[],
@@ -77,12 +98,85 @@ export class TwoVoiceVideoService {
     return true;
   }
 
+  /** The places with a camera stream (one per usable 2Voice place). */
+  placesServed(): string[] {
+    return this.cams.map((c) => c.place.id);
+  }
+
+  private camIndex(placeId: string): number {
+    return this.cams.findIndex((c) => c.place.id === placeId);
+  }
+
+  /** True while a camera call for the place is up (placed or streaming). */
+  hasCall(placeId: string): boolean {
+    return this.recvs.has(this.camIndex(placeId));
+  }
+
+  /** Send a door/gate tone ('1'/'2') on the place's live camera call. Undefined when no camera call
+   *  is up (the caller then uses the door helper). Resolves once recv confirms the tone went out;
+   *  rejects with NoLiveCallError if the call turned out to be gone (ended before its media, or recv
+   *  exited meanwhile) so the caller can fall back, with a plain Error on timeout. */
+  sendTone(placeId: string, digit: string): Promise<void> | undefined {
+    const i = this.camIndex(placeId);
+    const recv = this.recvs.get(i);
+    if (!recv || !recv.stdin?.writable) return undefined;
+    return new Promise<void>((resolve, reject) => {
+      const q = this.pendingTones.get(i) ?? [];
+      this.pendingTones.set(i, q);
+      const entry: PendingTone = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const k = q.indexOf(entry);
+          if (k >= 0) {
+            q.splice(k, 1);
+            reject(new Error("tone not confirmed by the camera call"));
+          }
+        }, TONE_TIMEOUT_MS),
+      };
+      q.push(entry);
+      recv.stdin!.write(digit + "\n");
+    });
+  }
+
+  private failPendingTones(i: number, why: string) {
+    const q = this.pendingTones.get(i);
+    if (!q) return;
+    this.pendingTones.delete(i);
+    for (const p of q) {
+      clearTimeout(p.timer);
+      p.reject(new NoLiveCallError(why));
+    }
+  }
+
+  // recv's stdout is piped (to read its RESULT lines) and passed through VERBATIM: its lines carry
+  // their own timestamps (recv.c rlog), so they must not go through the logger's prefixing.
+  private onRecvStdout(i: number, data: string) {
+    process.stdout.write(data);
+    let buf = (this.stdoutBuf.get(i) ?? "") + data;
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      const r = parseResult(line);
+      const q = this.pendingTones.get(i);
+      if (!r || !q?.length) continue;
+      const { resolve, reject, timer } = q.shift()!; // recv answers tones in the order it got them
+      clearTimeout(timer);
+      if (r.ok) resolve();
+      else reject(new NoLiveCallError("no call to send the tone on"));
+    }
+    this.stdoutBuf.set(i, buf);
+  }
+
   // Spawn recv in OUTGOING mode for camera i: register the place's channel account and place the
   // auto_insertion audio+video call to its OUT account, tapping to this camera's FIFOs. recv exits on
   // its own when the call ends (viewer gone / idle), and we respawn on the next /call.
   private startRecv(i: number) {
     if (this.stopping || this.recvs.has(i)) return;
     const cam = this.cams[i];
+    // A pre-warm / keep-alive call the door helper holds to this station would collide with ours.
+    this.onBeforeCall?.(cam.place.id);
     for (const fifo of [cam.fifo, cam.afifo]) {
       try {
         unlinkSync(fifo);
@@ -103,6 +197,7 @@ export class TwoVoiceVideoService {
     log.info(
       `2Voice video [${i}] ${cam.place.name}: call via ${mac ? `mac header ${mac}` : "no header (cloud-listed camera)"} to station ${cam.place.outgoingUser}`,
     );
+    // stdin = door/gate tones for the live call; stdout = recv's log (passed through) + RESULT lines.
     const recv = spawn("recv", [cam.place.incomingUser, cam.place.incomingPw], {
       env: {
         ...process.env,
@@ -115,14 +210,20 @@ export class TwoVoiceVideoService {
         RECV_DATA_DIR: dataDir,
         RECV_IDLE_SECONDS: String(RECV_IDLE_SECONDS),
         RECV_CONNECTED_URL: `http://127.0.0.1:${this.callPort}/connected?cam=${i}`,
+        RECV_COMMANDS: "1", // take door/gate tones on stdin (see sendTone)
         // No RECV_HANGUP_URL: there's no gateway cancel for 2Voice; recv just BYEs and exits.
         // log_level debug -> recv's own trace (SIP trace + per-5s audio RTP counters).
         ...(isDebug() ? { RECV_DEBUG: "1" } : {}),
       },
-      stdio: "inherit",
+      stdio: ["pipe", "pipe", "inherit"],
     });
+    this.stdoutBuf.set(i, "");
+    recv.stdout?.setEncoding("utf8");
+    recv.stdout?.on("data", (d: string) => this.onRecvStdout(i, d));
+    recv.on("error", (e) => log.error(`2Voice recv [${i}] spawn error: ${e.message}`));
     recv.on("exit", (code) => {
       this.recvs.delete(i);
+      this.failPendingTones(i, "camera call ended");
       if (!this.stopping)
         log.info(`2Voice recv [${i}] ${cam.place.name} exited (code ${code})`);
     });
@@ -131,7 +232,9 @@ export class TwoVoiceVideoService {
   }
 
   // End camera i's call: SIGUSR1 -> recv terminates the call (in-dialog BYE) and, in outgoing mode,
-  // exits. SIGTERM is the backstop if it doesn't exit promptly.
+  // exits. SIGTERM is the backstop if it doesn't exit promptly. (Checked with isAlive, not
+  // ChildProcess.killed: Node sets that after ANY successful kill(), so the SIGUSR1 above would make
+  // the backstop never fire -- see the same note in video.ts cancel().)
   private stopRecv(i: number) {
     const r = this.recvs.get(i);
     if (!r) return;
@@ -143,11 +246,21 @@ export class TwoVoiceVideoService {
     }
     setTimeout(() => {
       try {
-        if (!r.killed) r.kill("SIGTERM");
+        if (isAlive(r)) r.kill("SIGTERM");
       } catch {
         /* gone */
       }
     }, 2000);
+  }
+
+  /** End the place's camera call now (the "hang up" button). True if a call was up. Note a dashboard
+   *  card still showing the camera reconnects on its own and places a new call. */
+  hangup(placeId: string): boolean {
+    const i = this.camIndex(placeId);
+    if (!this.recvs.has(i)) return false;
+    log.info(`hanging up the camera call [${i}] ${this.cams[i].place.name}`);
+    this.stopRecv(i);
+    return true;
   }
 
   private serveCallEndpoint(): Promise<void> {
@@ -190,12 +303,13 @@ export class TwoVoiceVideoService {
     this.stopping = true;
     this.server?.close();
     this.go2rtc?.stop();
-    const live = [...this.recvs.values()];
+    const live = [...this.recvs.entries()];
     this.recvs.clear();
-    for (const r of live) {
+    for (const [i, r] of live) {
+      this.failPendingTones(i, "shutting down");
       r.removeAllListeners("exit");
       r.kill("SIGTERM");
     }
-    await Promise.all(live.map((r) => waitForExit(r, 2500)));
+    await Promise.all(live.map(([, r]) => waitForExit(r, 2500)));
   }
 }
