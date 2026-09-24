@@ -12,11 +12,11 @@
     "deploy": "./deploy-local.sh"
   },
   "dependencies": {
-    "mqtt": "^5.15.2"
+    "mqtt": "^5.16.0"
   },
   "devDependencies": {
-    "@types/node": "^22.20.2",
-    "tsx": "^4.23.13",
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
 }
