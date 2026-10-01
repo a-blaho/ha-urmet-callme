@@ -15,6 +15,14 @@ export function stableUuid(seed: string): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
 }
 
+/** A SIP URI from an address the gateway/cloud supplied. Installations differ: some send the bare
+ *  `user@host`, others the full `sip:user@host`. Prepending the scheme blindly turns the latter into
+ *  `sip:sip:user@host`, which Flexisip answers with 404. */
+export function sipUri(address: string): string {
+  const a = address.trim();
+  return /^sips?:/i.test(a) ? a : `sip:${a}`;
+}
+
 /** The `RESULT <digit> ok|fail` line the liblinphone helpers print per door/gate tone (opendoor
  *  always; recv when it takes tones on the live camera call). Matched anywhere in the line: recv's
  *  lines carry a timestamp prefix, opendoor's a `[opendoor]` tag, and a fail may carry a reason. */

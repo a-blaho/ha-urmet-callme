@@ -147,10 +147,10 @@ camera call (as the app does when you unlock while viewing), so the picture stay
 the camera's call setup waits for the media and goes out then. When no camera call is up, the press
 uses the door helper's own call as before. A camera about to connect first releases a call the door
 helper is holding (a "… ready" pre-warm, or the short keep-alive after an unlock), and "… ready" does
-nothing while the camera is up - the call is already there. This mirrors the app's behaviour and has
-not yet been confirmed on a 2Voice station: if a press during a preview does not open the door, please
-open an issue with a `log_level: debug` log (the `[recv] DTMF … sent on the camera call` line shows
-the tone going out).
+nothing while the camera is up - the call is already there. This mirrors the app's behaviour and is
+confirmed on a cloud-listed 2Voice station: the gate opened and the video continued uninterrupted. If
+a press during a preview does not open the door on yours, please open an issue with a
+`log_level: debug` log (the `[recv] DTMF … sent on the camera call` line shows the tone going out).
 
 **Experimental / what to check:** the call is _meant_ to be silent (it should open the door without
 ringing your indoor monitor). If you test this, watch that your monitor stays quiet. Set

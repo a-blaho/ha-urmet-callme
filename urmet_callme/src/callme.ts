@@ -5,6 +5,7 @@ import { logger, redact } from "./logger.js";
 import { buildBody, randId } from "./query.js";
 import { SipClient, callerName, uriUser } from "./sipClient.js";
 import { loadStation, saveStation } from "./station.js";
+import { sipUri } from "./util.js";
 
 const log = logger("callme");
 
@@ -524,7 +525,7 @@ export class CallMe {
     );
     if (!reply?.sip_address)
       throw new Error(`gateway resolution failed: ${JSON.stringify(reply)}`);
-    const gw = "sip:" + reply.sip_address;
+    const gw = sipUri(String(reply.sip_address));
     this.gateways.set(place.id, gw);
     // `alive` (defaults true when absent) is the panel's own reachability flag; false normally
     // means the place is unreachable. We still try (the flag is occasionally stale and a real open

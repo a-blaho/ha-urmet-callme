@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseResult, sanitize, stableUuid } from "./util.js";
+import { parseResult, sanitize, sipUri, stableUuid } from "./util.js";
 
 // Both helpers' tone replies must parse, whatever surrounds the RESULT token.
 test("parseResult reads opendoor's and recv's RESULT lines", () => {
@@ -20,6 +20,14 @@ test("parseResult reads opendoor's and recv's RESULT lines", () => {
 test("sanitize keeps [A-Za-z0-9_] and replaces the rest", () => {
   assert.equal(sanitize("urmet_ab-12.x@y z"), "urmet_ab_12_x_y_z");
   assert.equal(sanitize(""), "");
+});
+
+// A gateway may answer with or without the scheme; either way the URI carries it exactly once.
+test("sipUri adds the scheme only when the address lacks one", () => {
+  assert.equal(sipUri("1060abc@sip.urmet.com"), "sip:1060abc@sip.urmet.com");
+  assert.equal(sipUri("sip:1060abc@sip.urmet.com"), "sip:1060abc@sip.urmet.com");
+  assert.equal(sipUri("SIPS:1060abc@sip.urmet.com"), "SIPS:1060abc@sip.urmet.com");
+  assert.equal(sipUri(" sip:1060abc@sip.urmet.com "), "sip:1060abc@sip.urmet.com");
 });
 
 test("stableUuid is deterministic and RFC 4122 shaped", () => {
