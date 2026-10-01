@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.15
+
+- **Entrance discovery failed with `configuration_read_req: SIP send status 404` on some Ipercom
+  installations.** The gateway lookup answers with the gateway's SIP address, and installations
+  differ in how they write it: some send the bare `user@sip.urmet.com`, others the full
+  `sip:user@sip.urmet.com`. The add-on always prepended `sip:`, so on the latter the next request
+  went to `sip:sip:user@sip.urmet.com`, which the server answers with 404 -- login, registration and
+  the gateway lookup all succeeded and then no entrances appeared. The scheme is now added only when
+  it is missing. Diagnosed and reported by a user; not yet re-tested on such an installation, so if
+  discovery still fails there, please open an issue with a `log_level: debug` log.
+- **Door and gate on the live camera call are confirmed on a 2Voice station** (the 1.0.14 change):
+  the gate opened and the video continued uninterrupted. The documentation no longer marks it as
+  unconfirmed.
+- Updated the `mqtt` client library to 5.16.
+
 ## 1.0.14
 
 - **Door and gate work while the camera is open (2Voice).** On 2Voice the camera and the door are
