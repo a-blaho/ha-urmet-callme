@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.16
+
+- **Announcements on 2Voice (experimental, [#19](https://github.com/a-blaho/ha-urmet-callme/issues/19)).**
+  Each 2Voice place gets a **"… announce"** `notify` entity that plays a message out of the door
+  station's speaker - one-way "talk-out", for answering the door without answering it ("Leave the
+  parcel at the door"). Text is spoken by a Home Assistant TTS engine (`announce_tts_engine`,
+  `announce_tts_language`; the add-on now asks for Home Assistant API access for this), and an
+  http(s) audio URL is played as-is. The clip rides the door helper's call (with the app's "open
+  audio" tone `4` first, `announce_open_audio`) or, while the camera is open, the camera call; it is
+  cut at `announce_max_seconds`. Every step is logged at `info` - source, route, call setup,
+  negotiated audio direction, levels per second, dropouts, clipping and RTP packets sent - so a
+  report can tell "the station got nothing" apart from "it got the clip but did not play it". Not
+  yet confirmed on a station: please report how it behaves on yours in #19.
+- The door helper's silence source is now paced by the clock rather than one block per timer tick
+  (the camera helper already worked this way), so real audio does not drift when the timer runs late.
+- Updated the `mqtt` client library to 5.16.1.
+
 ## 1.0.15
 
 - **Entrance discovery failed with `configuration_read_req: SIP send status 404` on some Ipercom
