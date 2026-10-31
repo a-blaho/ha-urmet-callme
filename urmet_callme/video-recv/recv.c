@@ -42,6 +42,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include "talkout.h"
 
 /* Timestamped log line. The helper's output used to carry no timestamp of its own while the control
  * plane stamps every line and liblinphone stamps its own, so in the add-on log you could not tell
@@ -473,36 +474,48 @@ static MSFilterDesc awrite_desc = {
  * camera call is (the station only sends audio when offered sendrecv, like the app does). This
  * pump source keeps that graph fed with a steady 8 kHz mono s16le silence, 20 ms per block, paced
  * by the ticker; the encoder then sends silent G.711 the station ignores. The Ipercom answer stays
- * recvonly, so there the capture graph never runs. (Two-way audio would plug a microphone feed in
- * here; it is not implemented.) */
+ * recvonly, so there the capture graph never runs.
+ *
+ * Announcements: with RECV_AUDIO_IN=<fifo>, blocks are filled from that FIFO instead (see
+ * talkout.h), so a clip the control plane plays goes out on the live camera call. The open-audio
+ * digit this call already sends at StreamsRunning is what the app sends before it talks. */
 typedef struct {
   int rate;
   int nch;
+  int started;       /* first process() done (start_ms may legitimately be 0: the ticker starts there) */
   uint64_t start_ms; /* ticker time at the first process() */
   int64_t produced;  /* frames produced so far (per channel) */
+  TalkIn talk;       /* announcement FIFO (talkout.h) */
 } AudioSrc;
 
 static void aread_init(MSFilter *f) {
   AudioSrc *s = ms_new0(AudioSrc, 1);
   s->rate = 8000;
   s->nch = 1;
+  talkin_init(&s->talk, "atap", rlog);
   f->data = s;
 }
 
 static void aread_process(MSFilter *f) {
   AudioSrc *s = (AudioSrc *)f->data;
   uint64_t now = f->ticker->time;
-  if (!s->start_ms) { s->start_ms = now; return; }
+  if (!s->started) {
+    talkin_open(&s->talk, "RECV_AUDIO_IN", s->rate, s->nch);
+    s->started = 1;
+    s->start_ms = now;
+    return;
+  }
   const int block = s->rate / 50; /* 20 ms of frames */
   int64_t due = (int64_t)((now - s->start_ms) * (uint64_t)s->rate / 1000) - s->produced;
   if (due > s->rate / 5) { /* fell behind (ticker stall): skip rather than burst */
+    talkin_note_skip(&s->talk, (long)((due - block) * 1000 / s->rate));
     s->produced += due - block;
     due = block;
   }
   while (due >= block) {
     size_t bytes = (size_t)block * 2 * (size_t)s->nch;
     mblk_t *m = allocb(bytes, 0);
-    memset(m->b_wptr, 0, bytes);
+    talkin_fill(&s->talk, m->b_wptr, bytes, s->rate, s->nch);
     m->b_wptr += bytes;
     ms_queue_put(f->outputs[0], m);
     s->produced += block;
@@ -510,7 +523,11 @@ static void aread_process(MSFilter *f) {
   }
 }
 
-static void aread_uninit(MSFilter *f) { ms_free(f->data); }
+static void aread_uninit(MSFilter *f) {
+  AudioSrc *s = (AudioSrc *)f->data;
+  talkin_close(&s->talk, s->rate, s->nch);
+  ms_free(s);
+}
 
 static int aread_set_sr(MSFilter *f, void *a) { ((AudioSrc *)f->data)->rate = *(int *)a; return 0; }
 static int aread_get_sr(MSFilter *f, void *a) { *(int *)a = ((AudioSrc *)f->data)->rate; return 0; }

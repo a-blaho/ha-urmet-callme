@@ -18,7 +18,7 @@ import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { createServer, Server } from "node:http";
 import { Place } from "./callme.js";
-import { macHeaderOf, NoLiveCallError } from "./door2voice.js";
+import { macHeaderOf, NoLiveCallError, talkFifoOf } from "./door2voice.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { isDebug, logger } from "./logger.js";
 import { isAlive, waitForExit } from "./proc.js";
@@ -211,6 +211,7 @@ export class TwoVoiceVideoService {
         RECV_IDLE_SECONDS: String(RECV_IDLE_SECONDS),
         RECV_CONNECTED_URL: `http://127.0.0.1:${this.callPort}/connected?cam=${i}`,
         RECV_COMMANDS: "1", // take door/gate tones on stdin (see sendTone)
+        RECV_AUDIO_IN: talkFifoOf(cam.place.id), // announcements ride the camera call (announce.ts)
         // No RECV_HANGUP_URL: there's no gateway cancel for 2Voice; recv just BYEs and exits.
         // log_level debug -> recv's own trace (SIP trace + per-5s audio RTP counters).
         ...(isDebug() ? { RECV_DEBUG: "1" } : {}),

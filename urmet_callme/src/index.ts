@@ -1,6 +1,7 @@
 // Add-on entry point: load config, connect CallMe, bridge to MQTT (HA discovery),
 // and keep the SIP registration alive.
 import { readFileSync } from "node:fs";
+import { Announcer } from "./announce.js";
 import { CallMe, Door } from "./callme.js";
 import { TwoVoiceDoor, TwoVoiceService } from "./door2voice.js";
 import { Go2rtcPorts } from "./go2rtc.js";
@@ -23,6 +24,10 @@ interface Config {
   video: boolean;
   door2voiceKeepaliveMs: number; // 2Voice: hold the call open this long for instant door-then-gate (0 = off)
   door2voicePrewarmHoldMs: number; // 2Voice: how long a "ready" (pre-warm) press keeps the call open
+  announceOpenAudio: boolean; // 2Voice announcements: send the open-audio digit ('4') before the clip
+  announceTtsEngine?: string; // TTS entity for spoken announcements (empty = the first one HA has)
+  announceTtsLanguage?: string;
+  announceMaxSeconds: number; // announcements are cut at this length
   go2rtcPorts: Go2rtcPorts; // embedded go2rtc bind ports (from the add-on Network config via run.sh)
 }
 
@@ -84,6 +89,10 @@ async function loadConfig(): Promise<Config> {
     door2voiceKeepaliveMs: Number(o.door_open_2voice_keepalive ?? 4) * 1000,
     door2voicePrewarmHoldMs:
       Number(o.door_open_2voice_prewarm_hold ?? 15) * 1000,
+    announceOpenAudio: o.announce_open_audio ?? process.env.ANNOUNCE_OPEN_AUDIO !== "false",
+    announceTtsEngine: (o.announce_tts_engine || process.env.ANNOUNCE_TTS_ENGINE || "").trim() || undefined,
+    announceTtsLanguage: (o.announce_tts_language || process.env.ANNOUNCE_TTS_LANGUAGE || "").trim() || undefined,
+    announceMaxSeconds: Number(o.announce_max_seconds ?? process.env.ANNOUNCE_MAX_SECONDS ?? 30),
     // go2rtc bind ports. Under host networking these bind directly on the host; make them options
     // (not the Network tab, which can't remap ports under host networking) so they can be changed to
     // coexist with a user's own go2rtc add-on. candidateIp is an undocumented env escape hatch.
@@ -168,12 +177,25 @@ async function main() {
   // 2Voice door-open. Auto-enabled for any detected 2Voice place (like IPERCOM doors): each gets a
   // door + gate button, opened via the persistent opendoor helper.
   let twoVoice: TwoVoiceService | undefined;
+  let announcer: Announcer | undefined;
   let twoVoiceDoors: TwoVoiceDoor[] = [];
   if (twoVoicePlaces.length) {
     twoVoice = new TwoVoiceService(
       twoVoicePlaces,
       cfg.door2voiceKeepaliveMs,
       cfg.door2voicePrewarmHoldMs,
+      cfg.announceOpenAudio ? "4" : "",
+    );
+    // Announcements out of the door station (a `notify` entity per place), riding the same calls.
+    announcer = new Announcer(twoVoice, {
+      ttsEngine: cfg.announceTtsEngine,
+      ttsLanguage: cfg.announceTtsLanguage,
+      maxSeconds: cfg.announceMaxSeconds,
+    });
+    log.info(
+      `2Voice announcements enabled: TTS engine ${cfg.announceTtsEngine ?? "(first found)"}` +
+        `${cfg.announceTtsLanguage ? `, language ${cfg.announceTtsLanguage}` : ""}, ` +
+        `open-audio digit ${cfg.announceOpenAudio ? "'4'" : "off"}, max ${cfg.announceMaxSeconds}s`,
     );
     twoVoiceDoors = twoVoice.doors();
     twoVoice.start(); // spawn a persistent, pre-registered opendoor per place (fast opens)
@@ -200,6 +222,7 @@ async function main() {
       },
       callme,
       twoVoice,
+      announcer,
     );
     await bridge.start(doors, twoVoiceDoors, twoVoiceDoorbells);
   } else {
@@ -302,6 +325,7 @@ async function main() {
     if (stopping) return;
     stopping = true;
     log.info(`shutdown (${sig})`);
+    announcer?.stop();
     setTimeout(() => {
       log.warn("shutdown deadline reached; exiting");
       process.exit(0);

@@ -36,6 +36,26 @@ configuration:
     description: >-
       How long a "ready" (pre-warm) button press keeps the call open, so a following door/gate press
       is instant. Longer keeps the 2Voice line engaged for longer.
+  announce_tts_engine:
+    name: Announcement TTS engine (optional)
+    description: >-
+      2Voice: the text-to-speech entity that speaks announcements, e.g. tts.piper or
+      tts.google_translate_en_com. Leave empty to use the first one Home Assistant has.
+  announce_tts_language:
+    name: Announcement language (optional)
+    description: >-
+      2Voice: language code for spoken announcements (e.g. en, it, de-DE). Leave empty for the
+      engine's default.
+  announce_open_audio:
+    name: Open the station's audio before announcing
+    description: >-
+      2Voice: send the "open audio" tone (4) on the call before an announcement, as the official app
+      does before you talk. Turn off only if your station misbehaves with it.
+  announce_max_seconds:
+    name: Announcement length limit (seconds)
+    description: >-
+      2Voice: announcements are cut at this length, so a long file cannot keep the 2Voice line
+      engaged.
   log_level:
     name: Log level
     description: How much detail to log (debug, info, warn, error).

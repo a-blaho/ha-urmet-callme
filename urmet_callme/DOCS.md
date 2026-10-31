@@ -98,6 +98,8 @@ still up and is reused. So:
   and only one can be live.
 
 The stream includes **one-way audio** (hear the visitor); two-way (talk-back) is not implemented yet.
+On 2Voice you can speak *to* the visitor with an announcement instead (see
+[Announcements](#announcements-2voice-experimental)).
 
 **"… hang up" button.** With video on, each place with a camera gets a **"… hang up"** `button` that
 ends its live camera call immediately (on 2Voice it also releases a call the door helper is holding).
@@ -156,6 +158,38 @@ a press during a preview does not open the door on yours, please open an issue w
 ringing your indoor monitor). If you test this, watch that your monitor stays quiet. Set
 `log_level: debug` and the add-on log shows each step (`[opendoor] …`) for troubleshooting.
 
+### Announcements (2Voice, experimental)
+
+Each 2Voice place gets a **"… announce"** `notify` entity that plays a short message out of the door
+station's speaker - one-way, no microphone: "Leave the parcel at the door", "Be right down". Call it
+with `notify.send_message`:
+
+```yaml
+action: notify.send_message
+target:
+  entity_id: notify.front_door_announce
+data:
+  message: Please leave the parcel at the door, thank you.
+```
+
+- **Text** is spoken by one of Home Assistant's TTS engines (Piper, Google Translate, Home Assistant
+  Cloud, ...). Set `announce_tts_engine` to choose one, otherwise the first one found is used (the
+  log says which). `announce_tts_language` picks the language.
+- **An `http://` or `https://` URL** of an audio file (mp3, wav, ogg, ...) is played as-is, e.g. a
+  pre-recorded chime or message.
+
+How it works: when nobody is watching the camera, the add-on places the same silent `auto_insertion`
+call the door button uses, sends the station the "open audio" tone (`4`, as the app does before you
+talk; `announce_open_audio`), plays the clip into the call, and then holds the call for
+`door_open_2voice_keepalive` seconds, so a door press right after is instant. While the camera is
+being viewed the clip goes out on the camera call instead. A new announcement replaces one still
+playing, and clips are cut at `announce_max_seconds`.
+
+Not yet confirmed on a 2Voice station: whether the station plays audio on this call is exactly what
+needs testing. If you try it, please report back in
+[issue #19](https://github.com/a-blaho/ha-urmet-callme/issues/19) with the add-on log of one
+announcement - every step is logged at the default `info` level (see [Logging](#logging)).
+
 ## Options
 
 | Option                                         | Notes                                                                                                                                          |
@@ -165,6 +199,10 @@ ringing your indoor monitor). If you test this, watch that your monitor stays qu
 | `video`                                        | Stream entrance cameras via embedded liblinphone + go2rtc (default `false`)                                                                    |
 | `door_open_2voice_keepalive`                   | 2Voice: seconds to keep the call open after an unlock so a follow-up (e.g. door → gate) is instant (default `4`; `0` = a fresh call per press) |
 | `door_open_2voice_prewarm_hold`                | 2Voice: seconds a **"… ready"** (pre-warm) button press keeps the call open, so a following door/gate press is instant (default `15`)          |
+| `announce_tts_engine`                          | 2Voice announcements: TTS entity for spoken messages, e.g. `tts.piper` (default: the first one Home Assistant has)                             |
+| `announce_tts_language`                        | 2Voice announcements: language code for spoken messages (default: the engine's)                                                                |
+| `announce_open_audio`                          | 2Voice announcements: send the "open audio" tone (`4`) before the clip, as the app does (default `true`)                                       |
+| `announce_max_seconds`                         | 2Voice announcements: cut clips at this length (default `30`, max `120`)                                                                       |
 | `mqtt_url` / `mqtt_username` / `mqtt_password` | Optional; omit to use the HA MQTT service automatically                                                                                        |
 | `log_level`                                    | `debug` / `info` (default) / `warn` / `error`                                                                                                  |
 
@@ -175,6 +213,20 @@ Everything is logged to the add-on log, timestamped and tagged by component
 
 - `info` (default): login, SIP registration, gateway resolution, discovered entrances, every open (which door + result), MQTT connect, reconnects, inbound calls.
 - `debug`: full SIP request/response trace, cloud HTTP calls, message bodies - useful for diagnosing. Inbound calls (if the panel ever forwards to this account) log a `[sip] INBOUND CALL: …` line. With video on, the media helper also traces its SIP and logs audio RTP/RTCP counters every 5 s (`[recv] audio rtp: …`); every camera call logs its negotiated directions and ends with an audio packet total, so a silent camera can be told apart as "the panel sent no audio" versus "audio arrived but was not decoded".
+
+Announcements are logged step by step at `info`, numbered (`[announce] #3 …`) so one can be followed
+through the log:
+
+- `[announce]`: the request, the TTS engine and rendered clip (or the URL), which call carries it
+  (camera call or door helper), what ffmpeg found in the source (`source: Stream #0:0: Audio: …`),
+  when the call started taking the audio, and a closing `done` / `FAILED` line with the reason.
+- `[opendoor] announce: …`: the door helper's side - placing or reusing the call, `audio (media up): PCMU/8000, our direction sendrecv, station offered …`
+  (we can only be heard when our direction allows sending), the open-audio tone, and the audio RTP
+  packets sent after each clip.
+- `[opendoor] talk-out: …` / `[atap] talk-out: …` (camera call): when the clip reached the call, a level
+  line per second while it plays, and a summary - audio length, peak level, clipping, and dropouts
+  (gaps where the source was slower than real time) - with a plain-language warning when the clip is
+  very quiet, clips, or stutters.
 
 Passwords/tokens are redacted.
 

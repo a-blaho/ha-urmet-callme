@@ -25,6 +25,9 @@ init: true
 # don't need it. go2rtc binds its ports (1984/8554/8555) directly on the host, so no `ports:` mapping
 # is declared (under host networking it would be ignored and only render a non-functional Network tab).
 host_network: true
+# Announcements (2Voice): spoken messages are rendered by one of Home Assistant's TTS engines, which
+# needs the Core API (POST /api/tts_get_url, and GET /api/states to find an engine).
+homeassistant_api: true
 services:
   - mqtt:need
 options:
@@ -37,6 +40,8 @@ options:
   go2rtc_webrtc_port: 8555
   door_open_2voice_keepalive: 4
   door_open_2voice_prewarm_hold: 15
+  announce_open_audio: true
+  announce_max_seconds: 30
   log_level: info
 schema:
   email: str
@@ -48,6 +53,10 @@ schema:
   go2rtc_webrtc_port: "int(1,65535)?"
   door_open_2voice_keepalive: "int(0,60)?"
   door_open_2voice_prewarm_hold: "int(1,60)?"
+  announce_tts_engine: "str?"
+  announce_tts_language: "str?"
+  announce_open_audio: "bool?"
+  announce_max_seconds: "int(5,120)?"
   log_level: "list(debug|info|warn|error)?"
   mqtt_url: "str?"
   mqtt_username: "str?"

@@ -2,6 +2,7 @@
 // openable relay (door/gate of each entrance); a press pulses the door open. The strike
 // is momentary with no state feedback, so a stateless button models it (no lock state).
 import mqtt, { MqttClient } from "mqtt";
+import { Announcer } from "./announce.js";
 import { CallMe, Door, DoorbellRing } from "./callme.js";
 import { TwoVoiceDoor, TwoVoiceService } from "./door2voice.js";
 import { logger } from "./logger.js";
@@ -59,6 +60,7 @@ export class MqttBridge {
   private relays = new Map<string, Relay>(); // command_topic -> relay (IPERCOM open_door_req)
   private tvRelays = new Map<string, TvRelay>(); // command_topic -> 2Voice relay (opendoor/DTMF)
   private tvPrewarm = new Map<string, { placeId: string; name: string }>(); // command_topic -> place
+  private tvAnnounce = new Map<string, { placeId: string; name: string }>(); // command_topic -> place
   private hangups = new Map<string, HangupPlace>(); // command_topic -> place whose call to end
   private onHangup?: (placeId: string) => Promise<boolean>;
   private doorbells: Doorbell[] = [];
@@ -74,6 +76,7 @@ export class MqttBridge {
     },
     private callme: CallMe,
     private twoVoice?: TwoVoiceService, // present when 2Voice places are detected
+    private announcer?: Announcer, // 2Voice announcements (the `notify` entities)
   ) {
     this.prefix = options.discoveryPrefix || "homeassistant";
   }
@@ -182,6 +185,7 @@ export class MqttBridge {
       this.client.subscribe(cmd);
     }
     this.publishTwoVoicePrewarm(doors);
+    this.publishTwoVoiceAnnounce(doors);
   }
 
   /** One `button` per 2Voice place that PRE-WARMS the call (opens the auto_insertion call without a
@@ -207,6 +211,35 @@ export class MqttBridge {
       };
       this.client.publish(
         `${this.prefix}/button/${uid}/config`,
+        JSON.stringify(cfg),
+        { retain: true },
+      );
+      this.client.subscribe(cmd);
+    }
+  }
+
+  /** One `notify` entity per 2Voice place that plays an announcement out of the door station
+   *  (announce.ts): `notify.send_message` with text speaks it through a Home Assistant TTS engine, an
+   *  http(s) URL of an audio file plays the file. Published only with an Announcer (2Voice). */
+  private publishTwoVoiceAnnounce(doors: TwoVoiceDoor[]) {
+    if (!this.announcer) return;
+    const seen = new Set<string>();
+    for (const d of doors) {
+      if (seen.has(d.placeId)) continue;
+      seen.add(d.placeId);
+      const uid = sanitize(`urmet_${d.placeId}_2voice_announce`);
+      const cmd = `urmet/callme/${uid}/set`;
+      this.tvAnnounce.set(cmd, { placeId: d.placeId, name: d.name });
+      const cfg = {
+        name: `${d.name} announce`,
+        unique_id: uid,
+        command_topic: cmd,
+        icon: "mdi:bullhorn",
+        availability_topic: this.availTopic,
+        device: this.deviceFor(d.placeId, d.name, "CallMe / 2Voice"),
+      };
+      this.client.publish(
+        `${this.prefix}/notify/${uid}/config`,
         JSON.stringify(cfg),
         { retain: true },
       );
@@ -400,6 +433,11 @@ export class MqttBridge {
     if (warm && this.twoVoice) {
       log.info(`pre-warm ${payload} for ${warm.name} (2Voice)`);
       this.twoVoice.prewarm(warm.placeId); // fire-and-forget: opens the call, no tone
+      return;
+    }
+    const ann = this.tvAnnounce.get(topic);
+    if (ann && this.announcer) {
+      void this.announcer.announce(ann.placeId, payload); // logs its own progress and outcome
       return;
     }
     const hang = this.hangups.get(topic);

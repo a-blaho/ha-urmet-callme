@@ -7,8 +7,8 @@
 // register ~2-3s + call each time), we keep ONE opendoor per place registered on the channel account
 // and drive it over stdin -- each press then pays only the call-setup time. opendoor registers once,
 // reads digits ('1' door / '2' gate) from stdin, opens per line, and prints `RESULT <d> ok|fail`.
-import { ChildProcess, spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { ChildProcess, execFileSync, spawn } from "node:child_process";
+import { mkdirSync, unlinkSync } from "node:fs";
 import { Place } from "./callme.js";
 import { logger } from "./logger.js";
 import { waitForExit } from "./proc.js";
@@ -45,6 +45,13 @@ export function macHeaderOf(user: string): string {
     ? user.replace(/_/g, ":")
     : "";
 }
+
+/** Announcements (announce.ts): the place's talk FIFO. PCM written here (s16le, 8 kHz mono) goes
+ *  out on whichever call to the station is up: opendoor reads it as OPENDOOR_AUDIO_IN, the camera's
+ *  recv as RECV_AUDIO_IN. They never hold a call at the same time (the camera releases the
+ *  door helper's call before placing its own), and each opens the FIFO only while its audio graph
+ *  runs, so one FIFO per place serves both. */
+export const talkFifoOf = (placeId: string) => `/tmp/urmet_talk_${sanitize(placeId)}.pcm`;
 
 /** An openable 2Voice relay (a door and a gate per place; see doors()). */
 export interface TwoVoiceDoor {
@@ -87,6 +94,7 @@ export class TwoVoiceService {
     private places: Place[],
     private keepaliveMs = 0, // >0: hold the call open this long for instant door-then-gate; 0: per-press
     private prewarmHoldMs = 15000, // how long a prewarm() (ready button) keeps the call open
+    private talkDtmf = "4", // announcements: open-audio digit opendoor sends first ("" = none)
   ) {}
 
   /** The 2Voice places' openable relays: a DOOR (DTMF '1') and a GATE (DTMF '2') per place. 2Voice
@@ -110,6 +118,16 @@ export class TwoVoiceService {
         continue;
       }
       this.helpers.set(p.id, { place: p, buf: "", pending: [] });
+      try {
+        unlinkSync(talkFifoOf(p.id));
+      } catch {
+        /* not there */
+      }
+      try {
+        execFileSync("mkfifo", [talkFifoOf(p.id)]);
+      } catch (e) {
+        log.warn(`announcement FIFO for ${p.id} not created: ${(e as Error).message}`);
+      }
       if (!p.outgoingUser) {
         log.warn(
           `2Voice place ${p.id} has no station account yet; waiting for the device to register`,
@@ -169,6 +187,8 @@ export class TwoVoiceService {
         OPENDOOR_KEEPALIVE_MS: String(this.keepaliveMs),
         OPENDOOR_PREWARM_HOLD_MS: String(this.prewarmHoldMs),
         OPENDOOR_UUID: instanceUuid(p.incomingUser, p.id),
+        OPENDOOR_AUDIO_IN: talkFifoOf(p.id),
+        OPENDOOR_TALK_DTMF: this.talkDtmf,
         ...(mac ? { OPENDOOR_MAC: mac } : {}),
       },
       stdio: ["pipe", "pipe", "inherit"],
@@ -303,6 +323,23 @@ export class TwoVoiceService {
     const h = this.helpers.get(placeId);
     if (!h?.child?.stdin?.writable) return;
     h.child.stdin.write("H\n");
+  }
+
+  /** The place's name, for logs. */
+  placeName(placeId: string): string | undefined {
+    return this.helpers.get(placeId)?.place.name;
+  }
+
+  /** Get a call ready to carry an announcement (announce.ts) and say which one: the live camera
+   *  call when the camera is being viewed (its recv reads the talk FIFO and already sent the
+   *  open-audio digit), otherwise a call the door helper places or keeps ('T': it sends the
+   *  open-audio digit and holds the call while the clip plays). Undefined when neither is possible. */
+  startTalk(placeId: string): "camera" | "door" | undefined {
+    if (this.videoLive?.(placeId)) return "camera";
+    const h = this.helpers.get(placeId);
+    if (!h?.child?.stdin?.writable) return undefined;
+    h.child.stdin.write("T\n");
+    return "door";
   }
 
   /** Stop every helper; resolves once they exited (opendoor BYEs a held keep-alive/pre-warm call

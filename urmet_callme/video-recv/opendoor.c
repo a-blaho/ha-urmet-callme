@@ -31,14 +31,17 @@
 #include <mediastreamer2/msqueue.h>
 #include <mediastreamer2/mssndcard.h>
 #include <ortp/str_utils.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
 #include <unistd.h>
+#include "talkout.h"
 
 /* ---- A minimal sound card so an audio stream negotiates in a headless container. liblinphone
  * validates a capture AND a playback device at audio-stream setup even when we neither send nor
@@ -91,23 +94,63 @@ static MSFilterDesc nullsink_desc = {
  * PCM frames so the G.711 encoder actually packetizes them and ortp TRANSMITS RTP. 2Voice stations
  * gate DTMF actuation / cut-through on receiving inbound RTP -- with a no-packet stream the station
  * waits out an internal timer (~2.5s) before acting on the first tone (the fresh-call delay); real
- * (silent) RTP cuts through immediately, as a live mic would. ---- */
-typedef struct { int rate; int nch; } SilenceSrc;
+ * (silent) RTP cuts through immediately, as a live mic would.
+ *
+ * Announcements: with OPENDOOR_AUDIO_IN=<fifo>, blocks are filled from that FIFO instead (see
+ * talkout.h; a short read is zero-filled, so the steady RTP above is unchanged). Paced by the ticker
+ * clock like recv.c's aread, not one block per tick, so real audio does not drift when the ticker
+ * runs late. Env unset = silence, as before. ---- */
+static void olog(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vprintf(fmt, ap);
+  va_end(ap);
+}
+typedef struct {
+  int rate;
+  int nch;
+  int started;       /* first process() done (start_ms may legitimately be 0: the ticker starts there) */
+  uint64_t start_ms; /* ticker time at the first process() */
+  int64_t produced;  /* frames produced so far (per channel) */
+  TalkIn talk;       /* announcement FIFO (talkout.h) */
+} SilenceSrc;
 static void silence_init(MSFilter *f) {
   SilenceSrc *s = ms_new0(SilenceSrc, 1);
   s->rate = 8000; /* G.711 forced -> 8 kHz mono; SET handlers below confirm */
   s->nch = 1;
+  talkin_init(&s->talk, "opendoor", olog);
   f->data = s;
 }
-static void silence_uninit(MSFilter *f) { ms_free(f->data); }
+static void silence_uninit(MSFilter *f) {
+  SilenceSrc *s = (SilenceSrc *)f->data;
+  talkin_close(&s->talk, s->rate, s->nch);
+  ms_free(s);
+}
 static void silence_process(MSFilter *f) {
   SilenceSrc *s = (SilenceSrc *)f->data;
-  const int nsamp = s->rate / 100; /* ~10 ms per tick (mediastreamer default ticker) */
-  const int bytes = nsamp * s->nch * 2; /* s16le */
-  mblk_t *m = allocb(bytes, 0);
-  memset(m->b_wptr, 0, bytes);
-  m->b_wptr += bytes;
-  ms_queue_put(f->outputs[0], m);
+  uint64_t now = f->ticker->time;
+  if (!s->started) {
+    talkin_open(&s->talk, "OPENDOOR_AUDIO_IN", s->rate, s->nch);
+    s->started = 1;
+    s->start_ms = now;
+    return;
+  }
+  const int block = s->rate / 50; /* 20 ms of frames (one G.711 packet) */
+  int64_t due = (int64_t)((now - s->start_ms) * (uint64_t)s->rate / 1000) - s->produced;
+  if (due > s->rate / 5) { /* fell behind (ticker stall): skip rather than burst */
+    talkin_note_skip(&s->talk, (long)((due - block) * 1000 / s->rate));
+    s->produced += due - block;
+    due = block;
+  }
+  while (due >= block) {
+    size_t bytes = (size_t)block * 2 * (size_t)s->nch; /* s16le */
+    mblk_t *m = allocb(bytes, 0);
+    talkin_fill(&s->talk, m->b_wptr, bytes, s->rate, s->nch);
+    m->b_wptr += bytes;
+    ms_queue_put(f->outputs[0], m);
+    s->produced += block;
+    due -= block;
+  }
 }
 static int silence_set_sr(MSFilter *f, void *a) { ((SilenceSrc *)f->data)->rate = *(int *)a; return 0; }
 static int silence_get_sr(MSFilter *f, void *a) { *(int *)a = ((SilenceSrc *)f->data)->rate; return 0; }
@@ -130,7 +173,7 @@ static MSFilterDesc silence_desc = {
     .process = silence_process,
     .uninit = silence_uninit,
     .methods = silence_methods,
-    .flags = 0,
+    .flags = MS_FILTER_IS_PUMP, /* clock-paced: run every tick, not only when input is queued */
 };
 
 static MSFilter *null_create_writer(MSSndCard *card) {
@@ -168,8 +211,47 @@ static int g_reg_ok = 0;     /* registration succeeded */
 static int g_reg_failed = 0; /* registration failed (bad creds / server) */
 static int g_streams = 0;    /* the call reached StreamsRunning (media up) -> safe to send DTMF */
 static int g_ended = 0;      /* the call ended (End/Error/Released) */
+static int g_talk_digit_sent = 0; /* the open-audio digit went out on this call (announcements) */
 
 static void on_sig(int _s) { (void)_s; g_running = 0; }
+
+static const char *dir_name(LinphoneMediaDirection d) {
+  switch (d) {
+  case LinphoneMediaDirectionInactive: return "inactive";
+  case LinphoneMediaDirectionSendOnly: return "sendonly";
+  case LinphoneMediaDirectionRecvOnly: return "recvonly";
+  case LinphoneMediaDirectionSendRecv: return "sendrecv";
+  default: return "invalid";
+  }
+}
+
+/* Announcement diagnostics: the NEGOTIATED audio (codec + direction, ours and the station's). An
+ * announcement only reaches the station when our side may send: "sendrecv"/"sendonly" here. A
+ * station answering "sendonly" (from its side) puts us on recvonly, and nothing we play gets out. */
+static void log_audio_media(LinphoneCall *call, const char *when) {
+  const LinphoneCallParams *cp = linphone_call_get_current_params(call);
+  const LinphoneCallParams *rp = linphone_call_get_remote_params(call);
+  const LinphonePayloadType *pt = cp ? linphone_call_params_get_used_audio_payload_type(cp) : NULL;
+  printf("[opendoor] audio (%s): %s/%d, our direction %s, station offered %s\n", when,
+         pt ? linphone_payload_type_get_mime_type(pt) : "?",
+         pt ? linphone_payload_type_get_clock_rate(pt) : 0,
+         cp ? dir_name(linphone_call_params_get_audio_direction(cp)) : "?",
+         rp ? dir_name(linphone_call_params_get_audio_direction(rp)) : "?");
+  fflush(stdout);
+}
+
+/* Audio RTP counters for the call so far: "sent" rising while a clip plays = it left for the station;
+ * "recv" = the station sends audio back (its microphone is open). */
+static void log_audio_rtp(LinphoneCall *call, const char *when) {
+  LinphoneCallStats *st = linphone_call_get_audio_stats(call);
+  if (!st) return;
+  const rtp_stats_t *r = linphone_call_stats_get_rtp_stats(st);
+  printf("[opendoor] audio rtp (%s): sent %llu pkts (%llu B), recv %llu pkts, lost %lld\n", when,
+         (unsigned long long)r->packet_sent, (unsigned long long)r->sent,
+         (unsigned long long)r->packet_recv, (long long)r->cum_packet_loss);
+  fflush(stdout);
+  linphone_call_stats_unref(st);
+}
 
 static void on_reg_state(LinphoneCore *lc, LinphoneProxyConfig *cfg,
                          LinphoneRegistrationState state, const char *message) {
@@ -199,9 +281,15 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     printf("[opendoor] media up: audio%s\n",
            (cur && linphone_call_params_video_enabled(cur)) ? "+video" : " only");
     fflush(stdout);
+    log_audio_media(call, "media up");
     g_streams = 1;
     break;
   }
+  case LinphoneCallPausedByRemote:
+  case LinphoneCallUpdatedByRemote:
+    /* The station changed the media mid-call (e.g. put us on hold) -- this can stop an announcement. */
+    log_audio_media(call, linphone_call_state_to_string(state));
+    break;
   case LinphoneCallError: {
     /* DIAGNOSTIC (58A support): print the SIP status the station returned. A `486 Busy Here` here
      * means the station rejected our header (the 58A rejects `auto_insertion`; a cloud-listed
@@ -216,6 +304,8 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     break;
   }
   case LinphoneCallEnd:
+    log_audio_rtp(call, "call ended");
+    /* fall through */
   case LinphoneCallReleased:
     printf("[opendoor] call finished: %s\n", message ? message : "");
     fflush(stdout);
@@ -251,6 +341,7 @@ static int phase_b(void) {
 static LinphoneCall *place_call(LinphoneCore *lc, LinphoneFactory *factory, const char *out_uri) {
   g_streams = 0;
   g_ended = 0;
+  g_talk_digit_sent = 0;
   LinphoneAddress *to = linphone_factory_create_address(factory, out_uri);
   if (!to) { fprintf(stderr, "[opendoor] bad OUT uri %s\n", out_uri); return NULL; }
   LinphoneCallParams *p = linphone_core_create_call_params(lc, NULL);
@@ -355,6 +446,90 @@ static void send_tone(char c, long long *last_activity, long long now) {
   *last_activity = now;
 }
 
+/* ---- Announcements ('T' on stdin). The control plane plays a clip into OPENDOOR_AUDIO_IN (see
+ * talkout.h); our job is to have a call up while it plays: place one if none is held, send the
+ * station the open-audio digit (OPENDOOR_TALK_DTMF; the app sends '4' to open the audio on an
+ * auto_insertion call; empty = none), wait up to OPENDOOR_TALK_START_MS for the clip to start (TTS
+ * may still be rendering), keep the call while it plays, and release it like any other activity
+ * afterwards. No RESULT line: the control plane matches RESULTs to door presses, and it learns how
+ * the clip went from its own writer. */
+#define OPENDOOR_TALK_START_MS 25000
+
+static long long talk_start_ms(void) {
+  const char *e = getenv("OPENDOOR_TALK_START_MS");
+  return (e && *e) ? atoll(e) : OPENDOOR_TALK_START_MS;
+}
+
+/* Once per call, when media runs: the open-audio digit, if configured. */
+static void talk_send_digit(void) {
+  if (g_talk_digit_sent || !g_call || !g_streams) return;
+  g_talk_digit_sent = 1;
+  const char *d = getenv("OPENDOOR_TALK_DTMF");
+  if (!d || !*d) {
+    printf("[opendoor] announce: no open-audio digit configured (sending none)\n");
+  } else {
+    LinphoneStatus st = linphone_call_send_dtmf(g_call, d[0]);
+    printf("[opendoor] announce: sent open-audio DTMF '%c' (SIP INFO) -> %s\n", d[0],
+           st == 0 ? "ok" : "FAILED");
+  }
+  fflush(stdout);
+}
+
+/* Log what the announcement request finds (and whether it has to place a call). */
+static void talk_log_request(long long now, long long call_placed_at) {
+  if (!g_call)
+    printf("[opendoor] announce: requested -> placing a call to the station\n");
+  else if (!g_streams)
+    printf("[opendoor] announce: requested -> call already being placed (%lld ms ago)\n",
+           now - call_placed_at);
+  else
+    printf("[opendoor] announce: requested -> riding the call already up\n");
+  fflush(stdout);
+}
+
+/* PER-PRESS mode announcement (keep-alive off): place a call, play, hang up. Blocks like run_open. */
+static void run_talk(LinphoneCore *lc, LinphoneFactory *factory, const char *out_uri) {
+  const long long start = now_ms();
+  talk_log_request(start, start);
+  if (!place_call(lc, factory, out_uri)) return;
+  const long long start_ms = talk_start_ms();
+  const long clips0 = g_talk_clips;
+  long long media_at = 0, clip_end_at = 0;
+  int started = 0;
+  while (g_running) {
+    linphone_core_iterate(lc);
+    usleep(50 * 1000);
+    const long long now = now_ms();
+    if (g_streams && !media_at) {
+      media_at = now;
+      printf("[opendoor] announce: call ready %lld ms after the request; waiting for the clip\n",
+             now - start);
+      fflush(stdout);
+    }
+    talk_send_digit();
+    if (g_talk_active) started = 1;
+    if (g_ended) { printf("[opendoor] announce: the station ended the call\n"); fflush(stdout); break; }
+    if (!g_streams && now - start > OPENDOOR_STREAMS_TIMEOUT_MS) {
+      printf("[opendoor] announce: FAILED -- no media within %ds (station busy / rejected?)\n",
+             OPENDOOR_STREAMS_TIMEOUT_MS / 1000);
+      fflush(stdout);
+      break;
+    }
+    if (!started && media_at && now - media_at > start_ms) {
+      printf("[opendoor] announce: no audio arrived within %llds of the call coming up; hanging up\n",
+             start_ms / 1000);
+      fflush(stdout);
+      break;
+    }
+    if (g_talk_clips != clips0 && !clip_end_at) {
+      clip_end_at = now;
+      if (g_call) log_audio_rtp(g_call, "after the clip");
+    }
+    if (clip_end_at && now - clip_end_at > 500) break; /* brief settle, then BYE */
+  }
+  bye_call(lc);
+}
+
 /* PERSISTENT KEEP-ALIVE loop: hold the auto_insertion call up for `keepalive_ms` after the last tone
  * and send follow-up tones on the SAME call (instant repeat, e.g. door then gate),
  * then BYE on idle to release the 2Voice bus/monitor. Reads digits from stdin; reports RESULT per
@@ -368,6 +543,13 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
   char queue[8]; /* tones waiting for StreamsRunning (the command that placed the call) */
   int qn = 0;
   int release_req = 0; /* an 'H' arrived: BYE the held call once no tone is still waiting to go out */
+  /* Announcement: hold the call for a clip until talk_deadline (it must START by then); while it
+   * plays the call is busy; after it ends, the keep-alive idle counts from the clip's end. */
+  long long talk_deadline = 0, talk_requested_at = 0;
+  int talk_waiting = 0;   /* a 'T' is waiting for its clip to start */
+  int talk_media_logged = 0;
+  long talk_clips = g_talk_clips;
+  const long long talk_start = talk_start_ms();
 
   while (g_running) {
     linphone_core_iterate(lc);
@@ -394,12 +576,31 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
         }
         continue;
       }
+      if (c == 'T') {
+        /* Announcement: open/hold the call; the clip arrives on OPENDOOR_AUDIO_IN (see run_talk). */
+        talk_log_request(now, call_placed_at);
+        if (!g_call) {
+          if (!place_call(lc, factory, out_uri)) continue;
+          call_placed_at = now;
+        }
+        talk_requested_at = now;
+        talk_waiting = 1;
+        talk_media_logged = 0;
+        talk_deadline = now + OPENDOOR_STREAMS_TIMEOUT_MS + talk_start;
+        continue;
+      }
       if (c == 'H') {
         /* Release (hang up): the user pressed "hang up", or the camera is about to place ITS call
          * to this station and a held pre-warm/keep-alive call of ours would collide with it. A tone
          * already queued for this call still goes out first (checked below); nothing is lost. */
         release_req = 1;
         warm_deadline = 0;
+        if (g_talk_active) {
+          printf("[opendoor] announce: hang-up requested while a clip plays -> cutting it short\n");
+          fflush(stdout);
+        }
+        talk_waiting = 0;
+        talk_deadline = 0;
         continue;
       }
       if (c != '1' && c != '2') continue;
@@ -419,6 +620,39 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
       for (int i = 0; i < qn; i++) send_tone(queue[i], &last_activity, now);
       qn = 0;
     }
+    /* Announcement bookkeeping. */
+    if (talk_waiting && g_call && g_streams) {
+      if (!talk_media_logged) {
+        talk_media_logged = 1;
+        printf("[opendoor] announce: call ready %lld ms after the request; waiting for the clip\n",
+               now - talk_requested_at);
+        fflush(stdout);
+        talk_deadline = now + talk_start; /* the clip must start within talk_start from here */
+      }
+      talk_send_digit();
+    }
+    if (g_talk_active) {
+      talk_waiting = 0;
+      talk_deadline = 0;
+      last_activity = now; /* busy while it plays; the idle hang-up counts from the clip's end */
+    }
+    if (g_talk_clips != talk_clips) {
+      talk_clips = g_talk_clips;
+      last_activity = now;
+      if (g_call) log_audio_rtp(g_call, "after the clip");
+      if (keepalive_ms > 0) {
+        printf("[opendoor] announce: done; holding the call %llds for a follow-up\n",
+               keepalive_ms / 1000);
+        fflush(stdout);
+      }
+    }
+    if (talk_waiting && talk_deadline && now > talk_deadline) {
+      printf("[opendoor] announce: no audio arrived within %llds of the call coming up; "
+             "releasing the hold\n", talk_start / 1000);
+      fflush(stdout);
+      talk_waiting = 0;
+      talk_deadline = 0;
+    }
     /* Release requested and no tone is waiting on this call any more -> BYE now (not on idle). */
     if (release_req && qn == 0) {
       release_req = 0;
@@ -434,6 +668,9 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
               OPENDOOR_STREAMS_TIMEOUT_MS / 1000);
       for (int i = 0; i < qn; i++) printf("[opendoor] RESULT %c fail\n", queue[i]);
       qn = 0; fflush(stdout);
+      if (talk_waiting) { printf("[opendoor] announce: FAILED -- the call never came up\n"); fflush(stdout); }
+      talk_waiting = 0;
+      talk_deadline = 0;
       bye_call(lc);
     }
     /* Station ended the call on its own. */
@@ -441,11 +678,19 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
       for (int i = 0; i < qn; i++) printf("[opendoor] RESULT %c fail\n", queue[i]);
       if (qn > 0) fflush(stdout);
       qn = 0;
+      if (talk_waiting || g_talk_active) {
+        printf("[opendoor] announce: the station ended the call%s\n",
+               g_talk_active ? " mid-clip" : " before the clip started");
+        fflush(stdout);
+      }
+      talk_waiting = 0;
+      talk_deadline = 0;
       bye_call(lc);
     }
     /* Idle -> release the bus/monitor. A pre-warm holds the call up until warm_deadline even with no
      * tone yet (last_activity stays 0), so require both the keep-alive idle AND the warm window past. */
-    if (g_call && g_streams && now - last_activity > keepalive_ms && now > warm_deadline) {
+    if (g_call && g_streams && !g_talk_active && now - last_activity > keepalive_ms &&
+        now > warm_deadline && now > talk_deadline) {
       printf("[opendoor] keep-alive idle -> hanging up\n");
       fflush(stdout);
       bye_call(lc);
@@ -464,6 +709,9 @@ int main(int argc, char **argv) {
             "    per line, printing 'RESULT <d> ok|fail'; exit when stdin closes. (Faster: each press\n"
             "    skips the SIP register.) With OPENDOOR_KEEPALIVE_MS>0 also 'W' (pre-warm: open the\n"
             "    call, no tone) and 'H' (release: hang up a held call now).\n"
+            "  Announcements: OPENDOOR_AUDIO_IN=<fifo> sends s16le 8 kHz mono PCM from it instead of\n"
+            "    silence; 'T' holds a call for a clip (OPENDOOR_TALK_DTMF = open-audio digit to send,\n"
+            "    empty = none; OPENDOOR_TALK_START_MS = how long the clip may take to start).\n"
             "  env: OPENDOOR_DATA_DIR=<dir> (unique per place), OPENDOOR_DEBUG=1 (SIP trace)\n",
             argv[0]);
     return 2;
@@ -652,6 +900,8 @@ int main(int argc, char **argv) {
         if (n == 0) break; /* stdin closed -> the control plane stopped us -> exit */
         if (n == 1 && (c == '1' || c == '2'))
           run_open(lc, factory, out_uri, c, 1); /* prints RESULT (ok as soon as the tone is out) */
+        else if (n == 1 && c == 'T')
+          run_talk(lc, factory, out_uri); /* announcement: place a call, play the clip, hang up */
       }
     }
   } else {
