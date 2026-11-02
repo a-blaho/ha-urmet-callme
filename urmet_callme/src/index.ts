@@ -306,6 +306,22 @@ async function main() {
     );
   }
 
+  // "Next camera" button per 2Voice place with video: a station with several entrance panels shows
+  // them one at a time on the camera call, switched by an in-call tone (issue #20). Ipercom cameras
+  // are separate streams already, so they get none.
+  const v2served = video2v?.placesServed() ?? [];
+  if (bridge && video2v && v2served.length) {
+    const v2 = video2v;
+    bridge.publishNextCamera(
+      v2served.map((placeId) => ({
+        placeId,
+        name: callme.places.find((x) => x.id === placeId)?.name ?? placeId,
+        model: "CallMe / 2Voice",
+      })),
+      (placeId) => v2.nextCamera(placeId),
+    );
+  }
+
   // Ingress panel (served through HA's authenticated proxy): the go2rtc camera UI when video is on,
   // otherwise blank (the entities/log already report status).
   try {

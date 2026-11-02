@@ -670,12 +670,18 @@ static int g_cmds = 0;    /* reading tone commands from stdin */
 static int g_streams = 0; /* the current call reached StreamsRunning (tones can go out) */
 static char g_tone_q[8];  /* tones waiting for StreamsRunning */
 static int g_tone_qn = 0;
+/* '3' (UCFCallManager's next-camera digit, issue #20) is taken on stdin like the door/gate tones: the
+ * station swaps the picture to its next camera on the SAME call. Its first frames after the swap may
+ * be P-frames of a stream we hold no keyframe for, so nudge for one (~1/s) until this time. Unlike the
+ * start-of-call window this never hangs up: the call is fine either way. */
+static time_t g_switch_vfu_until = 0;
 
 static void send_tone(LinphoneCall *call, char digit) {
   LinphoneStatus st = linphone_call_send_dtmf(call, digit);
   rlog("[recv] DTMF '%c' sent on the camera call (SIP INFO) -> %s\n", digit,
        st == 0 ? "ok" : "FAILED");
   rlog("[recv] RESULT %c %s\n", digit, st == 0 ? "ok" : "fail");
+  if (digit == '3' && st == 0) g_switch_vfu_until = time(NULL) + 5;
 }
 
 static void fail_queued_tones(const char *why) {
@@ -691,7 +697,7 @@ static void read_tone_commands(void) {
     ssize_t n = read(STDIN_FILENO, &c, 1);
     if (n == 0) { g_cmds = 0; break; } /* the control plane closed our stdin: stop polling */
     if (n < 0) break;                  /* EAGAIN: nothing more right now */
-    if (c != '1' && c != '2') continue; /* newlines, anything else */
+    if (c != '1' && c != '2' && c != '3') continue; /* newlines, anything else */
     if (g_call && g_streams) send_tone(g_call, c);
     else if (g_call && g_tone_qn < (int)sizeof g_tone_q) g_tone_q[g_tone_qn++] = c;
     else rlog("[recv] RESULT %c fail (no call up)\n", c);
@@ -1116,6 +1122,18 @@ int main(int argc, char **argv) {
         linphone_call_send_vfu_request(g_call);
         send_pfu_info(g_call);
         rlog("[recv] SIGUSR2 -> keyframe requested for the re-attached reader\n");
+        fflush(stdout);
+      }
+    }
+    /* After a next-camera tone: keyframe nudges for the new camera's picture (see send_tone). */
+    if (g_call && g_switch_vfu_until) {
+      time_t now = time(NULL);
+      if (now >= g_switch_vfu_until) g_switch_vfu_until = 0;
+      else if (now != g_last_vfu) { /* rate-limit to ~1/s */
+        g_last_vfu = now;
+        linphone_call_send_vfu_request(g_call);
+        send_pfu_info(g_call);
+        rlog("[recv] requesting keyframe (VFU + INFO) after the camera switch\n");
         fflush(stdout);
       }
     }

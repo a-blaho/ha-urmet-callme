@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **2Voice: "next camera" button for stations with more than one entrance panel
+  ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).** Only the first panel's camera
+  could be shown. With video on, each 2Voice place now gets a **"… next camera"** button that sends
+  the app's next-camera tone `3` on the live camera call, and asks the station for a fresh picture so
+  the stream does not stall on the switch. While another panel is shown, the door/gate buttons open
+  that panel's door and gate. Not yet confirmed on a station.
 - **2Voice: announcements and door presses now work while the station rings
   ([#19](https://github.com/a-blaho/ha-urmet-callme/issues/19)).** A ringing station refuses every
   new call (486 Busy), so an auto-reply to a ring failed until the ring timed out. When that happens

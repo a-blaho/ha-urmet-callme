@@ -52,7 +52,8 @@ family from the cloud and uses the right door-open path - no extra option to set
 - **Video (opt-in `video: true`)** - one-way live video + audio via the WebRTC Camera card, plus a
   "hang up" button per camera place to end the call from an automation or dashboard.
 - **2Voice door-open** - auto-enabled on 2Voice systems: door/gate unlock plus a "ready" pre-warm
-  button for an instant open; with video on, door/gate work on the live camera call.
+  button for an instant open; with video on, door/gate work on the live camera call, and a
+  "next camera" button switches between entrance panels.
 - **Camera panel** - when video is enabled, a page in the Home Assistant sidebar (via ingress) shows
   the live camera view; blank when video is off (status is in the entities and the add-on log).
 

@@ -13,8 +13,13 @@ test("parseResult reads opendoor's and recv's RESULT lines", () => {
     digit: "1",
     ok: false,
   });
+  // recv's next-camera tone must match too, or its pending queue shifts onto the next door press
+  assert.deepEqual(parseResult("2026-11-02T10:00:00.123Z [recv] RESULT 3 ok"), {
+    digit: "3",
+    ok: true,
+  });
   assert.equal(parseResult("[opendoor] sent DTMF '1' (status 0)"), null);
-  assert.equal(parseResult("RESULT 4 ok"), null); // only door/gate digits are tone results
+  assert.equal(parseResult("RESULT 4 ok"), null); // open-audio is never answered with a RESULT
 });
 
 test("sanitize keeps [A-Za-z0-9_] and replaces the rest", () => {

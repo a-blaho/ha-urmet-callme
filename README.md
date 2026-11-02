@@ -29,7 +29,8 @@ one as a Home Assistant entity over MQTT.
   default; enable with `video: true`.
 - **2Voice support.** Non-Ipercom 2Voice systems open the door a different way (an in-call tone);
   when a 2Voice system is detected, door/gate unlock and a "ready" pre-warm button appear
-  automatically - no option to set. With video on, door and gate work on the live camera call.
+  automatically - no option to set. With video on, door and gate work on the live camera call, and a
+  "next camera" button switches between the station's entrance panels.
 - **Camera panel.** When video is enabled, a page in the Home Assistant sidebar (via ingress) shows
   the live camera view. With video off it is blank - entity states and the add-on log report status.
 - **Local MQTT, cloud control.** Entities are published via Home Assistant's MQTT discovery; the door

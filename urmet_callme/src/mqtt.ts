@@ -63,6 +63,8 @@ export class MqttBridge {
   private tvAnnounce = new Map<string, { placeId: string; name: string }>(); // command_topic -> place
   private hangups = new Map<string, HangupPlace>(); // command_topic -> place whose call to end
   private onHangup?: (placeId: string) => Promise<boolean>;
+  private nextCams = new Map<string, HangupPlace>(); // command_topic -> 2Voice place to switch
+  private onNextCamera?: (placeId: string) => Promise<boolean>;
   private doorbells: Doorbell[] = [];
   private availTopic = "urmet/callme/availability";
   private prefix: string; // HA MQTT-discovery topic prefix (default "homeassistant")
@@ -276,6 +278,35 @@ export class MqttBridge {
     log.info(`published ${places.length} hang-up button(s)`);
   }
 
+  /** One "next camera" `button` per 2Voice place with video (issue #20). A station with several
+   *  entrance panels shows one at a time on the camera call; a press sends the app's next-camera
+   *  digit on that call, and the door/gate buttons then open the panel being shown. `handler`
+   *  resolves whether a camera call was up to switch. */
+  publishNextCamera(places: HangupPlace[], handler: (placeId: string) => Promise<boolean>) {
+    this.onNextCamera = handler;
+    for (const p of places) {
+      const uid = sanitize(`urmet_${p.placeId}_next_camera`);
+      const cmd = `urmet/callme/${uid}/set`;
+      this.nextCams.set(cmd, p);
+      const cfg = {
+        name: `${p.name} next camera`,
+        unique_id: uid,
+        command_topic: cmd,
+        payload_press: "NEXT",
+        icon: "mdi:camera-switch",
+        availability_topic: this.availTopic,
+        device: this.deviceFor(p.placeId, p.name, p.model),
+      };
+      this.client.publish(
+        `${this.prefix}/button/${uid}/config`,
+        JSON.stringify(cfg),
+        { retain: true },
+      );
+      this.client.subscribe(cmd);
+    }
+    log.info(`published ${places.length} next-camera button(s)`);
+  }
+
   /** One doorbell `event` entity per 2Voice place. The ring arrives on the channel account carrying
    *  the calling-station (OUT) username in its From, so we key the match on that. Pushed into the
    *  same `doorbells` list so `ringDoorbell` routes to it. Independent of 2Voice door-open - the ring
@@ -448,6 +479,19 @@ export class MqttBridge {
         log.info(`hang up ${hang.name}: ${ended ? "call ended" : "no camera call was up"}`);
       } catch (e) {
         log.error(`hang up ${hang.name} FAILED:`, (e as Error).message);
+      }
+      return;
+    }
+    const next = this.nextCams.get(topic);
+    if (next && this.onNextCamera) {
+      log.info(`press ${payload} for ${next.name} next camera`);
+      try {
+        const switched = await this.onNextCamera(next.placeId);
+        log.info(
+          `next camera ${next.name}: ${switched ? "switch sent on the camera call" : "no camera call was up (open the camera first)"}`,
+        );
+      } catch (e) {
+        log.error(`next camera ${next.name} FAILED:`, (e as Error).message);
       }
     }
   }
