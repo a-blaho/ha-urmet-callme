@@ -30,18 +30,14 @@ host_network: true
 homeassistant_api: true
 services:
   - mqtt:need
+# Only the options most users touch are listed here (shown in the UI by default). Every other schema
+# entry is optional with its default in src/index.ts, and appears under "Show unused optional
+# configuration options" for the few setups that need it.
 options:
   email: ""
   password: ""
   doorbell: true
   video: false
-  go2rtc_api_port: 1984
-  go2rtc_rtsp_port: 8554
-  go2rtc_webrtc_port: 8555
-  door_open_2voice_keepalive: 4
-  door_open_2voice_prewarm_hold: 15
-  announce_open_audio: true
-  announce_max_seconds: 30
   log_level: info
 schema:
   email: str

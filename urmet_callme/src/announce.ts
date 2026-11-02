@@ -172,6 +172,26 @@ export class Announcer {
     );
 
     // 3. Decode into the place's talk FIFO. One clip per place: a newer one replaces it.
+    const ok = await this.play(placeId, id, at, input, auth, route);
+    if (ok !== "camera-took-over") return ok;
+    // The camera was opened while the door helper's call was coming up or playing: the camera call
+    // has to hang that call up first (the two collide at the station), which broke the clip. The
+    // camera call reads the same talk FIFO, so play the clip again from the start on it.
+    log.info(`#${id} ${at()} the camera call took the line; playing the clip again on it`);
+    return (await this.play(placeId, id, at, input, auth, "camera")) === true;
+  }
+
+  /** Write one clip into the place's talk FIFO with ffmpeg. "camera-took-over" = the door helper's
+   *  call was dropped for the camera's before the clip finished (the caller replays it). */
+  private play(
+    placeId: string,
+    id: number,
+    at: () => string,
+    input: string,
+    auth: string | undefined,
+    route: "camera" | "door",
+  ): Promise<boolean | "camera-took-over"> {
+    const t0 = Date.now();
     const prev = this.playing.get(placeId);
     if (prev) {
       log.info(`#${id} replacing announcement #${prev.id}, which is still playing`);
@@ -184,8 +204,9 @@ export class Announcer {
     const cur: Playing = { id, ff, replaced: false };
     this.playing.set(placeId, cur);
 
-    return new Promise<boolean>((resolve) => {
-      let took = 0; // ms since the request when the call took the audio
+    return new Promise((resolve) => {
+      let took = 0; // ms since this clip was started when the call took the audio
+      let timedOut = false;
       let last = { totalSize: 0, outTimeMs: 0 };
       const errors: string[] = [];
       let out = "";
@@ -197,6 +218,7 @@ export class Announcer {
           `#${id} ${at()} FAILED: no call took the clip within ${START_TIMEOUT_MS / 1000}s ` +
             "(see the [opendoor]/[recv] lines above for why the call did not come up)",
         );
+        timedOut = true;
         ff.kill("SIGTERM");
       }, START_TIMEOUT_MS);
 
@@ -260,7 +282,18 @@ export class Announcer {
           );
           return resolve(true);
         }
-        const why = errors.some((e) => /broken pipe/i.test(e))
+        const brokenPipe = errors.some((e) => /broken pipe/i.test(e));
+        if (
+          route === "door" &&
+          !this.stopping &&
+          !timedOut &&
+          (brokenPipe || !errors.length) &&
+          this.tv.cameraLive(placeId)
+        ) {
+          log.info(`#${id} ${at()} the door helper's call was released after ${audio}`);
+          return resolve("camera-took-over");
+        }
+        const why = brokenPipe
           ? "the call ended mid-clip"
           : errors.length
             ? `source: ${errors[errors.length - 1]}` // e.g. a 404 URL: ffmpeg fails before the call matters

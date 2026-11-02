@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **2Voice: announcements and door presses now work while the station rings
+  ([#19](https://github.com/a-blaho/ha-urmet-callme/issues/19)).** A ringing station refuses every
+  new call (486 Busy), so an auto-reply to a ring failed until the ring timed out. When that happens
+  the add-on now answers the ring call and plays the announcement (or sends the door/gate tone) on
+  it. Answering takes the call, so the CallMe app stops ringing; it only happens when the add-on's own
+  call is refused. Not yet confirmed on a station.
+- **2Voice: opening the camera while an announcement starts no longer drops it.** The camera call has
+  to end the door helper's call first, which cut the clip; it is now played again from the start on
+  the camera call.
+- **Fewer options on the Configuration page.** Only login, doorbell, video and log level are shown by
+  default; the go2rtc ports, 2Voice call timings and announcement settings keep their defaults and
+  appear under "Show unused optional configuration options". Values you already set are kept.
+
 ## 1.0.16
 
 - **Announcements on 2Voice (experimental, [#19](https://github.com/a-blaho/ha-urmet-callme/issues/19)).**

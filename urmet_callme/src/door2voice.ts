@@ -189,6 +189,9 @@ export class TwoVoiceService {
         OPENDOOR_UUID: instanceUuid(p.incomingUser, p.id),
         OPENDOOR_AUDIO_IN: talkFifoOf(p.id),
         OPENDOOR_TALK_DTMF: this.talkDtmf,
+        // Hold a doorbell ring so an announcement / door press during it can answer it (the station
+        // refuses new calls while it rings). Only answered when our own call is refused.
+        OPENDOOR_ANSWER_RING: "1",
         ...(mac ? { OPENDOOR_MAC: mac } : {}),
       },
       stdio: ["pipe", "pipe", "inherit"],
@@ -334,6 +337,11 @@ export class TwoVoiceService {
    *  call when the camera is being viewed (its recv reads the talk FIFO and already sent the
    *  open-audio digit), otherwise a call the door helper places or keeps ('T': it sends the
    *  open-audio digit and holds the call while the clip plays). Undefined when neither is possible. */
+  /** True while the place's camera call is up (it can carry an announcement). */
+  cameraLive(placeId: string): boolean {
+    return this.videoLive?.(placeId) ?? false;
+  }
+
   startTalk(placeId: string): "camera" | "door" | undefined {
     if (this.videoLive?.(placeId)) return "camera";
     const h = this.helpers.get(placeId);

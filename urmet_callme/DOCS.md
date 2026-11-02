@@ -55,7 +55,7 @@ is the path that works.
 
    **Already run your own go2rtc add-on?** It owns ports `1984`/`8554`/`8555`, so set
    `go2rtc_api_port` / `go2rtc_rtsp_port` / `go2rtc_webrtc_port` in this add-on's **Configuration**
-   options to free ports (e.g. `11984`/`18554`/`18555`) and point the card's `server:` at the API port
+   options (turn on **Show unused optional configuration options** to see them) to free ports (e.g. `11984`/`18554`/`18555`) and point the card's `server:` at the API port
    you set. Both go2rtc instances then coexist.
 
    **Point the card at the add-on's go2rtc (`server: …:1984`), not at HA's built-in go2rtc via a
@@ -182,15 +182,26 @@ How it works: when nobody is watching the camera, the add-on places the same sil
 call the door button uses, sends the station the "open audio" tone (`4`, as the app does before you
 talk; `announce_open_audio`), plays the clip into the call, and then holds the call for
 `door_open_2voice_keepalive` seconds, so a door press right after is instant. While the camera is
-being viewed the clip goes out on the camera call instead. A new announcement replaces one still
-playing, and clips are cut at `announce_max_seconds`.
+being viewed the clip goes out on the camera call instead; if you open the camera while an
+announcement is starting, it is played again from the start on the camera call. A new announcement
+replaces one still playing, and clips are cut at `announce_max_seconds`.
 
-Not yet confirmed on a 2Voice station: whether the station plays audio on this call is exactly what
-needs testing. If you try it, please report back in
-[issue #19](https://github.com/a-blaho/ha-urmet-callme/issues/19) with the add-on log of one
-announcement - every step is logged at the default `info` level (see [Logging](#logging)).
+**While the station is ringing** (someone just pressed the bell), it refuses every new call. An
+announcement - or a door/gate press - sent during the ring then **answers the ring call** and plays on
+it instead, so an automation can reply to a visitor right away ("Please leave the parcel in the
+lockers"). Answering takes the call, so the CallMe app on your phones stops ringing, just as when
+someone answers it. This only happens when the add-on's own call is refused; the camera is not
+available until the ring ends.
+
+Confirmed on a cloud-listed 2Voice station
+([issue #19](https://github.com/a-blaho/ha-urmet-callme/issues/19)); answering a ring is new and not
+yet confirmed. Please report how it behaves on yours there, with the add-on log of one announcement -
+every step is logged at the default `info` level (see [Logging](#logging)).
 
 ## Options
+
+The Configuration page shows the everyday options. The rest are optional, with sensible defaults; turn
+on **Show unused optional configuration options** to set one.
 
 | Option                                         | Notes                                                                                                                                          |
 | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -223,6 +234,8 @@ through the log:
 - `[opendoor] announce: …`: the door helper's side - placing or reusing the call, `audio (media up): PCMU/8000, our direction sendrecv, station offered …`
   (we can only be heard when our direction allows sending), the open-audio tone, and the audio RTP
   packets sent after each clip.
+- `[opendoor] ring: …`: a doorbell ring the door helper holds unanswered, and whether an announcement
+  or door press answered it because the station refused the add-on's own call while ringing.
 - `[opendoor] talk-out: …` / `[atap] talk-out: …` (camera call): when the clip reached the call, a level
   line per second while it plays, and a summary - audio length, peak level, clipping, and dropouts
   (gaps where the source was slower than real time) - with a plain-language warning when the clip is

@@ -212,6 +212,10 @@ static int g_reg_failed = 0; /* registration failed (bad creds / server) */
 static int g_streams = 0;    /* the call reached StreamsRunning (media up) -> safe to send DTMF */
 static int g_ended = 0;      /* the call ended (End/Error/Released) */
 static int g_talk_digit_sent = 0; /* the open-audio digit went out on this call (announcements) */
+/* Doorbell ring held unanswered (OPENDOOR_ANSWER_RING). While a station rings it answers 486 Busy to
+ * every new call, so an announcement or door press during the ring can't place its own call; it
+ * answers this one instead (answer_ring). NULL = no ring, or not holding rings. */
+static LinphoneCall *g_ring = NULL;
 
 static void on_sig(int _s) { (void)_s; g_running = 0; }
 
@@ -271,9 +275,18 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
   switch (state) {
   case LinphoneCallIncomingReceived:
     /* Persistent mode stays registered on the channel account, so a doorbell ring forks here too.
-     * Decline (Busy) so we never answer -- the Node doorbell listener handles rings. (486 is a 4xx,
-     * so Flexisip keeps forking to the listener's binding; it just drops us from this call.) */
-    linphone_call_decline(call, LinphoneReasonBusy);
+     * The Node doorbell listener handles rings. With OPENDOOR_ANSWER_RING we hold one ring unanswered
+     * (ringing, like the listener and the phone app) so answer_ring can pick it up if a call we place
+     * during the ring is refused; otherwise, and for a second ring, decline (Busy). (486 is a 4xx, so
+     * Flexisip keeps forking to the other bindings; it just drops us from this call.) */
+    if (!g_ring && getenv("OPENDOOR_ANSWER_RING")) {
+      g_ring = linphone_call_ref(call);
+      printf("[opendoor] ring: holding the doorbell call unanswered (picked up only if an "
+             "announcement or door press can't get its own call through while it rings)\n");
+      fflush(stdout);
+    } else {
+      linphone_call_decline(call, LinphoneReasonBusy);
+    }
     break;
   case LinphoneCallStreamsRunning: {
     /* Report the NEGOTIATED media, not what we asked for -- a station can still answer with video. */
@@ -291,6 +304,13 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     log_audio_media(call, linphone_call_state_to_string(state));
     break;
   case LinphoneCallError: {
+    if (call == g_ring) { /* the ring ended before anyone needed it (answered elsewhere / gave up) */
+      printf("[opendoor] ring: ended (%s)\n", message ? message : "");
+      fflush(stdout);
+      linphone_call_unref(g_ring);
+      g_ring = NULL;
+      break;
+    }
     /* DIAGNOSTIC (58A support): print the SIP status the station returned. A `486 Busy Here` here
      * means the station rejected our header (the 58A rejects `auto_insertion`; a cloud-listed
      * station rejects `mac`) -- this is how we tell "wrong header" apart from "no media / timeout". */
@@ -299,14 +319,22 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
            ei ? linphone_error_info_get_protocol_code(ei) : 0,
            (ei && linphone_error_info_get_phrase(ei)) ? linphone_error_info_get_phrase(ei) : "",
            message ? message : "");
+    if (g_call == call && g_ring)
+      printf("[opendoor] (a doorbell ring is in progress: the station refuses new calls while it rings)\n");
     fflush(stdout);
     if (g_call == call) g_ended = 1;
     break;
   }
   case LinphoneCallEnd:
-    log_audio_rtp(call, "call ended");
-    /* fall through */
   case LinphoneCallReleased:
+    if (call == g_ring) {
+      printf("[opendoor] ring: ended (%s)\n", message ? message : "");
+      fflush(stdout);
+      linphone_call_unref(g_ring);
+      g_ring = NULL;
+      break;
+    }
+    if (state == LinphoneCallEnd) log_audio_rtp(call, "call ended");
     printf("[opendoor] call finished: %s\n", message ? message : "");
     fflush(stdout);
     if (g_call == call) g_ended = 1;
@@ -395,6 +423,45 @@ static void bye_call(LinphoneCore *lc) {
   g_ended = 0; /* consume: place_call sets it fresh for the next call */
 }
 
+/* The call we placed was refused before media (a ringing station answers 486 Busy) and a ring is
+ * held: drop the refused call and answer the ring instead, so it carries the announcement / tone.
+ * Answering takes the call for us, so the phone app stops ringing -- only done when nothing else can
+ * get through. No open-audio digit on it: a ring answered like the app answers it has the audio
+ * open already. Returns 1 when the ring is now g_call. */
+static int answer_ring(LinphoneCore *lc, const char *what) {
+  if (!g_ring || g_streams) return 0;
+  bye_call(lc); /* the refused call */
+  LinphoneCall *c = g_ring;
+  g_ring = NULL;
+  LinphoneCallState st = linphone_call_get_state(c);
+  if (st != LinphoneCallIncomingReceived && st != LinphoneCallIncomingEarlyMedia) {
+    linphone_call_unref(c);
+    return 0;
+  }
+  LinphoneCallParams *p = linphone_core_create_call_params(lc, c);
+  linphone_call_params_enable_audio(p, TRUE);
+  if (phase_b()) {
+    linphone_call_params_enable_video(p, FALSE);
+  } else {
+    linphone_call_params_enable_video(p, TRUE); /* as on our own calls: receive only, discarded */
+    linphone_call_params_set_video_direction(p, LinphoneMediaDirectionRecvOnly);
+  }
+  LinphoneStatus rc = linphone_call_accept_with_params(c, p);
+  linphone_call_params_unref(p);
+  printf("[opendoor] ring: the station is busy ringing -> answering the ring call for the %s (%s)\n",
+         what, rc == 0 ? "ok; the phone app stops ringing" : "FAILED");
+  fflush(stdout);
+  if (rc != 0) {
+    linphone_call_unref(c);
+    return 0;
+  }
+  g_call = c; /* keeps the ref taken when the ring arrived */
+  g_streams = 0;
+  g_ended = 0;
+  g_talk_digit_sent = 1;
+  return 1;
+}
+
 /* SINGLE-SHOT open: place a call, send DTMF on StreamsRunning, brief hold, BYE. Returns 0 if the tone
  * was delivered. (Persistent keep-alive mode calls place_call/bye_call directly -- see keepalive_loop.) */
 static int run_open(LinphoneCore *lc, LinphoneFactory *factory, const char *out_uri, char digit,
@@ -429,6 +496,7 @@ static int run_open(LinphoneCore *lc, LinphoneFactory *factory, const char *out_
     }
     if (dtmf_sent && now - dtmf_at > HOLD_AFTER_DTMF_MS) { printf("[opendoor] done -> hanging up\n"); fflush(stdout); break; }
     if (g_ended && dtmf_sent) break;
+    if (g_ended && !dtmf_sent && answer_ring(lc, digit == '1' ? "door" : "gate")) continue;
     if (g_ended && !dtmf_sent) { fprintf(stderr, "[opendoor] call ended before media\n"); break; }
     if (now - start > OVERALL_MS) { fprintf(stderr, "[opendoor] overall timeout\n"); break; }
   }
@@ -508,6 +576,7 @@ static void run_talk(LinphoneCore *lc, LinphoneFactory *factory, const char *out
     }
     talk_send_digit();
     if (g_talk_active) started = 1;
+    if (g_ended && !media_at && answer_ring(lc, "announcement")) continue;
     if (g_ended) { printf("[opendoor] announce: the station ended the call\n"); fflush(stdout); break; }
     if (!g_streams && now - start > OPENDOOR_STREAMS_TIMEOUT_MS) {
       printf("[opendoor] announce: FAILED -- no media within %ds (station busy / rejected?)\n",
@@ -673,6 +742,13 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
       talk_deadline = 0;
       bye_call(lc);
     }
+    /* Refused before media while the station rings -> carry the tones / clip on the ring instead. */
+    if (g_ended && !g_streams && (qn > 0 || talk_waiting) &&
+        answer_ring(lc, talk_waiting ? "announcement" : "door press")) {
+      call_placed_at = now;
+      if (talk_waiting) talk_deadline = now + OPENDOOR_STREAMS_TIMEOUT_MS + talk_start;
+      continue;
+    }
     /* Station ended the call on its own. */
     if (g_ended) {
       for (int i = 0; i < qn; i++) printf("[opendoor] RESULT %c fail\n", queue[i]);
@@ -712,6 +788,8 @@ int main(int argc, char **argv) {
             "  Announcements: OPENDOOR_AUDIO_IN=<fifo> sends s16le 8 kHz mono PCM from it instead of\n"
             "    silence; 'T' holds a call for a clip (OPENDOOR_TALK_DTMF = open-audio digit to send,\n"
             "    empty = none; OPENDOOR_TALK_START_MS = how long the clip may take to start).\n"
+            "  OPENDOOR_ANSWER_RING=1: hold a doorbell ring unanswered and answer it when a call we\n"
+            "    place during the ring is refused (the station is busy ringing).\n"
             "  env: OPENDOOR_DATA_DIR=<dir> (unique per place), OPENDOOR_DEBUG=1 (SIP trace)\n",
             argv[0]);
     return 2;
@@ -807,6 +885,9 @@ int main(int argc, char **argv) {
     linphone_config_set_string(linphone_core_get_config(lc), "misc", "uuid", uuid);
 
   linphone_core_start(lc);
+  /* A held ring must outlast the station's own ring (~60 s); liblinphone's default would give up on
+   * it after 30 s. */
+  linphone_core_set_inc_timeout(lc, 120);
 
   /* Point playback + capture at our null card. */
   {
