@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.17
 
 - **2Voice: "next camera" button for stations with more than one entrance panel
   ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).** Only the first panel's camera
