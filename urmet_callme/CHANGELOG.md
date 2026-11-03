@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.19
+
+- **2Voice: "next camera" waits before re-dialling
+  ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).** In 1.0.18 the new call went out
+  about 100 ms after the old one ended, and the station declined it because it hadn't released the
+  line yet. The switch now waits 2.5 s before calling again. If the station still declines, it
+  retries twice, waiting longer each time. The picture pauses longer during a switch as a result.
+  Not yet confirmed on a station.
+
 ## 1.0.18
 
 - **2Voice: "next camera" re-dials to switch, the way the station allows it

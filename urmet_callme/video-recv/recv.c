@@ -687,12 +687,23 @@ static long long g_switch_next_ms = 0; /* when the next '3' (or the closing '4')
 static int g_n_waiting = 0;        /* 'N' commands awaiting their RESULT line */
 static time_t g_switch_vfu_until = 0; /* keyframe nudges for the new panel's picture until then */
 static int g_hold_fd[2] = {-1, -1};   /* our own writer on the FIFOs across a re-dial */
+static long long g_redial_at_ms = 0;  /* don't place the re-dial before this */
+static int g_redial_tries = 0;        /* re-dial attempts left for this switch */
 /* Gap between the '3's and before the closing '4'. The app's '3' is a button press, so a person's
  * pace; the station needs a moment to swap the picture before the next one. */
 static long long switch_gap_ms(void) {
   const char *e = getenv("RECV_SWITCH_GAP_MS");
   return (e && *e) ? atoll(e) : 1500;
 }
+
+/* Pause between the BYE's answer and the re-dial. The station declines a call placed ~100 ms
+ * after the previous one ended (it hasn't released the line yet; issue #20, 1.0.18), and declines
+ * again if we retry too soon, so each retry waits one more pause. */
+static long long redial_delay_ms(void) {
+  const char *e = getenv("RECV_REDIAL_DELAY_MS");
+  return (e && *e) ? atoll(e) : 2500;
+}
+#define REDIAL_TRIES 3
 
 /* Keep the camera's FIFOs open across a re-dial. The per-call taps close theirs when the call ends,
  * and with no writer left the reader (stream.sh's ffmpeg) would see EOF and end the go2rtc stream,
@@ -914,11 +925,24 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
        * exiting. Queued door/gate tones and the FIFO hold carry over to the new call. */
       g_redial_req = 0;
       g_redialing = 1;
+      g_redial_tries = REDIAL_TRIES;
+      g_redial_at_ms = now_ms() + redial_delay_ms();
       g_placed = 0;
       g_last_drain = 0;
       g_stop_at = 0;
       g_video_deadline = 0;
-      rlog("[recv] camera switch: call ended -> placing it again\n");
+      rlog("[recv] camera switch: call ended -> placing it again in %lld ms\n", redial_delay_ms());
+      fflush(stdout);
+      break;
+    }
+    if (g_redialing && g_redial_tries > 1 && g_call_uri[0]) {
+      /* The re-placed call was declined (station still busy with the last one): wait longer, retry. */
+      g_redial_tries--;
+      long long wait = redial_delay_ms() * (REDIAL_TRIES - g_redial_tries + 1);
+      g_redial_at_ms = now_ms() + wait;
+      g_placed = 0;
+      rlog("[recv] camera switch: re-placed call ended before media -> retrying in %lld ms (%d left)\n",
+           wait, g_redial_tries);
       fflush(stdout);
       break;
     }
@@ -1156,7 +1180,7 @@ int main(int argc, char **argv) {
     /* 2Voice OUTGOING mode: once registered, place the auto_insertion audio+video call (recvonly)
      * to the OUT account and tap it like an answered call. Placed once (again after a camera switch's
      * BYE, see g_cam_steps); the process exits when the call ends (see on_call_state End). Uses the same auto_insertion offer as opendoor. */
-    if (g_call_uri[0] && g_reg_ok && !g_placed && !g_call) {
+    if (g_call_uri[0] && g_reg_ok && !g_placed && !g_call && now_ms() >= g_redial_at_ms) {
       g_placed = 1;
       LinphoneFactory *f2 = linphone_factory_get();
       LinphoneAddress *to = linphone_factory_create_address(f2, g_call_uri);
