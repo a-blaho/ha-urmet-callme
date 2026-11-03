@@ -721,6 +721,36 @@ static void hold_fifos(int on) {
   }
 }
 
+/* Feed the held FIFOs while a switch has no call carrying media: black frames at ~25 fps and
+ * silence at 8 kHz s16le. With nothing on its inputs ffmpeg stops sending to go2rtc, which drops
+ * the idle publisher after a few seconds, and the viewer's card freezes until a reload (issue #20,
+ * 1.0.19's longer re-dial). Only while no call is past ringing, so this never writes into a FIFO
+ * the new call's taps already write to. */
+static long long g_fill_ms = 0;
+static void feed_switch_gap(void) {
+  int media = g_call && linphone_call_get_state(g_call) != LinphoneCallOutgoingInit &&
+              linphone_call_get_state(g_call) != LinphoneCallOutgoingProgress &&
+              linphone_call_get_state(g_call) != LinphoneCallOutgoingRinging;
+  if (!g_redialing || media || g_hold_fd[0] < 0) { g_fill_ms = 0; return; }
+  long long now = now_ms();
+  if (g_fill_ms == 0) {
+    g_fill_ms = now;
+    rlog("[recv] camera switch: feeding black + silence until the new call's media\n");
+    if (g_black) (void)!write(g_hold_fd[0], g_black, g_black_len);
+    return;
+  }
+  long long ms = now - g_fill_ms;
+  if (ms < 40) return;
+  g_fill_ms = now;
+  if (g_black) (void)!write(g_hold_fd[0], g_black, g_black_len); /* drop on EAGAIN, like the tap */
+  if (g_hold_fd[1] >= 0) {
+    static const unsigned char zero[4096];
+    size_t n = (size_t)(ms * 16); /* 8000 samples/s * 2 bytes */
+    if (n > sizeof zero) n = sizeof zero;
+    (void)!write(g_hold_fd[1], zero, n);
+  }
+}
+
 static void answer_switches(const char *result, const char *why) {
   for (; g_n_waiting > 0; g_n_waiting--)
     rlog("[recv] RESULT N %s%s%s%s\n", result, why ? " (" : "", why ? why : "", why ? ")" : "");
@@ -1252,6 +1282,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
       }
     }
+    feed_switch_gap();
     /* Camera switch on the re-placed call: the '3's one gap apart, then (one gap after the last)
      * the audio, the queued door/gate tones, and the switch's RESULT. */
     if (g_call && g_switching && now_ms() >= g_switch_next_ms) {

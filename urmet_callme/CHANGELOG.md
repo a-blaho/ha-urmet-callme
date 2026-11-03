@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.21
+
+- **2Voice: the picture no longer freezes after "next camera"
+  ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).** While the add-on calls the station
+  again, nothing reached the stream for several seconds, so the stream stopped and the dashboard card
+  froze until the page was reloaded. The add-on now sends a black picture and silence until the new
+  call's video arrives, so the stream keeps running and the card switches to the new camera on its
+  own. The picture goes black for a few seconds during a switch. Not yet confirmed on a station.
+
 ## 1.0.20
 
 - **2Voice: an announcement during a ring now answers the ring
