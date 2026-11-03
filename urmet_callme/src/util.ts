@@ -23,12 +23,12 @@ export function sipUri(address: string): string {
   return /^sips?:/i.test(a) ? a : `sip:${a}`;
 }
 
-/** The `RESULT <digit> ok|fail` line the liblinphone helpers print per tone: door/gate (opendoor
- *  always; recv when it takes tones on the live camera call) and next-camera '3' (recv only). Every
- *  tone recv answers must match, or its pending queue shifts onto the wrong press. Matched anywhere in
- *  the line: recv's lines carry a timestamp prefix, opendoor's a `[opendoor]` tag, and a fail may
- *  carry a reason. */
-export function parseResult(line: string): { digit: "1" | "2" | "3"; ok: boolean } | null {
-  const m = /RESULT ([123]) (ok|fail)/.exec(line);
-  return m ? { digit: m[1] as "1" | "2" | "3", ok: m[2] === "ok" } : null;
+/** The `RESULT <cmd> ok|fail` line the liblinphone helpers print per command: door/gate tones '1'/'2'
+ *  (opendoor always; recv when it takes tones on the live camera call) and camera switches 'N' (recv
+ *  only). Every command recv answers must match, or its pending queue shifts onto the wrong press.
+ *  Matched anywhere in the line: recv's lines carry a timestamp prefix, opendoor's a `[opendoor]`
+ *  tag, and a fail may carry a reason. */
+export function parseResult(line: string): { digit: "1" | "2" | "N"; ok: boolean } | null {
+  const m = /RESULT ([12N]) (ok|fail)/.exec(line);
+  return m ? { digit: m[1] as "1" | "2" | "N", ok: m[2] === "ok" } : null;
 }

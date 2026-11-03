@@ -660,7 +660,7 @@ static int g_reg_ok = 0; /* our registration reached Ok (gate for placing the ou
 static int g_placed = 0; /* placed the outgoing call already (place it exactly once) */
 
 /* Door/gate tones over the LIVE camera call (RECV_COMMANDS=1: the control plane pipes our stdin and
- * writes '1' door / '2' gate, one per line). On 2Voice the camera and the door are the SAME call --
+ * writes '1' door / '2' gate, one per line; 'N' = next camera, see g_cam_steps). On 2Voice the camera and the door are the SAME call --
  * the app unlocks by sending the digit on the call it is viewing (UCFCallManager DOOR_DTMF /
  * GATE_DTMF), and a second call from opendoor while ours is up would collide with it at the station.
  * A tone that arrives before the streams run is queued and sent at StreamsRunning, like opendoor
@@ -670,18 +670,78 @@ static int g_cmds = 0;    /* reading tone commands from stdin */
 static int g_streams = 0; /* the current call reached StreamsRunning (tones can go out) */
 static char g_tone_q[8];  /* tones waiting for StreamsRunning */
 static int g_tone_qn = 0;
-/* '3' (UCFCallManager's next-camera digit, issue #20) is taken on stdin like the door/gate tones: the
- * station swaps the picture to its next camera on the SAME call. Its first frames after the swap may
- * be P-frames of a stream we hold no keyframe for, so nudge for one (~1/s) until this time. Unlike the
- * start-of-call window this never hangs up: the call is fine either way. */
-static time_t g_switch_vfu_until = 0;
+
+/* Next camera (2Voice, issue #20; stdin command 'N'). The station cycles its entrance panels on the
+ * in-call DTMF '3' (UCFCallManager NEXT_CAM_DTMF), but the app only offers that while the audio is
+ * still closed: opening it ('4') hides the next-camera button for the rest of the call, and the
+ * station ignores a '3' after it. We open the audio at the start of every call, so a switch RE-DIALS:
+ * BYE the call, place it again, send '3' once per switch made so far on this view (a new call
+ * always starts on the first panel) while the audio is still closed, and only then send '4'. The
+ * whole view is one recv process, so the count lives here and resets when the view ends. */
+static int g_cam_steps = 0;        /* '3's to send on each new call (= switches requested so far) */
+static int g_redial_req = 0;       /* a switch asked for the current call to end and be re-placed */
+static int g_redialing = 0;        /* the re-placed call is on its way (not yet StreamsRunning) */
+static int g_switching = 0;        /* on the re-placed call: sending the '3's, audio still closed */
+static int g_switch_left = 0;      /* '3's still to send on this call */
+static long long g_switch_next_ms = 0; /* when the next '3' (or the closing '4') may go out */
+static int g_n_waiting = 0;        /* 'N' commands awaiting their RESULT line */
+static time_t g_switch_vfu_until = 0; /* keyframe nudges for the new panel's picture until then */
+static int g_hold_fd[2] = {-1, -1};   /* our own writer on the FIFOs across a re-dial */
+/* Gap between the '3's and before the closing '4'. The app's '3' is a button press, so a person's
+ * pace; the station needs a moment to swap the picture before the next one. */
+static long long switch_gap_ms(void) {
+  const char *e = getenv("RECV_SWITCH_GAP_MS");
+  return (e && *e) ? atoll(e) : 1500;
+}
+
+/* Keep the camera's FIFOs open across a re-dial. The per-call taps close theirs when the call ends,
+ * and with no writer left the reader (stream.sh's ffmpeg) would see EOF and end the go2rtc stream,
+ * making every viewer reconnect. O_RDWR|O_NONBLOCK like the taps: never blocks, never EPIPEs. */
+static void hold_fifos(int on) {
+  for (int k = 0; k < 2; k++) {
+    if (on && g_hold_fd[k] < 0) {
+      char path[256];
+      read_target_line(path, sizeof path, k, NULL);
+      if (path[0]) g_hold_fd[k] = open(path, O_RDWR | O_NONBLOCK);
+    } else if (!on && g_hold_fd[k] >= 0) {
+      close(g_hold_fd[k]);
+      g_hold_fd[k] = -1;
+    }
+  }
+}
+
+static void answer_switches(const char *result, const char *why) {
+  for (; g_n_waiting > 0; g_n_waiting--)
+    rlog("[recv] RESULT N %s%s%s%s\n", result, why ? " (" : "", why ? why : "", why ? ")" : "");
+}
 
 static void send_tone(LinphoneCall *call, char digit) {
   LinphoneStatus st = linphone_call_send_dtmf(call, digit);
   rlog("[recv] DTMF '%c' sent on the camera call (SIP INFO) -> %s\n", digit,
        st == 0 ? "ok" : "FAILED");
   rlog("[recv] RESULT %c %s\n", digit, st == 0 ? "ok" : "fail");
-  if (digit == '3' && st == 0) g_switch_vfu_until = time(NULL) + 5;
+}
+
+/* 2Voice (outgoing) camera call: the station keeps the audio closed until the viewer "opens" it.
+ * The app does that with an in-call DTMF '4' (UCFCallManager.OPEN_AUDIO_DTMF, sent from
+ * executeOpenAutoinsertionAudio once StreamsRunning) -- '1'/'2' being door/gate and '3' the next
+ * camera. Sent once per call at StreamsRunning (after the '3's on a camera switch's call), like
+ * opendoor sends the door digit. RECV_OPEN_AUDIO_DTMF overrides the digit; empty disables. Door/gate
+ * tones that arrived while the call was being set up go out right after. */
+static void open_audio_and_tones(LinphoneCall *call) {
+  if (g_call_uri[0] && !g_audio_opened) {
+    const char *d = getenv("RECV_OPEN_AUDIO_DTMF");
+    char digit = d ? d[0] : '4';
+    g_audio_opened = 1;
+    if (digit) {
+      LinphoneStatus st = linphone_call_send_dtmf(call, digit);
+      rlog("[recv] open-audio DTMF '%c' sent (SIP INFO) -> %s\n", digit,
+             st == 0 ? "ok" : "FAILED");
+    }
+  }
+  g_streams = 1;
+  for (int i = 0; i < g_tone_qn; i++) send_tone(call, g_tone_q[i]);
+  g_tone_qn = 0;
 }
 
 static void fail_queued_tones(const char *why) {
@@ -697,9 +757,29 @@ static void read_tone_commands(void) {
     ssize_t n = read(STDIN_FILENO, &c, 1);
     if (n == 0) { g_cmds = 0; break; } /* the control plane closed our stdin: stop polling */
     if (n < 0) break;                  /* EAGAIN: nothing more right now */
-    if (c != '1' && c != '2' && c != '3') continue; /* newlines, anything else */
+    if (c == 'N') { /* next camera: re-dial (see g_cam_steps) */
+      if (!g_call_uri[0] || (!g_call && !g_redial_req && !g_redialing)) {
+        rlog("[recv] RESULT N fail (no call up)\n");
+        continue;
+      }
+      g_cam_steps++;
+      g_n_waiting++;
+      rlog("[recv] next camera requested -> re-dialing to send '3' x%d before opening the audio\n",
+           g_cam_steps);
+      if (!g_redial_req && !g_redialing) {
+        g_redial_req = 1;
+        g_switching = 0;
+        hold_fifos(1);
+        if (g_call) linphone_call_terminate(g_call);
+      }
+      continue;
+    }
+    if (c != '1' && c != '2') continue; /* newlines, anything else */
+    /* A re-dial in flight counts as a call coming: queue, so the press is not sent by the door
+     * helper on a second call that would collide with ours. */
+    int coming = g_call || g_redial_req || g_redialing;
     if (g_call && g_streams) send_tone(g_call, c);
-    else if (g_call && g_tone_qn < (int)sizeof g_tone_q) g_tone_q[g_tone_qn++] = c;
+    else if (coming && g_tone_qn < (int)sizeof g_tone_q) g_tone_q[g_tone_qn++] = c;
     else rlog("[recv] RESULT %c fail (no call up)\n", c);
   }
 }
@@ -785,25 +865,16 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
              rp ? dir_name(linphone_call_params_get_audio_direction(rp)) : "?",
              cp ? dir_name(linphone_call_params_get_video_direction(cp)) : "?");
     }
-    /* 2Voice (outgoing) camera call: the station keeps the audio closed until the viewer "opens"
-     * it. The app does that with an in-call DTMF '4' (UCFCallManager.OPEN_AUDIO_DTMF, sent from
-     * executeOpenAutoinsertionAudio once StreamsRunning) -- '1'/'2' being door/gate and '3' the
-     * next camera. Send it once per call, right here, like opendoor sends the door digit.
-     * RECV_OPEN_AUDIO_DTMF overrides the digit; empty disables. */
-    if (g_call_uri[0] && !g_audio_opened) {
-      const char *d = getenv("RECV_OPEN_AUDIO_DTMF");
-      char digit = d ? d[0] : '4';
-      g_audio_opened = 1;
-      if (digit) {
-        LinphoneStatus st = linphone_call_send_dtmf(call, digit);
-        rlog("[recv] open-audio DTMF '%c' sent (SIP INFO) -> %s\n", digit,
-               st == 0 ? "ok" : "FAILED");
-      }
+    if (g_redialing) {
+      /* The re-placed call of a camera switch: the '3's go out first, from the main loop, with
+       * the audio still closed; open_audio_and_tones() follows the last one. */
+      g_redialing = 0;
+      g_switching = 1;
+      g_switch_left = g_cam_steps;
+      g_switch_next_ms = now_ms() + switch_gap_ms();
+    } else {
+      open_audio_and_tones(call);
     }
-    /* Door/gate tones that arrived while the call was being set up go out now. */
-    g_streams = 1;
-    for (int i = 0; i < g_tone_qn; i++) send_tone(call, g_tone_q[i]);
-    g_tone_qn = 0;
     fflush(stdout);
     /* Do NOT start the reader-idle clock yet. With tap-gating we write NOTHING until the first
      * keyframe, so counting this pre-keyframe wait as "no reader" would tear the call down before
@@ -838,6 +909,24 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     fflush(stdout);
     if (g_call == call) g_call = NULL;
     g_streams = 0;
+    if (g_redial_req && g_call_uri[0]) {
+      /* Our BYE for a camera switch was answered: place the call again (main loop) instead of
+       * exiting. Queued door/gate tones and the FIFO hold carry over to the new call. */
+      g_redial_req = 0;
+      g_redialing = 1;
+      g_placed = 0;
+      g_last_drain = 0;
+      g_stop_at = 0;
+      g_video_deadline = 0;
+      rlog("[recv] camera switch: call ended -> placing it again\n");
+      fflush(stdout);
+      break;
+    }
+    if (g_redialing || g_switching) {
+      g_redialing = g_switching = 0;
+      answer_switches("fail", "the re-placed call ended before the switch");
+    }
+    hold_fifos(0);
     fail_queued_tones("call ended before media"); /* the control plane falls back to opendoor */
     g_last_drain = 0;
     g_stop_at = 0;
@@ -1065,8 +1154,8 @@ int main(int argc, char **argv) {
     usleep(50 * 1000);
     if (g_cmds) read_tone_commands(); /* door/gate tones for the live call (see g_cmds) */
     /* 2Voice OUTGOING mode: once registered, place the auto_insertion audio+video call (recvonly)
-     * to the OUT account and tap it like an answered call. Placed exactly once; the process exits
-     * when the call ends (see on_call_state End). Uses the same auto_insertion offer as opendoor. */
+     * to the OUT account and tap it like an answered call. Placed once (again after a camera switch's
+     * BYE, see g_cam_steps); the process exits when the call ends (see on_call_state End). Uses the same auto_insertion offer as opendoor. */
     if (g_call_uri[0] && g_reg_ok && !g_placed && !g_call) {
       g_placed = 1;
       LinphoneFactory *f2 = linphone_factory_get();
@@ -1104,6 +1193,20 @@ int main(int argc, char **argv) {
      * loop. The natural reader-idle timeout still covers the case where the viewer just vanishes. */
     if (g_hangup_req) {
       g_hangup_req = 0;
+      /* Hanging up wins over a camera switch in flight: without this the BYE would only re-dial. */
+      if (g_redial_req || g_redialing || g_switching) {
+        g_redial_req = g_switching = 0;
+        answer_switches("fail", "hung up");
+        if (g_redialing && !g_call) { /* between the two calls: nothing to BYE, just stop */
+          g_redialing = 0;
+          hold_fifos(0);
+          fail_queued_tones("hung up");
+          rlog("[recv] SIGUSR1 during a camera switch -> exiting\n");
+          fflush(stdout);
+          g_running = 0;
+        }
+        g_redialing = 0;
+      }
       if (g_call) {
         rlog("[recv] SIGUSR1 -> terminating current call (in-dialog BYE)\n");
         fflush(stdout);
@@ -1125,7 +1228,27 @@ int main(int argc, char **argv) {
         fflush(stdout);
       }
     }
-    /* After a next-camera tone: keyframe nudges for the new camera's picture (see send_tone). */
+    /* Camera switch on the re-placed call: the '3's one gap apart, then (one gap after the last)
+     * the audio, the queued door/gate tones, and the switch's RESULT. */
+    if (g_call && g_switching && now_ms() >= g_switch_next_ms) {
+      if (g_switch_left > 0) {
+        LinphoneStatus st = linphone_call_send_dtmf(g_call, '3');
+        rlog("[recv] next-camera DTMF '3' sent (SIP INFO) -> %s (%d left)\n",
+             st == 0 ? "ok" : "FAILED", g_switch_left - 1);
+        g_switch_left--;
+        g_switch_next_ms = now_ms() + switch_gap_ms();
+      } else {
+        g_switching = 0;
+        open_audio_and_tones(g_call);
+        answer_switches("ok", NULL);
+        hold_fifos(0); /* the new call's taps have long had their own writers */
+        g_switch_vfu_until = time(NULL) + 5;
+      }
+      fflush(stdout);
+    }
+    /* After a camera switch: keyframe nudges for the new panel's picture. Its first frames may be
+     * P-frames of a stream we hold no keyframe for. Unlike the start-of-call window this never
+     * hangs up: the call is fine either way. */
     if (g_call && g_switch_vfu_until) {
       time_t now = time(NULL);
       if (now >= g_switch_vfu_until) g_switch_vfu_until = 0;

@@ -111,13 +111,16 @@ places a new call a few seconds later, so pressing hang up while keeping the car
 
 **"… next camera" button (2Voice).** A 2Voice station with more than one entrance panel shows them
 one at a time on the same camera call, and the official app switches between them with an in-call
-tone. With video on, each 2Voice place gets a **"… next camera"** `button` that does the same: open the
-camera first, then press it to move to the next panel. While a panel is shown, the door/gate buttons
-open *that* panel's door and gate (the tone goes on the camera call). A door/gate press with the camera
-closed always reaches the first panel, and a new camera call always starts on it. The button does
-nothing when no camera call is up (the log says so). Not yet confirmed on a station
-([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)): please report whether it cycles back to
-the first panel after the last one.
+tone. With video on, each 2Voice place gets a **"… next camera"** `button`: open the camera first, then
+press it to move to the next panel. The station only switches while the call's sound is still off, and
+the add-on turns the sound on at the start of every call, so a press **calls the station again**,
+switches to the right panel before turning the sound on, and continues there. The picture pauses for a
+few seconds (more for each further panel), the stream itself stays up. While a panel is shown, the
+door/gate buttons open *that* panel's door and gate (the tone goes on the camera call). A door/gate
+press with the camera closed always reaches the first panel, and a new camera call always starts on
+it. The button does nothing when no camera call is up (the log says so). Not yet confirmed on a
+station ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)): please report whether it cycles
+back to the first panel after the last one.
 
 **Door / gate while watching.** On Ipercom the door command is a cloud message, independent of the
 camera call, so unlocking never disturbs the picture. On 2Voice the camera and the door are the *same*

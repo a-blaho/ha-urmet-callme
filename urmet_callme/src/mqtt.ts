@@ -279,9 +279,9 @@ export class MqttBridge {
   }
 
   /** One "next camera" `button` per 2Voice place with video (issue #20). A station with several
-   *  entrance panels shows one at a time on the camera call; a press sends the app's next-camera
-   *  digit on that call, and the door/gate buttons then open the panel being shown. `handler`
-   *  resolves whether a camera call was up to switch. */
+   *  entrance panels shows one at a time on the camera call; a press moves that call to the next
+   *  panel (TwoVoiceVideoService.nextCamera), and the door/gate buttons then open the panel being
+   *  shown. `handler` resolves whether the switch went through. */
   publishNextCamera(places: HangupPlace[], handler: (placeId: string) => Promise<boolean>) {
     this.onNextCamera = handler;
     for (const p of places) {
@@ -488,7 +488,7 @@ export class MqttBridge {
       try {
         const switched = await this.onNextCamera(next.placeId);
         log.info(
-          `next camera ${next.name}: ${switched ? "switch sent on the camera call" : "no camera call was up (open the camera first)"}`,
+          `next camera ${next.name}: ${switched ? "switched (the call was placed again)" : "not switched (no camera call up, or the new call did not come up)"}`,
         );
       } catch (e) {
         log.error(`next camera ${next.name} FAILED:`, (e as Error).message);

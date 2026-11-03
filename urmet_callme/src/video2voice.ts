@@ -9,7 +9,7 @@
 // sent as a DTMF tone on recv's live call (sendTone; recv reads '1'/'2' on its stdin and answers
 // `RESULT <d> ok|fail`), exactly as the app unlocks while viewing. A second call from opendoor would
 // collide with ours at the station. TwoVoiceService routes presses here via its videoOpener hook.
-// The same channel carries '3', the app's next-camera digit (nextCamera; issue #20).
+// The same channel carries 'N', a camera switch that recv performs by re-dialing (nextCamera).
 //
 // This is a slimmed video.ts: no shared account B (2Voice uses the channel account it already has), no
 // call_device_req/gateway, no slot-switching (each place is independent, one recv per place, spawned
@@ -31,8 +31,9 @@ const RECV_IDLE_SECONDS = 10; // recv hangs up (and exits) after no FIFO reader 
 // How long a tone sent on the camera call may take to be confirmed. A tone on a running call is
 // answered at once; one queued during call setup waits for the station's media (a few seconds).
 const TONE_TIMEOUT_MS = 20000;
-// The app's in-call "next camera" digit (UCFCallManager; '1'/'2' door/gate, '4' open audio).
-const NEXT_CAMERA_DTMF = "3";
+// A camera switch is a BYE, a new call, then one '3' per switch ~1.5 s apart before the audio
+// opens, so its confirmation can take well past a door tone's.
+const SWITCH_TIMEOUT_MS = 45000;
 
 interface Cam {
   place: Place;
@@ -119,7 +120,11 @@ export class TwoVoiceVideoService {
    *  is up (the caller then uses the door helper). Resolves once recv confirms the tone went out;
    *  rejects with NoLiveCallError if the call turned out to be gone (ended before its media, or recv
    *  exited meanwhile) so the caller can fall back, with a plain Error on timeout. */
-  sendTone(placeId: string, digit: string): Promise<void> | undefined {
+  sendTone(
+    placeId: string,
+    digit: string,
+    timeoutMs = TONE_TIMEOUT_MS,
+  ): Promise<void> | undefined {
     const i = this.camIndex(placeId);
     const recv = this.recvs.get(i);
     if (!recv || !recv.stdin?.writable) return undefined;
@@ -135,20 +140,23 @@ export class TwoVoiceVideoService {
             q.splice(k, 1);
             reject(new Error("tone not confirmed by the camera call"));
           }
-        }, TONE_TIMEOUT_MS),
+        }, timeoutMs),
       };
       q.push(entry);
       recv.stdin!.write(digit + "\n");
     });
   }
 
-  /** Switch the place's live camera call to the station's next camera (in-call DTMF '3', the app's
-   *  next-camera digit; issue #20). A 2Voice station with several entrance panels shows them one at a
-   *  time on the same call, and door/gate tones on that call then open the panel being shown. False
-   *  when no camera call is up: there is no picture to switch, and a new call starts on the first
-   *  camera anyway. Rejects like sendTone if recv could not send the tone. */
+  /** Switch the place's live camera call to the station's next entrance panel (issue #20). The
+   *  station cycles panels on the in-call DTMF '3', but only while the call's audio is still closed
+   *  (the app hides its next-camera button once the audio is opened), and recv opens it at the start
+   *  of every call. So recv re-dials ('N' on its stdin): BYE, the same call again, '3' once per
+   *  switch made on this view, then the audio. The stream stays up meanwhile (recv holds the FIFOs);
+   *  the picture pauses for a few seconds. Door/gate presses on that call then open the panel being
+   *  shown. False when no camera call is up (a new call starts on the first panel anyway), or when
+   *  the re-placed call did not come up. */
   async nextCamera(placeId: string): Promise<boolean> {
-    const sent = this.sendTone(placeId, NEXT_CAMERA_DTMF);
+    const sent = this.sendTone(placeId, "N", SWITCH_TIMEOUT_MS);
     if (!sent) return false;
     try {
       await sent;
@@ -230,7 +238,7 @@ export class TwoVoiceVideoService {
         RECV_DATA_DIR: dataDir,
         RECV_IDLE_SECONDS: String(RECV_IDLE_SECONDS),
         RECV_CONNECTED_URL: `http://127.0.0.1:${this.callPort}/connected?cam=${i}`,
-        RECV_COMMANDS: "1", // take door/gate/next-camera tones on stdin (see sendTone)
+        RECV_COMMANDS: "1", // take door/gate tones and camera switches on stdin (see sendTone)
         RECV_AUDIO_IN: talkFifoOf(cam.place.id), // announcements ride the camera call (announce.ts)
         // No RECV_HANGUP_URL: there's no gateway cancel for 2Voice; recv just BYEs and exits.
         // log_level debug -> recv's own trace (SIP trace + per-5s audio RTP counters).

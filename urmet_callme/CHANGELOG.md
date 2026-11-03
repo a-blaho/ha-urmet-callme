@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.18
+
+- **2Voice: "next camera" re-dials to switch, the way the station allows it
+  ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).** 1.0.17 sent the station's
+  next-camera tone `3` on the live call, and the station ignored it: the official app only allows a
+  switch while the call's sound is still closed, and the add-on opens it (tone `4`) at the start of
+  every call. A press now places the camera call again and sends `3` once per switch before opening
+  the sound, then carries on as before. The picture pauses for a few seconds while this happens; the
+  stream stays up, and door/gate presses made meanwhile wait for the new call. Not yet confirmed on
+  a station.
+
 ## 1.0.17
 
 - **2Voice: "next camera" button for stations with more than one entrance panel
