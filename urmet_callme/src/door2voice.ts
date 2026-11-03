@@ -190,7 +190,7 @@ export class TwoVoiceService {
         OPENDOOR_AUDIO_IN: talkFifoOf(p.id),
         OPENDOOR_TALK_DTMF: this.talkDtmf,
         // Hold a doorbell ring so an announcement / door press during it can answer it (the station
-        // refuses new calls while it rings). Only answered when our own call is refused.
+        // refuses new calls while it rings). A pre-warm never answers it.
         OPENDOOR_ANSWER_RING: "1",
         ...(mac ? { OPENDOOR_MAC: mac } : {}),
       },

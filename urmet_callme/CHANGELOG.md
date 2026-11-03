@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.20
+
+- **2Voice: an announcement during a ring now answers the ring
+  ([#19](https://github.com/a-blaho/ha-urmet-callme/issues/19)).** The 1.0.17 fallback never ran: the
+  held ring call keeps the sound device, so the door helper couldn't even try its own call, and the
+  announcement timed out after 50 s. While a ring is held, an announcement or door/gate press now
+  answers it straight away. The "… ready" button doesn't answer a ring.
+
 ## 1.0.19
 
 - **2Voice: "next camera" waits before re-dialling

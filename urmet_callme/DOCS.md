@@ -203,7 +203,7 @@ replaces one still playing, and clips are cut at `announce_max_seconds`.
 announcement - or a door/gate press - sent during the ring then **answers the ring call** and plays on
 it instead, so an automation can reply to a visitor right away ("Please leave the parcel in the
 lockers"). Answering takes the call, so the CallMe app on your phones stops ringing, just as when
-someone answers it. This only happens when the add-on's own call is refused; the camera is not
+someone answers it. The "… ready" (pre-warm) button never answers a ring, and the camera is not
 available until the ring ends.
 
 Confirmed on a cloud-listed 2Voice station
@@ -248,7 +248,7 @@ through the log:
   (we can only be heard when our direction allows sending), the open-audio tone, and the audio RTP
   packets sent after each clip.
 - `[opendoor] ring: …`: a doorbell ring the door helper holds unanswered, and whether an announcement
-  or door press answered it because the station refused the add-on's own call while ringing.
+  or door press during it answered it.
 - `[opendoor] talk-out: …` / `[atap] talk-out: …` (camera call): when the clip reached the call, a level
   line per second while it plays, and a summary - audio length, peak level, clipping, and dropouts
   (gaps where the source was slower than real time) - with a plain-language warning when the clip is
