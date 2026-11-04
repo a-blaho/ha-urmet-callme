@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
 - **2Voice: the camera works during a ring, like the app's "view camera"
   ([#19](https://github.com/a-blaho/ha-urmet-callme/issues/19)).** A ringing station refuses new
