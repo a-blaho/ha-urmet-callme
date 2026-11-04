@@ -40,9 +40,10 @@ const OPEN_TIMEOUT_MS = 45000;
 // A camera switch is one '3' on the live call, but with the audio open it is a BYE, a new call, then up
 // to three '3's ~1.5 s apart, so its confirmation can take well past a door tone's.
 const SWITCH_TIMEOUT_MS = 45000;
-// How long the helper may take to answer a 'V' with CAMERA ok|fail (it reads stdin every 50 ms and
-// answers at once, placing the call in the background).
-const CAMERA_REPLY_MS = 3000;
+// How long a camera request may wait for the helper's CAMERA reply. The helper reads stdin only once
+// registered, and right after a (re)spawn that takes up to 15 s (station.c lp_wait_registered), so a
+// request queued meanwhile is answered late, not never; stream.sh's curl gives /call 20 s.
+const CAMERA_REPLY_MS = 18000;
 const RESPAWN_MS = 3000; // auto-restart a helper that died (e.g. registration dropped)
 const RESTART_EXIT_MS = 3000; // how long a restart waits for the old helper to exit before SIGKILL
 const IDLE_SECONDS = 10; // camera off (and the call released after the keep-alive) with no reader this long
@@ -271,7 +272,7 @@ export class TwoVoiceStation {
     h.inPw = p.incomingPw;
     h.buf = "";
     child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (d: string) => this.onStdout(placeId, d));
+    child.stdout?.on("data", (d: string) => this.onStdout(placeId, child, d));
     child.on("error", (e) => log.error(`2Voice helper [${p.id}] spawn error: ${e.message}`));
     child.on("exit", (code) => {
       h.child = undefined;
@@ -294,9 +295,11 @@ export class TwoVoiceStation {
   }
 
   // Assemble the helper's stdout into lines: consume the machine lines, forward the rest to the log.
-  private onStdout(placeId: string, data: string): void {
+  private onStdout(placeId: string, child: ChildProcess, data: string): void {
     const h = this.helpers.get(placeId);
-    if (!h) return;
+    // A retired helper (restart(), or one that exited) may still flush buffered lines after its exit
+    // event: they must not answer the replacement's queued commands or set its camera state.
+    if (!h || h.child !== child) return;
     h.buf += data;
     let nl: number;
     while ((nl = h.buf.indexOf("\n")) >= 0) {
