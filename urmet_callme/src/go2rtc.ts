@@ -22,6 +22,7 @@
 import { ChildProcess, spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { logger } from "./logger.js";
+import { camFifos } from "./util.js";
 
 const log = logger("go2rtc");
 
@@ -86,11 +87,15 @@ export function go2rtcConfig(
   ports: Go2rtcPorts,
   debug = false, // add-on log_level debug: also surface the producers' stderr (ffmpeg warnings)
 ): string {
+  // stream.sh argv: camera index, go2rtc's {output} RTSP URL, the control port, then the H.264 and PCM
+  // FIFOs it reads (named here, in util.camFifos, nowhere else).
   const streams: string[] = [];
-  for (let i = 0; i < cameras; i++)
+  for (let i = 0; i < cameras; i++) {
+    const f = camFifos(i);
     streams.push(
-      `  urmet_cam_${i}: "exec:${STREAM_SCRIPT} ${i} {output} ${callPort}#starttimeout=60"`,
+      `  urmet_cam_${i}: "exec:${STREAM_SCRIPT} ${i} {output} ${callPort} ${f.h264} ${f.pcm}#starttimeout=60"`,
     );
+  }
   return [
     `app: { modules: ${yamlList(MODULES)} }`,
     `api: { listen: ":${ports.api}", allow_paths: ${yamlList(API_PATHS)} }`,

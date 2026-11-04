@@ -10,9 +10,10 @@
 import { ChildProcess, execFileSync, spawn } from "node:child_process";
 import { mkdirSync, unlinkSync } from "node:fs";
 import { Place } from "./callme.js";
+import { cameraCommand, HelperCommand, parseHelperLine } from "./helperProtocol.js";
 import { logger } from "./logger.js";
 import { waitForExit } from "./proc.js";
-import { parseResult, sanitize, stableUuid } from "./util.js";
+import { sanitize, stableUuid } from "./util.js";
 
 const log = logger("door2voice");
 
@@ -28,7 +29,10 @@ export class NoLiveCallError extends Error {}
 const instanceUuid = (user: string, placeId: string) =>
   stableUuid(`urmet-opendoor:${user}:${placeId}`);
 
-const DIGIT: Record<"door" | "gate", string> = { door: "1", gate: "2" };
+const DIGIT: Record<"door" | "gate", string> = {
+  door: HelperCommand.DOOR,
+  gate: HelperCommand.GATE,
+};
 // Per-open wait for opendoor's RESULT line. opendoor's own worst case (no media) is ~40 s, so give a
 // little more before we give up on the reply (the helper stays alive regardless -- no kill needed).
 const OPEN_TIMEOUT_MS = 45000;
@@ -192,7 +196,6 @@ export class TwoVoiceService {
     const child = spawn("opendoor", [p.incomingUser, p.incomingPw, outUri], {
       env: {
         ...process.env,
-        OPENDOOR_PERSISTENT: "1",
         OPENDOOR_DATA_DIR: dataDir,
         OPENDOOR_KEEPALIVE_MS: String(this.keepaliveMs),
         OPENDOOR_PREWARM_HOLD_MS: String(this.prewarmHoldMs),
@@ -250,25 +253,24 @@ export class TwoVoiceService {
       h.buf = h.buf.slice(nl + 1);
       if (!line) continue;
       // Machine lines (ring state, camera replies) are consumed here; opendoor logs each in words.
-      if (line === "RING held" || line === "RING gone") {
-        h.ringing = line === "RING held";
+      const ev = parseHelperLine(line);
+      if (ev.kind === "ring") {
+        h.ringing = ev.held;
         log.debug(line);
         continue;
       }
-      const cam = /^CAMERA (ok|fail|end)\b ?(.*)$/.exec(line);
-      if (cam) {
+      if (ev.kind === "camera") {
         log.debug(line);
-        if (cam[1] === "end") this.onRingCameraEnd?.(placeId);
-        else h.camWaiters.shift()?.(cam[1] === "ok" ? undefined : cam[2] || "failed");
+        if (ev.status === "end") this.onRingCameraEnd?.(placeId);
+        else h.camWaiters.shift()?.(ev.status === "ok" ? undefined : ev.why || "failed");
         continue;
       }
       log.info(line); // opendoor lines are already "[opendoor] …"
-      const r = parseResult(line);
-      if (r && h.pending.length > 0) {
+      if (ev.kind === "result" && h.pending.length > 0) {
         // opendoor reports RESULT in the order it received the tones -> match FIFO.
         const { resolve, reject, timer } = h.pending.shift()!;
         clearTimeout(timer);
-        if (r.ok) resolve();
+        if (ev.ok) resolve();
         else reject(new Error("open failed (tone not delivered)"));
       }
     }
@@ -342,7 +344,7 @@ export class TwoVoiceService {
     log.info(
       `pre-warming 2Voice call for ${placeId} (${h.place.name}) on ring`,
     );
-    h.child.stdin.write("W\n");
+    h.child.stdin.write(HelperCommand.PREWARM + "\n");
     return true;
   }
 
@@ -353,7 +355,7 @@ export class TwoVoiceService {
   release(placeId: string): void {
     const h = this.helpers.get(placeId);
     if (!h?.child?.stdin?.writable) return;
-    h.child.stdin.write("H\n");
+    h.child.stdin.write(HelperCommand.RELEASE + "\n");
   }
 
   /** True while the door helper holds the place's doorbell ring call (still ringing, or answered for
@@ -383,7 +385,7 @@ export class TwoVoiceService {
         finish("no reply from the door helper");
       }, CAMERA_REPLY_MS);
       h.camWaiters.push(finish);
-      h.child!.stdin!.write(`V ${h264Fifo} ${pcmFifo}\n`);
+      h.child!.stdin!.write(cameraCommand(h264Fifo, pcmFifo) + "\n");
     });
   }
 
@@ -408,7 +410,7 @@ export class TwoVoiceService {
     }
     const h = this.helpers.get(placeId);
     if (!h?.child?.stdin?.writable) return undefined;
-    h.child.stdin.write("T\n");
+    h.child.stdin.write(HelperCommand.TALK + "\n");
     return "door";
   }
 

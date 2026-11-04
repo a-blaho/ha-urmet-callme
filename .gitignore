@@ -9,3 +9,7 @@ callme/
 # macOS
 .DS_Store
 ._*
+
+# Reverse-engineering material: the official apps (Urmet IP), their jadx output and the protocol
+# notes derived from them. Never committed; see reverse-engineering/README.md.
+reverse-engineering/

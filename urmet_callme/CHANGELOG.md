@@ -12,6 +12,21 @@
   confirmed on a station.
 - **2Voice: a door press during a ring now opens the door.** 1.0.20 answered the ring for it but never
   sent the tone: the call's media came up while it was being answered, and that was then forgotten.
+- **Reconnects now refresh the places' credentials.** After a SIP reconnect the add-on re-read
+  `get_my_devices` but handed the new data to a fresh set of places, while the 2Voice door helper, the
+  camera and announcements kept the old ones; rotated channel credentials or a changed station only
+  took effect after a restart. The existing places are updated in place now.
+- **A doorbell listener whose first registration fails is retried** on the maintenance tick instead
+  of being dropped until the next restart.
+- The connection probe no longer writes to a dead socket, so a dropped SIP connection is reconnected
+  without a spurious `socket error` line every 25 s first.
+- The add-on's own SIP client now presents the official app's User-Agent, as the media helpers already
+  did.
+- Cleanup, no behaviour change: the `opendoor` helper's single-shot and no-keep-alive modes are gone
+  (`door_open_2voice_keepalive: 0` still means a fresh call per press; the call is held half a second
+  for the tone to land), `recv`'s dev-only knobs are gone, the FIFO paths and the helper command
+  alphabet are each defined once, MQTT entities are published through one routine (ids unchanged),
+  and the SIP client, the helper protocol and the MQTT bridge have unit tests.
 
 ## 1.1.0
 

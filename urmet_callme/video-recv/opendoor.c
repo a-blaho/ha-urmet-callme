@@ -1,7 +1,9 @@
 /*
- * opendoor.c - a single-shot liblinphone helper that opens a 2Voice (or other non-IPERCOM CallMe)
+ * opendoor.c - the persistent liblinphone helper that opens a 2Voice (or other non-IPERCOM CallMe)
  * door. Auto-enabled whenever a 2Voice system is detected on the account; compiled into the image
- * next to recv (see ../Dockerfile) and spawned per unlock by src/door2voice.ts.
+ * next to recv (see ../Dockerfile) and spawned ONCE per place by src/door2voice.ts, which then drives
+ * it over stdin (one command letter per line) and reads its replies on stdout. The command alphabet
+ * is spelled out in src/helperProtocol.ts and in the usage text below.
  *
  * WHY a separate binary (not the pure-Node open_door_req path): IPERCOM opens a door with a cloud
  * MESSAGE (open_door_req to the gateway). 2Voice has NO such command - the door is opened by placing
@@ -10,19 +12,23 @@
  * embedded stack here rather than hand-rolling a media call in Node.
  *
  * Flow (the 2Voice auto-insertion door-open, non-SER_PHASE_B families):
- *   1. register the place's INCOMING/channel account (argv IN user/pass) over TLS to sip.urmet.com
- *   2. place an OUTGOING audio INVITE to the OUTGOING account username (argv OUT uri) with a custom
- *      header `auto_insertion: true` so the station auto-answers without ringing the indoor monitor
- *   3. on StreamsRunning, send the DTMF digit (argv: '1' door / '2' gate) via SIP INFO
- *   4. hold briefly so the INFO lands, then hang up (BYE) and exit
- * Exit code 0 = the tone was delivered (door presumably opened); non-zero = register/answer/timeout
- * failure. No media is tapped - a void capture (silence) + null playback just satisfy liblinphone's
- * device lookup so a media stream negotiates and StreamsRunning fires.
+ *   1. register the place's INCOMING/channel account (argv IN user/pass) over TLS to sip.urmet.com,
+ *      once, at startup (each later press then skips the ~2-3 s register)
+ *   2. on a '1'/'2' command, place an OUTGOING INVITE to the OUTGOING account (argv OUT uri) with a
+ *      custom header `auto_insertion: true` so the station auto-answers without ringing the indoor
+ *      monitor (or `mac: <MAC>` for a phase-B station, see OPENDOOR_MAC)
+ *   3. on StreamsRunning, send the DTMF digit via SIP INFO and print `RESULT <d> ok`
+ *   4. keep the call up for OPENDOOR_KEEPALIVE_MS so a follow-up tone rides the same call, then BYE
+ * No media is tapped on the door call - a silence capture + null playback just satisfy liblinphone's
+ * device lookup so a stream negotiates and StreamsRunning fires. The same process also holds a
+ * doorbell ring unanswered (OPENDOOR_ANSWER_RING) so a press/announcement during the ring can answer
+ * it, and can show that ring call on the camera (the 'V' command, h264tap.h).
  *
- * Usage: opendoor <in-username> <in-password> <out-sip-uri> <dtmf-digit>
+ * Usage: opendoor <in-username> <in-password> <out-sip-uri>
  *   env: OPENDOOR_DATA_DIR (writable, unique per place - liblinphone's sqlite/config),
  *        OPENDOOR_UUID (stable +sip.instance id, so a restart REPLACES our registrar binding),
- *        OPENDOOR_TIMEOUT (overall seconds, default 40), OPENDOOR_DEBUG=1 (SIP trace).
+ *        OPENDOOR_KEEPALIVE_MS, OPENDOOR_PREWARM_HOLD_MS, OPENDOOR_MAC, OPENDOOR_AUDIO_IN,
+ *        OPENDOOR_TALK_DTMF, OPENDOOR_ANSWER_RING, OPENDOOR_DEBUG=1 (SIP trace).
  * Targets the same liblinphone C API (Ubuntu 24.04: liblinphone-dev) as recv.c.
  */
 #include <linphone/core.h>
@@ -599,48 +605,6 @@ static void bye_call(LinphoneCore *lc) {
   g_ended = 0; /* consume: place_call sets it fresh for the next call */
 }
 
-/* SINGLE-SHOT open: place a call, send DTMF on StreamsRunning, brief hold, BYE. Returns 0 if the tone
- * was delivered. (Persistent keep-alive mode calls place_call/bye_call directly -- see keepalive_loop.) */
-static int run_open(LinphoneCore *lc, LinphoneFactory *factory, const char *out_uri, char digit,
-                    int report) {
-  if (!place_call(lc, factory, out_uri, digit == '1' ? "door" : "gate")) {
-    if (report) { printf("[opendoor] RESULT %c fail\n", digit); fflush(stdout); }
-    return 1;
-  }
-  const long long start = now_ms();
-  const long long HOLD_AFTER_DTMF_MS = 500; /* the tone is out (door opens); brief settle then BYE */
-  const long long OVERALL_MS = 40000;
-  int dtmf_sent = 0;
-  long long dtmf_at = 0;
-
-  while (g_running) {
-    linphone_core_iterate(lc);
-    usleep(50 * 1000);
-    const long long now = now_ms();
-    if (!dtmf_sent && g_streams) {
-      LinphoneStatus st = linphone_call_send_dtmf(g_call, digit);
-      dtmf_sent = 1;
-      dtmf_at = now;
-      printf("[opendoor] streams running -> sent DTMF '%c' (status %d)\n", digit, (int)st);
-      /* Report done as soon as the tone is out -- the door/gate opens now; the hold+BYE is teardown. */
-      if (report) printf("[opendoor] RESULT %c ok\n", digit);
-      fflush(stdout);
-    }
-    if (!dtmf_sent && now - start > OPENDOOR_STREAMS_TIMEOUT_MS) {
-      fprintf(stderr, "[opendoor] no media within %ds (station busy / rejected?)\n",
-              OPENDOOR_STREAMS_TIMEOUT_MS / 1000);
-      break;
-    }
-    if (dtmf_sent && now - dtmf_at > HOLD_AFTER_DTMF_MS) { printf("[opendoor] done -> hanging up\n"); fflush(stdout); break; }
-    if (g_ended && dtmf_sent) break;
-    if (g_ended && !dtmf_sent) { fprintf(stderr, "[opendoor] call ended before media\n"); break; }
-    if (now - start > OVERALL_MS) { fprintf(stderr, "[opendoor] overall timeout\n"); break; }
-  }
-  bye_call(lc);
-  if (report && !dtmf_sent) { printf("[opendoor] RESULT %c fail\n", digit); fflush(stdout); }
-  return dtmf_sent ? 0 : 1;
-}
-
 /* Send one tone on the active (already-running) call and report it. */
 static void send_tone(char c, long long *last_activity, long long now) {
   LinphoneStatus st = linphone_call_send_dtmf(g_call, c);
@@ -691,53 +655,10 @@ static void talk_log_request(long long now, long long call_placed_at) {
   fflush(stdout);
 }
 
-/* PER-PRESS mode announcement (keep-alive off): place a call, play, hang up. Blocks like run_open. */
-static void run_talk(LinphoneCore *lc, LinphoneFactory *factory, const char *out_uri) {
-  const long long start = now_ms();
-  talk_log_request(start, start);
-  if (!place_call(lc, factory, out_uri, "announcement")) return;
-  const long long start_ms = talk_start_ms();
-  const long clips0 = g_talk_clips;
-  long long media_at = 0, clip_end_at = 0;
-  int started = 0;
-  while (g_running) {
-    linphone_core_iterate(lc);
-    usleep(50 * 1000);
-    const long long now = now_ms();
-    if (g_streams && !media_at) {
-      media_at = now;
-      printf("[opendoor] announce: call ready %lld ms after the request; waiting for the clip\n",
-             now - start);
-      fflush(stdout);
-    }
-    talk_send_digit();
-    if (g_talk_active) started = 1;
-    if (g_ended) { printf("[opendoor] announce: the station ended the call\n"); fflush(stdout); break; }
-    if (!g_streams && now - start > OPENDOOR_STREAMS_TIMEOUT_MS) {
-      printf("[opendoor] announce: FAILED -- no media within %ds (station busy / rejected?)\n",
-             OPENDOOR_STREAMS_TIMEOUT_MS / 1000);
-      fflush(stdout);
-      break;
-    }
-    if (!started && media_at && now - media_at > start_ms) {
-      printf("[opendoor] announce: no audio arrived within %llds of the call coming up; hanging up\n",
-             start_ms / 1000);
-      fflush(stdout);
-      break;
-    }
-    if (g_talk_clips != clips0 && !clip_end_at) {
-      clip_end_at = now;
-      if (g_call) log_audio_rtp(g_call, "after the clip");
-    }
-    if (clip_end_at && now - clip_end_at > 500) break; /* brief settle, then BYE */
-  }
-  bye_call(lc);
-}
-
-/* PERSISTENT KEEP-ALIVE loop: hold the auto_insertion call up for `keepalive_ms` after the last tone
- * and send follow-up tones on the SAME call (instant repeat, e.g. door then gate),
- * then BYE on idle to release the 2Voice bus/monitor. Reads digits from stdin; reports RESULT per
- * command. keepalive_ms<=0 uses the simpler per-press path (see main). */
+/* THE command loop: hold the auto_insertion call up for `keepalive_ms` after the last tone and send
+ * follow-up tones on the SAME call (instant repeat, e.g. door then gate), then BYE on idle to release
+ * the 2Voice bus/monitor. Reads commands from stdin (see the usage text / src/helperProtocol.ts);
+ * reports RESULT per tone. */
 static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const char *out_uri,
                            long long keepalive_ms) {
   long long last_activity = 0, call_placed_at = 0;
@@ -781,7 +702,7 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
         continue;
       }
       if (c == 'T') {
-        /* Announcement: open/hold the call; the clip arrives on OPENDOOR_AUDIO_IN (see run_talk). */
+        /* Announcement: open/hold the call; the clip arrives on OPENDOOR_AUDIO_IN (talkout.h). */
         talk_log_request(now, call_placed_at);
         if (!g_call) {
           if (!place_call(lc, factory, out_uri, "announcement")) continue;
@@ -911,33 +832,32 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
 }
 
 int main(int argc, char **argv) {
-  int persistent = getenv("OPENDOOR_PERSISTENT") != NULL;
-  if (argc < (persistent ? 4 : 5)) {
+  if (argc < 4) {
     fprintf(stderr,
-            "usage: %s <in-username> <in-password> <out-sip-uri> [<dtmf-digit>]\n"
-            "  single-shot: place one call, send <dtmf-digit> (1=door / 2=gate), exit.\n"
-            "  OPENDOOR_PERSISTENT=1: register ONCE, then read digits ('1'/'2') from stdin, one open\n"
-            "    per line, printing 'RESULT <d> ok|fail'; exit when stdin closes. (Faster: each press\n"
-            "    skips the SIP register.) With OPENDOOR_KEEPALIVE_MS>0 also 'W' (pre-warm: open the\n"
-            "    call, no tone) and 'H' (release: hang up a held call now).\n"
-            "  Announcements: OPENDOOR_AUDIO_IN=<fifo> sends s16le 8 kHz mono PCM from it instead of\n"
-            "    silence; 'T' holds a call for a clip (OPENDOOR_TALK_DTMF = open-audio digit to send,\n"
-            "    empty = none; OPENDOOR_TALK_START_MS = how long the clip may take to start).\n"
-            "  OPENDOOR_ANSWER_RING=1: hold a doorbell ring unanswered; an announcement or door press\n"
-            "    during it answers it (the station refuses new calls while it rings), and\n"
-            "    'V <h264 fifo> <pcm fifo>' shows it on the camera (early media, like the app).\n"
-            "  env: OPENDOOR_DATA_DIR=<dir> (unique per place), OPENDOOR_DEBUG=1 (SIP trace)\n",
+            "usage: %s <in-username> <in-password> <out-sip-uri>\n"
+            "  Registers ONCE, then reads commands from stdin, one per line, until stdin closes:\n"
+            "    '1' / '2'  open the door / gate: a tone on the station call (placed if none is up);\n"
+            "               answered with 'RESULT <d> ok|fail' on stdout, in the order received\n"
+            "    'W'        pre-warm: open the call now, no tone (held OPENDOOR_PREWARM_HOLD_MS)\n"
+            "    'H'        release: hang up a held call now\n"
+            "    'T'        announcement: hold a call for a clip read from OPENDOOR_AUDIO_IN (s16le 8 kHz\n"
+            "               mono PCM); OPENDOOR_TALK_DTMF = open-audio digit to send first (empty = none),\n"
+            "               OPENDOOR_TALK_START_MS = how long the clip may take to start\n"
+            "    'V <h264 fifo> <pcm fifo>'  show the held doorbell ring on the camera (early media, like\n"
+            "               the app); answered with 'CAMERA ok|fail <why>', later 'CAMERA end'\n"
+            "  OPENDOOR_KEEPALIVE_MS: keep the call up this long after the last tone so a follow-up tone\n"
+            "    rides the same call (below 500 ms the call is still held 500 ms for the INFO to land).\n"
+            "  OPENDOOR_ANSWER_RING=1: hold a doorbell ring unanswered ('RING held' / 'RING gone' on\n"
+            "    stdout); an announcement or door press during it answers it (the station refuses new\n"
+            "    calls while it rings).\n"
+            "  env: OPENDOOR_DATA_DIR=<dir> (unique per place), OPENDOOR_UUID, OPENDOOR_MAC (phase-B\n"
+            "    station: dial with a `mac` header, audio only), OPENDOOR_DEBUG=1 (SIP trace)\n",
             argv[0]);
     return 2;
   }
   const char *in_user = argv[1];
   const char *in_pass = argv[2];
   const char *out_uri = argv[3];
-  char digit = persistent ? 0 : argv[4][0];
-  if (!persistent && digit != '1' && digit != '2') {
-    fprintf(stderr, "[opendoor] bad DTMF digit '%c' (expected 1=door / 2=gate)\n", digit);
-    return 2;
-  }
 
   const char *domain = "sip.urmet.com";
   const char *server = "sip:sip.urmet.com:5061;transport=tls";
@@ -1074,12 +994,10 @@ int main(int argc, char **argv) {
   linphone_account_params_unref(ap);
   linphone_account_unref(account);
 
-  printf("[opendoor] registering %s (mode=%s) -> %s\n",
-         identity, persistent ? "persistent" : "single-shot", out_uri);
+  printf("[opendoor] registering %s -> %s\n", identity, out_uri);
   fflush(stdout);
 
-  /* Wait for registration (bounded). Both modes need the account registered before calling; in
-   * persistent mode this happens ONCE at startup, so later presses skip it. */
+  /* Wait for registration (bounded). It happens ONCE at startup, so later presses skip it. */
   {
     long long t0 = now_ms();
     while (g_running && !g_reg_ok && !g_reg_failed && now_ms() - t0 < 15000) {
@@ -1094,48 +1012,20 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  int rc = 0;
-  if (persistent) {
-    /* Stay registered and serve open commands from stdin ('1'/'2', one per line) without
-     * re-registering -- each press then pays only the call-setup time, not the ~2-3s register. */
-    long long keepalive_ms = 0;
-    if (getenv("OPENDOOR_KEEPALIVE_MS")) keepalive_ms = atoll(getenv("OPENDOOR_KEEPALIVE_MS"));
-    int fl = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK);
-    if (keepalive_ms > 0) {
-      /* Keep the call up for keepalive_ms and send follow-up tones on it (instant door-then-gate). */
-      printf("[opendoor] persistent (keep-alive %llds): registered, waiting for commands on stdin\n",
-             keepalive_ms / 1000);
-      fflush(stdout);
-      keepalive_loop(lc, factory, out_uri, keepalive_ms);
-    } else {
-      /* Simple: one call per press, BYE each time (keepalive disabled). */
-      printf("[opendoor] persistent: registered, waiting for commands on stdin\n");
-      fflush(stdout);
-      while (g_running) {
-        linphone_core_iterate(lc); /* refreshes the registration while idle */
-        usleep(50 * 1000);
-        char c;
-        ssize_t n = read(STDIN_FILENO, &c, 1);
-        if (n == 0) break; /* stdin closed -> the control plane stopped us -> exit */
-        if (n == 1 && (c == '1' || c == '2'))
-          run_open(lc, factory, out_uri, c, 1); /* prints RESULT (ok as soon as the tone is out) */
-        else if (n == 1 && c == 'T')
-          run_talk(lc, factory, out_uri); /* announcement: place a call, play the clip, hang up */
-        else if (n == 1 && c == 'V')
-          handle_camera_command(); /* camera during a ring: show the ring call */
-      }
-    }
-  } else {
-    rc = run_open(lc, factory, out_uri, digit, 0);
-    if (rc == 0)
-      printf("[opendoor] SUCCESS: %s tone delivered\n", digit == '1' ? "door" : "gate");
-    else
-      fprintf(stderr, "[opendoor] FAILED: tone not delivered\n");
-    fflush(stdout);
-  }
+  /* Stay registered and serve commands from stdin without re-registering -- each press then pays only
+   * the call-setup time, not the ~2-3 s register. */
+  long long keepalive_ms = 0;
+  if (getenv("OPENDOOR_KEEPALIVE_MS")) keepalive_ms = atoll(getenv("OPENDOOR_KEEPALIVE_MS"));
+  /* The add-on's `0` means "a fresh call per press"; the call is still held 500 ms after the tone so
+   * the INFO lands before the BYE (what the former single-shot path did). */
+  if (keepalive_ms < 500) keepalive_ms = 500;
+  int fl = fcntl(STDIN_FILENO, F_GETFL, 0);
+  fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK);
+  printf("[opendoor] registered (keep-alive %lld ms), waiting for commands on stdin\n", keepalive_ms);
+  fflush(stdout);
+  keepalive_loop(lc, factory, out_uri, keepalive_ms);
 
   linphone_core_stop(lc);
   linphone_core_unref(lc);
-  return rc;
+  return 0;
 }

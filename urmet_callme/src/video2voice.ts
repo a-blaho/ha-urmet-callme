@@ -16,16 +16,17 @@
 // call_device_req/gateway, no slot-switching (each place is independent, one recv per place, spawned
 // on demand). The go2rtc + stream.sh + FIFO/keyframe machinery is shared with the IPERCOM path,
 // reused as-is.
-import { spawn, execFileSync, ChildProcess } from "node:child_process";
-import { writeFileSync, unlinkSync, mkdirSync } from "node:fs";
-import { createServer, Server } from "node:http";
+import { spawn, ChildProcess } from "node:child_process";
+import { writeFileSync, mkdirSync } from "node:fs";
+import type { Server } from "node:http";
 import { Place } from "./callme.js";
+import { listenControl, makeFifos, type ControlHandler } from "./cameraPipeline.js";
 import { macHeaderOf, NoLiveCallError, talkFifoOf } from "./door2voice.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
+import { HelperCommand, parseResult } from "./helperProtocol.js";
 import { isDebug, logger } from "./logger.js";
 import { isAlive, waitForExit } from "./proc.js";
-import { parseResult } from "./util.js";
-import { deterministicUuid } from "./video.js";
+import { camFifos, stableUuid } from "./util.js";
 
 const log = logger("video2v");
 const RECV_IDLE_SECONDS = 10; // recv hangs up (and exits) after no FIFO reader for this long
@@ -85,16 +86,12 @@ export class TwoVoiceVideoService {
       log.warn("no 2Voice place with channel + OUT creds; 2Voice video not started");
       return false;
     }
-    // FIFO names MUST match what stream.sh reads (`/tmp/urmet_cam_<i>.h264` / `.pcm`) -- stream.sh
-    // hardcodes those. Only one video service runs at a time (index.ts), so reusing the names the
-    // IPERCOM path uses is safe and is what wires recv's output to go2rtc.
-    usable.forEach((p, i) =>
-      this.cams.push({
-        place: p,
-        fifo: `/tmp/urmet_cam_${i}.h264`,
-        afifo: `/tmp/urmet_cam_${i}.pcm`,
-      }),
-    );
+    // Only one video service runs at a time (index.ts), so camera i gets the same FIFO pair and go2rtc
+    // stream name as on the IPERCOM path (util.camFifos; stream.sh gets the paths as arguments).
+    usable.forEach((p, i) => {
+      const f = camFifos(i);
+      this.cams.push({ place: p, fifo: f.h264, afifo: f.pcm });
+    });
     log.info(
       `2Voice cameras: ${this.cams.map((c, i) => `[${i}] ${c.place.name}`).join(", ")}`,
     );
@@ -166,7 +163,7 @@ export class TwoVoiceVideoService {
    *  being shown. False when no camera call is up (a new call starts on the first panel anyway), or
    *  when the switch did not go out. */
   async nextCamera(placeId: string): Promise<boolean> {
-    const sent = this.sendTone(placeId, "N", SWITCH_TIMEOUT_MS);
+    const sent = this.sendTone(placeId, HelperCommand.NEXT_CAMERA, SWITCH_TIMEOUT_MS);
     if (!sent) return false;
     try {
       await sent;
@@ -181,7 +178,7 @@ export class TwoVoiceVideoService {
    *  (recv sends the open-audio digit; once its media runs if the call is still coming up). */
   openAudio(placeId: string): void {
     const recv = this.recvs.get(this.camIndex(placeId));
-    if (recv?.stdin?.writable) recv.stdin.write("A\n");
+    if (recv?.stdin?.writable) recv.stdin.write(HelperCommand.OPEN_AUDIO + "\n");
   }
 
   private failPendingTones(i: number, why: string) {
@@ -214,17 +211,6 @@ export class TwoVoiceVideoService {
     this.stdoutBuf.set(i, buf);
   }
 
-  private makeFifos(cam: Cam) {
-    for (const fifo of [cam.fifo, cam.afifo]) {
-      try {
-        unlinkSync(fifo);
-      } catch {
-        /* not there */
-      }
-      execFileSync("mkfifo", [fifo]);
-    }
-  }
-
   /** A camera request: show the ring call while the door helper holds one (see ringCamera),
    *  otherwise place our own camera call. */
   private call(i: number): Promise<void> {
@@ -241,7 +227,7 @@ export class TwoVoiceVideoService {
     const cam = this.cams[i];
     if (!this.stopping && this.showRing && this.ringing?.(cam.place.id)) {
       log.info(`2Voice camera [${i}] ${cam.place.name}: the station is ringing -> showing the ring call`);
-      this.makeFifos(cam); // first: opendoor opens them as soon as the early media starts
+      makeFifos(cam.fifo, cam.afifo); // first: opendoor opens them as soon as the early media starts
       const failure = await this.showRing(cam.place.id, cam.fifo, cam.afifo);
       if (!failure) {
         this.ringCams.add(i);
@@ -269,7 +255,7 @@ export class TwoVoiceVideoService {
     const cam = this.cams[i];
     // A pre-warm / keep-alive call the door helper holds to this station would collide with ours.
     this.onBeforeCall?.(cam.place.id);
-    this.makeFifos(cam);
+    makeFifos(cam.fifo, cam.afifo);
     const targetFile = `/tmp/recv2v_target_${i}`;
     writeFileSync(targetFile, `${cam.fifo}\n${cam.afifo}\n`);
     const dataDir = `/tmp/lp_2v_vid_${i}/`; // unique per camera (shared sqlite corrupts account state)
@@ -290,7 +276,7 @@ export class TwoVoiceVideoService {
         ...(mac ? { RECV_MAC: mac } : {}), // 58A: dial with `mac` instead of `auto_insertion`
         // Stable instance id, DISTINCT from opendoor's (which registers the same channel account for
         // door-open) so the two helpers hold separate bindings instead of replacing each other.
-        RECV_UUID: deterministicUuid(`urmet-recv:${cam.place.incomingUser}:${cam.place.id}`),
+        RECV_UUID: stableUuid(`urmet-recv:${cam.place.incomingUser}:${cam.place.id}`),
         RECV_TARGET_FILE: targetFile, // line 0 = H.264 FIFO, line 1 = PCM FIFO
         RECV_DATA_DIR: dataDir,
         RECV_IDLE_SECONDS: String(RECV_IDLE_SECONDS),
@@ -352,8 +338,8 @@ export class TwoVoiceVideoService {
     return true;
   }
 
-  private serveCallEndpoint(): Promise<void> {
-    this.server = createServer((req, res) => {
+  private async serveCallEndpoint(): Promise<void> {
+    const handler: ControlHandler = (req, res) => {
       const u = new URL(req.url || "/", "http://127.0.0.1");
       const i = parseInt(u.searchParams.get("cam") || "0", 10) || 0;
       if (!this.cams[i]) return void res.writeHead(400).end("no such camera");
@@ -372,20 +358,10 @@ export class TwoVoiceVideoService {
         return void res.writeHead(200).end("ok");
       }
       res.writeHead(404).end();
-    });
-    this.server.on("error", (e) =>
-      log.error(`2Voice call endpoint error: ${(e as Error).message}`),
-    );
-    // Ephemeral port (0): the OS picks a free one, so a host-network clash on a fixed port (8099 was
-    // taken by Zigbee2MQTT on a real install) can't happen. The chosen port goes to stream.sh (argv $3).
-    return new Promise<void>((resolve) => {
-      this.server!.listen(0, "127.0.0.1", () => {
-        const addr = this.server!.address();
-        this.callPort = typeof addr === "object" && addr ? addr.port : 0;
-        log.info(`2Voice control endpoint on 127.0.0.1:${this.callPort}`);
-        resolve();
-      });
-    });
+    };
+    const { server, port } = await listenControl(handler, "2Voice control endpoint");
+    this.server = server;
+    this.callPort = port;
   }
 
   /** Stop go2rtc and every live recv; resolves once they exited (each BYEs its call on SIGTERM)

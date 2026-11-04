@@ -20,8 +20,15 @@ test("go2rtcConfig keeps the LAN hardening keys", () => {
 
 test("go2rtcConfig emits one on-demand stream per camera with the call port", () => {
   const cfg = go2rtcConfig(2, 45123, ports);
-  assert.match(cfg, /^  urmet_cam_0: "exec:\/app\/stream\.sh 0 \{output\} 45123#starttimeout=60"$/m);
-  assert.match(cfg, /^  urmet_cam_1: "exec:\/app\/stream\.sh 1 \{output\} 45123#starttimeout=60"$/m);
+  // argv: index, {output}, control port, H.264 FIFO, PCM FIFO (stream.sh reads $4/$5, nothing hardcoded)
+  assert.match(
+    cfg,
+    /^  urmet_cam_0: "exec:\/app\/stream\.sh 0 \{output\} 45123 \/tmp\/urmet_cam_0\.h264 \/tmp\/urmet_cam_0\.pcm#starttimeout=60"$/m,
+  );
+  assert.match(
+    cfg,
+    /^  urmet_cam_1: "exec:\/app\/stream\.sh 1 \{output\} 45123 \/tmp\/urmet_cam_1\.h264 \/tmp\/urmet_cam_1\.pcm#starttimeout=60"$/m,
+  );
   assert.ok(!cfg.includes("urmet_cam_2"));
   assert.match(cfg, /^rtsp: \{ listen: ":8554" \}$/m);
   assert.ok(cfg.endsWith("\n"));

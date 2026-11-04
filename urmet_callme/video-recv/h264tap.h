@@ -4,9 +4,9 @@
  * during a doorbell ring: early media on the ring call, as the official app's "view camera" does).
  * Header-only (one includer per binary), like talkout.h.
  *
- * The includer defines TAP_LOG(fmt, ...) (its own log function) before including, and optionally
- * TAP_DEFAULT_PATH (the FIFO when neither g_tap_target nor RECV_TARGET_FILE/RECV_H264_OUT name one).
- * With no target at all the tap still consumes the stream and writes nothing (video discarded).
+ * The includer defines TAP_LOG(fmt, ...) (its own log function) before including. The output FIFO
+ * comes from g_tap_target (opendoor's 'V' command) or line 0 of RECV_TARGET_FILE (recv); with no
+ * target at all the tap still consumes the stream and writes nothing (video discarded).
  */
 #ifndef URMET_H264TAP_H
 #define URMET_H264TAP_H
@@ -129,42 +129,30 @@ static void write_black(TapState *s) {
 
 /* Resolve the output FIFO for the CURRENT call. With the single-account model, one recv serves
  * whichever camera the control plane (src/video.ts) is currently calling, so the target FIFO can
- * change per call. video.ts writes the target paths to RECV_TARGET_FILE (line 0 = H.264 FIFO,
- * line 1 = PCM FIFO) BEFORE placing each call; we read it here when the per-call tap is created.
- * Falls back to the static env var (single-camera / dev spike). */
-static void read_target_line(char *out, size_t outsz, int lineno, const char *env_fallback) {
+ * change per call. The control plane writes the target paths to RECV_TARGET_FILE (line 0 = H.264
+ * FIFO, line 1 = PCM FIFO) BEFORE placing each call; we read it here when the per-call tap is
+ * created. Empty when the file or the line is absent. */
+static void read_target_line(char *out, size_t outsz, int lineno) {
   out[0] = '\0';
   const char *tf = getenv("RECV_TARGET_FILE");
-  if (tf && *tf) {
-    FILE *fp = fopen(tf, "r");
-    if (fp) {
-      char line[256];
-      int n = 0;
-      while (fgets(line, sizeof line, fp)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (n == lineno) { snprintf(out, outsz, "%s", line); break; }
-        n++;
-      }
-      fclose(fp);
-    }
+  if (!tf || !*tf) return;
+  FILE *fp = fopen(tf, "r");
+  if (!fp) return;
+  char line[256];
+  int n = 0;
+  while (fgets(line, sizeof line, fp)) {
+    line[strcspn(line, "\r\n")] = '\0';
+    if (n == lineno) { snprintf(out, outsz, "%s", line); break; }
+    n++;
   }
-  if (!out[0]) {
-    const char *e = env_fallback ? getenv(env_fallback) : NULL;
-    if (e && *e) snprintf(out, outsz, "%s", e);
-  }
+  fclose(fp);
 }
 
 static void tap_init(MSFilter *f) {
   TapState *s = ms_new0(TapState, 1);
   s->fd = -1;
-  if (g_tap_target[0]) {
-    snprintf(s->path, sizeof s->path, "%s", g_tap_target);
-  } else {
-    read_target_line(s->path, sizeof s->path, 0, "RECV_H264_OUT");
-#ifdef TAP_DEFAULT_PATH
-    if (!s->path[0]) snprintf(s->path, sizeof s->path, "%s", TAP_DEFAULT_PATH);
-#endif
-  }
+  if (g_tap_target[0]) snprintf(s->path, sizeof s->path, "%s", g_tap_target);
+  else read_target_line(s->path, sizeof s->path, 0);
   s->unpacker = rfc3984_new_with_factory(f->factory);
   f->data = s;
   if (s->path[0]) TAP_LOG("[tap] H264 tap decoder instantiated -> %s\n", s->path);

@@ -10,27 +10,18 @@
 //
 // The door station serves ~one video call at a time, so switching cameras BYEs the current call
 // then re-calls on the same account. See ../video-recv/INTEGRATION.md.
-import { ChildProcess, execFileSync, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { createServer, Server } from "node:http";
+import { ChildProcess, spawn } from "node:child_process";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import type { Server } from "node:http";
 import { AvailableDevice, CallMe } from "./callme.js";
+import { listenControl, makeFifos, type ControlHandler } from "./cameraPipeline.js";
 import { Cloud } from "./cloud.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { isDebug, logger } from "./logger.js";
 import { isAlive, waitForExit } from "./proc.js";
+import { camFifos, stableUuid } from "./util.js";
 
 const log = logger("video");
-
-/** A stable RFC 5626 `+sip.instance` UUID derived from `seed`, so a liblinphone helper keeps the
- *  SAME instance id across restarts (its `/tmp` config is wiped with the container). Without this a
- *  restart/recall ADDS a registrar binding instead of replacing ours, and the registrar forks calls
- *  to the stale ones until they expire (see recv.c / opendoor.c). Callers pass distinct seeds
- *  (`urmet-recv:...` vs `urmet-opendoor:...`) so co-registered helpers never collide. */
-export function deterministicUuid(seed: string): string {
-  const h = createHash("md5").update(seed).digest("hex");
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
-}
 
 // How long recv keeps a call alive after its FIFO stops being drained (viewer gone) before it
 // hangs up. This clock only starts once streaming actually begins (recv.c starts it at the first
@@ -171,12 +162,8 @@ export class VideoService {
     log.info(`shared camera account B: ${reuse ? "reused" : "created"}`);
 
     for (let i = 0; i < found.length; i++) {
-      this.cams.push({
-        placeId: found[i].placeId,
-        dev: found[i].dev,
-        fifo: `/tmp/urmet_cam_${i}.h264`,
-        afifo: `/tmp/urmet_cam_${i}.pcm`,
-      });
+      const f = camFifos(i);
+      this.cams.push({ placeId: found[i].placeId, dev: found[i].dev, fifo: f.h264, afifo: f.pcm });
     }
     log.info(
       `cameras: ${this.cams.map((c, i) => `[${i}] ${c.dev.name} (place ${c.placeId})`).join(", ")}`,
@@ -220,18 +207,8 @@ export class VideoService {
   // to the current slotHolder.
   private spawnRecv(pass: string) {
     if (this.stopping) return; // don't resurrect while shutting down
-    // (Re)create every camera's FIFO pair as real FIFOs (recv opens O_RDWR|O_CREAT; without a real
-    // FIFO here O_CREAT would make a plain file). Only the currently-targeted pair is written to.
-    for (const cam of this.cams) {
-      for (const fifo of [cam.fifo, cam.afifo]) {
-        try {
-          unlinkSync(fifo);
-        } catch {
-          /* not there */
-        }
-        execFileSync("mkfifo", [fifo]);
-      }
-    }
+    // (Re)create every camera's FIFO pair; only the currently-targeted pair is written to.
+    for (const cam of this.cams) makeFifos(cam.fifo, cam.afifo);
     this.writeTarget(0); // default target before the first placeCall
     const dataDir = `/tmp/lp_shared/`; // trailing slash: liblinphone appends the db filename
     mkdirSync(dataDir, { recursive: true });
@@ -241,8 +218,8 @@ export class VideoService {
         RECV_TARGET_FILE: TARGET_FILE, // per-call output FIFOs (line 0 = H.264, line 1 = PCM)
         RECV_DATA_DIR: dataDir,
         // Stable instance id: this single recv registers account B across respawns/camera switches;
-        // without it each restart would leave a stale binding on B (see deterministicUuid).
-        RECV_UUID: deterministicUuid(`urmet-recv:${this.sharedBUser}`),
+        // without it each restart would leave a stale binding on B (see util.stableUuid).
+        RECV_UUID: stableUuid(`urmet-recv:${this.sharedBUser}`),
         // No cam index: there's one call at a time; the handler maps these to the current slotHolder.
         RECV_HANGUP_URL: `http://127.0.0.1:${this.callPort}/hangup`,
         RECV_CONNECTED_URL: `http://127.0.0.1:${this.callPort}/connected`,
@@ -469,8 +446,8 @@ export class VideoService {
   // go2rtc's stream.sh calls /call?cam=<i> (on view) and /hangup?cam=<i> (viewer left). The shared
   // recv also calls /hangup and /connected with NO cam index -> those resolve to the current
   // slotHolder (there's only one live call).
-  private serveCallEndpoint(): Promise<void> {
-    this.server = createServer(async (req, res) => {
+  private async serveCallEndpoint(): Promise<void> {
+    const handler: ControlHandler = async (req, res) => {
       const u = new URL(req.url || "/", "http://127.0.0.1");
       const camParam = u.searchParams.get("cam");
       // No cam index (recv's pings) -> the current camera. With one, fall back to 0.
@@ -548,22 +525,10 @@ export class VideoService {
       this.serialize(() => this.placeCall(idx)).catch((e) =>
         log.error(`video call [${idx}] failed: ${(e as Error).message}`),
       );
-    });
-    // Without an 'error' handler an EADDRINUSE (e.g. a respawn race) is an unhandled 'error'
-    // event that crashes the process.
-    this.server.on("error", (e) =>
-      log.error(`call endpoint error: ${(e as Error).message}`),
-    );
-    // Ephemeral port (0): the OS picks a free one, so a fixed-port host-network clash can't happen.
-    // The chosen port is handed to recv (RECV_*_URL) and stream.sh (argv $3).
-    return new Promise<void>((resolve) => {
-      this.server!.listen(0, "127.0.0.1", () => {
-        const addr = this.server!.address();
-        this.callPort = typeof addr === "object" && addr ? addr.port : 0;
-        log.info(`control endpoint on 127.0.0.1:${this.callPort}`);
-        resolve();
-      });
-    });
+    };
+    const { server, port } = await listenControl(handler, "control endpoint");
+    this.server = server;
+    this.callPort = port;
   }
 
   /** Stop go2rtc and recv. Resolves once recv has exited (it sends the in-dialog BYE for a live

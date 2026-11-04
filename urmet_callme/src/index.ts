@@ -383,8 +383,9 @@ async function main() {
     try {
       if (!callme.sip?.alive()) {
         await callme.connect();
-      } else if (callme.sip.dueForReregister()) {
-        await callme.sip.register();
+      } else {
+        callme.sip.keepalive();
+        if (callme.sip.dueForReregister()) await callme.sip.register();
       }
       if (cfg.doorbell) await callme.maintainDoorbell();
     } catch (e) {

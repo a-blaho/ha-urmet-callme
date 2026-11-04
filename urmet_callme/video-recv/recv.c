@@ -10,15 +10,16 @@
  * registers the shared dedicated SIP account B, auto-answers the panel's INVITE, and taps the
  * received media WITHOUT decoding/re-encoding:
  *   - H.264: a custom mediastreamer "decoder" filter depacketizes (rfc3984) to Annex-B and
- *     writes the byte stream to a FIFO (RECV_H264_OUT).
+ *     writes the byte stream to a FIFO (line 0 of RECV_TARGET_FILE).
  *   - audio: a custom mediastreamer sound card writes the decoded PCM (s16le) to a FIFO
- *     (RECV_AUDIO_OUT); a single G.711 codec is forced so the PCM is deterministic 8 kHz mono.
+ *     (line 1 of RECV_TARGET_FILE); a single G.711 codec is forced so the PCM is deterministic
+ *     8 kHz mono.
  * ffmpeg (in stream.sh) reads both FIFOs and hands them to go2rtc -> HA. No MKV, no display.
  *
  * The call is placed by the control plane (src/callme.ts, from account A) via call_device_req
  * with uri_to_call/response_uri pointed at account B, so the gateway routes the panel INVITE
- * here. This program only registers + answers + taps; teardown is an idle timeout (no FIFO
- * reader for RECV_IDLE_SECONDS) plus a gateway cancel_call_req curled via RECV_HANGUP_URL.
+ * here. This program only registers + answers + taps; teardown is an in-dialog BYE, on SIGUSR1
+ * from the control plane or after an idle timeout (no FIFO reader for RECV_IDLE_SECONDS).
  *
  * Usage: recv <B-username> <B-password>   (see the env vars documented at main()).
  * Targets the liblinphone C API on Ubuntu 24.04 (liblinphone-dev + mediastreamer2-plugin-openh264).
@@ -68,7 +69,6 @@ static void rlog(const char *fmt, ...) {
 
 /* ---- H.264 tap: see h264tap.h (shared with opendoor.c). ---- */
 #define TAP_LOG rlog
-#define TAP_DEFAULT_PATH "/tmp/cam.h264"
 #include "h264tap.h"
 
 /* ---- Audio tap: liblinphone decodes the received audio (Opus/PCMU/...) to PCM; this minimal
@@ -103,8 +103,7 @@ static void awrite_init(MSFilter *f) {
   s->fd = -1;
   s->rate = 48000; /* defaults; overwritten by whatever liblinphone SETs on the card */
   s->nch = 1;
-  read_target_line(s->path, sizeof s->path, 1, "RECV_AUDIO_OUT"); /* per-call target (see tap_init) */
-  if (!s->path[0]) snprintf(s->path, sizeof s->path, "%s", "/tmp/cam_audio.pcm");
+  read_target_line(s->path, sizeof s->path, 1); /* per-call target (see tap_init) */
   f->data = s;
 }
 
@@ -120,7 +119,7 @@ static void awrite_announce(AudioTap *s) {
 static void awrite_process(MSFilter *f) {
   AudioTap *s = (AudioTap *)f->data;
   awrite_announce(s);
-  if (s->fd < 0) {
+  if (s->fd < 0 && s->path[0]) {
     /* Same O_RDWR|O_NONBLOCK trick as the H264 tap: we hold the FIFO open so writes never
      * EPIPE when ffmpeg comes and goes; a full pipe just returns EAGAIN and we drop. */
     int fd = open(s->path, O_RDWR | O_CREAT | O_NONBLOCK, 0644);
@@ -404,8 +403,6 @@ static void send_pfu_info(LinphoneCall *call) {
 static LinphoneCall *g_call = NULL; /* the active call, if any */
 static int g_audio_opened = 0;      /* 2Voice: the open-audio DTMF went out for this call */
 static volatile sig_atomic_t g_running = 1;
-static int g_max_seconds = 0;  /* RECV_SECONDS: auto-stop after this long call (0=off) */
-static time_t g_stop_at = 0;
 static int g_idle_seconds = 10; /* RECV_IDLE_SECONDS: hang up if no reader drains this long */
 static time_t g_video_deadline = 0; /* nudge for a keyframe until this time; give up if none (0=off) */
 static time_t g_last_vfu = 0;  /* last keyframe nudge, to rate-limit to ~1/s */
@@ -492,7 +489,7 @@ static void hold_fifos(int on) {
   for (int k = 0; k < 2; k++) {
     if (on && g_hold_fd[k] < 0) {
       char path[256];
-      read_target_line(path, sizeof path, k, NULL);
+      read_target_line(path, sizeof path, k);
       if (path[0]) g_hold_fd[k] = open(path, O_RDWR | O_NONBLOCK);
     } else if (!on && g_hold_fd[k] >= 0) {
       close(g_hold_fd[k]);
@@ -681,9 +678,10 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
      * the WRONG panel, the gateway/panel crossed the split-account routing (the feed-swap bug). */
     const LinphoneAddress *from = linphone_call_get_remote_address(call);
     const char *fromu = from ? linphone_address_get_username(from) : NULL;
-    const char *outfifo = getenv("RECV_H264_OUT");
+    char outfifo[256];
+    read_target_line(outfifo, sizeof outfifo, 0);
     rlog("[recv] INVITE FROM %s -> stream %s\n",
-           fromu ? fromu : "?", outfifo ? outfifo : "?");
+           fromu ? fromu : "?", outfifo[0] ? outfifo : "?");
     {
       const LinphoneCallParams *rp = linphone_call_get_remote_params(call);
       rlog("[recv] panel's audio offer: %s\n",
@@ -730,7 +728,6 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
      * it ever streams (esp. with a short RECV_IDLE_SECONDS). The idle clock starts on the first
      * actual write (tap_write, or when g_keyframe_seen fires in the main loop). */
     g_last_drain = 0;
-    if (g_max_seconds > 0) g_stop_at = time(NULL) + g_max_seconds;
     /* Open the keyframe-nudge window: the main loop sends VFU + picture_fast_update ~1/s until the
      * tap sees an IDR (needed when two cameras stream at once -- the panel doesn't reliably emit a
      * start-of-call IDR to each), or this deadline closes and we give up so go2rtc retries from a
@@ -767,7 +764,6 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
       g_redial_at_ms = now_ms() + redial_delay_ms();
       g_placed = 0;
       g_last_drain = 0;
-      g_stop_at = 0;
       g_video_deadline = 0;
       rlog("[recv] camera switch: call ended -> placing it again in %lld ms\n", redial_delay_ms());
       fflush(stdout);
@@ -789,7 +785,6 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     hold_fifos(0);
     fail_queued_tones("call ended before media"); /* the control plane falls back to opendoor */
     g_last_drain = 0;
-    g_stop_at = 0;
     g_video_deadline = 0;
     /* Tell the control plane the dialog is really over (our BYE was answered, or the panel hung
      * up). A camera SWITCH waits for this before placing the next call, like the app does (BYE ->
@@ -827,8 +822,8 @@ int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr,
             "usage: %s <B-username> <B-password>\n"
-            "  env (set by src/video.ts): RECV_H264_OUT=<fifo> (default /tmp/cam.h264), "
-            "RECV_AUDIO_OUT=<fifo> (default /tmp/cam_audio.pcm; s16le 8k mono), "
+            "  env (set by src/video.ts / src/video2voice.ts): RECV_TARGET_FILE=<file> (line 0 = the "
+            "H.264 FIFO, line 1 = the PCM FIFO; s16le 8k mono), "
             "RECV_DATA_DIR=<dir> (per-recv, MUST be unique), "
             "RECV_UUID=<uuid> (stable +sip.instance id so a restart replaces our binding), "
             "RECV_HANGUP_URL=<url> (gateway cancel on idle), "
@@ -840,13 +835,14 @@ int main(int argc, char **argv) {
             "RECV_IDLE_SECONDS=<n> (default 10), "
             "RECV_COMMANDS=1 (read door/gate tones '1'/'2' from stdin, one per line, and send them "
             "on the live call; each is answered with 'RESULT <d> ok|fail' on stdout)\n"
-            "  dev-only: RECV_SECONDS=<n> (auto-stop), RECV_DEBUG=1 (SIP trace)\n",
+            "  RECV_CALL_URI=<sip uri> (2Voice: place the auto_insertion call there instead of waiting "
+            "for an INVITE; RECV_MAC dials a phase-B station with a `mac` header), "
+            "RECV_DEBUG=1 (SIP trace)\n",
             argv[0]);
     return 2;
   }
   const char *user = argv[1];
   const char *pass = argv[2];
-  if (getenv("RECV_SECONDS")) g_max_seconds = atoi(getenv("RECV_SECONDS"));
   if (getenv("RECV_IDLE_SECONDS")) g_idle_seconds = atoi(getenv("RECV_IDLE_SECONDS"));
   { /* 2Voice: outgoing auto_insertion call target (empty -> inbound/IPERCOM mode) */
     const char *cu = getenv("RECV_CALL_URI");
@@ -1153,8 +1149,9 @@ int main(int argc, char **argv) {
     /* End the call (stay registered for the next one) only when NO reader has drained the
      * FIFO for g_idle_seconds -- i.e. the viewer is really gone, not just a go2rtc probe /
      * WebRTC reconnect blip. This is what keeps a live view from dying at the first reader
-     * gap. A SIP BYE alone won't free the door station's channel, so also ask the control
-     * plane to send the gateway cancel_call_req. */
+     * gap. The in-dialog BYE is the teardown the official app uses and it does free the
+     * station; RECV_HANGUP_URL only tells the control plane to drop its slot bookkeeping (and,
+     * for a call that never connected, to cancel the ringing request at the gateway). */
     if (g_call && g_last_drain && time(NULL) - g_last_drain >= g_idle_seconds) {
       rlog("[recv] no FIFO reader for %ds -> hanging up\n", g_idle_seconds);
       fflush(stdout);
@@ -1183,12 +1180,6 @@ int main(int argc, char **argv) {
           linphone_call_stats_unref(st);
         }
       }
-    }
-    if (g_call && g_stop_at && time(NULL) >= g_stop_at) {
-      rlog("[recv] reached RECV_SECONDS=%d -> hanging up\n", g_max_seconds);
-      fflush(stdout);
-      linphone_call_terminate(g_call);
-      g_stop_at = 0;
     }
   }
 

@@ -12,14 +12,16 @@
 # recv sees no FIFO reader for RECV_IDLE_SECONDS. That idle window is also what makes a re-open of
 # the same camera instant (the control plane reuses the still-live call, see video.ts placeCall).
 #
-#   $1 = camera index    $2 = {output} RTSP url provided by go2rtc    $3 = control port (optional)
-CAM="$1"
-OUTPUT="$2"
-FIFO="/tmp/urmet_cam_${CAM}.h264"     # per-camera video FIFO (matches recv's RECV_H264_OUT)
-AFIFO="/tmp/urmet_cam_${CAM}.pcm"     # per-camera audio FIFO  (matches recv's RECV_AUDIO_OUT)
-# Control endpoint port. The 2Voice service passes an ephemeral port as $3 (to dodge a host-network
-# clash with e.g. Zigbee2MQTT on 8099); the IPERCOM service omits it and uses the env/default.
-CALL_PORT="${3:-${CALL_PORT:-8099}}"
+#   $1 = camera index              $2 = {output} RTSP url provided by go2rtc
+#   $3 = control endpoint port     $4 = H.264 FIFO to read       $5 = PCM FIFO to read
+# All five come from the go2rtc config the control plane writes (src/go2rtc.ts, FIFO names from
+# src/util.ts camFifos), so nothing here needs to agree with a path spelled elsewhere. The control port
+# is ephemeral (a fixed 8099 clashed with Zigbee2MQTT under host networking).
+CAM="${1:?camera index}"
+OUTPUT="${2:?go2rtc output url}"
+CALL_PORT="${3:?control port}"
+FIFO="${4:?h264 fifo}"
+AFIFO="${5:?pcm fifo}"
 
 # Place the call; recv (already registered) answers and starts tapping. Synchronous so that if the
 # control plane rejects the request (`curl -f` fails) we exit BEFORE ffmpeg instead of waiting

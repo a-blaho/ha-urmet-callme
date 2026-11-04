@@ -1,7 +1,10 @@
-// MQTT bridge: publishes Home Assistant MQTT-discovery `button` entities for each
-// openable relay (door/gate of each entrance); a press pulses the door open. The strike
-// is momentary with no state feedback, so a stateless button models it (no lock state).
-import mqtt, { MqttClient } from "mqtt";
+// MQTT bridge: publishes Home Assistant MQTT-discovery entities and routes their command topics.
+//   button  one per openable relay (door/gate of each IPERCOM entrance; door + gate per 2Voice place),
+//           plus per place "ready" (2Voice pre-warm), "hang up" and "next camera" when video is on
+//   event   one doorbell per entrance/panel (device_class doorbell), firing `ring`
+//   notify  one per 2Voice place (announcements)
+// The strike is momentary with no state feedback, so a stateless button models it (no lock state).
+import mqtt, { IClientOptions, MqttClient } from "mqtt";
 import { Announcer } from "./announce.js";
 import { CallMe, Door, DoorbellRing } from "./callme.js";
 import { TwoVoiceDoor, TwoVoiceService } from "./door2voice.js";
@@ -15,22 +18,8 @@ const log = logger("mqtt");
 // positions in the panel's SIP From. Canonicalize (# and _ → #) so they compare equal.
 const canonTopo = (s: string) => (s || "").replace(/[_#]/g, "#");
 
-interface Relay {
-  uid: string;
-  doorId: number;
-  doorType: "door" | "gate";
-  placeId: string;
-  name: string;
-}
-
-// A 2Voice relay: opened via the liblinphone `opendoor` path (TwoVoiceService), keyed by place +
-// kind (no doorId - 2Voice has no residentDoors list; the OUT account IS the door).
-interface TvRelay {
-  uid: string;
-  placeId: string;
-  kind: "door" | "gate";
-  name: string;
-}
+const MODEL_IPERCOM = "CallMe / Ipercom";
+const MODEL_TWOVOICE = "CallMe / 2Voice";
 
 interface Doorbell {
   uid: string;
@@ -48,24 +37,32 @@ export interface TwoVoiceDoorbell {
   station: string; // the calling-station (OUT) username the ring's From carries
 }
 
-/** A place whose camera call the "hang up" button can end (published once video is up). */
+/** A place whose camera call the "hang up" / "next camera" buttons act on (published once video is up). */
 export interface HangupPlace {
   placeId: string;
   name: string;
   model: string; // the place device's model string, so the entity joins the place's existing device
 }
 
+/** The subset of MqttClient the bridge uses; a test substitutes a fake through `options.connect`. */
+export interface MqttLike {
+  publish(topic: string, payload: string, opts?: { retain?: boolean; qos?: 0 | 1 | 2 }): unknown;
+  publishAsync(topic: string, payload: string, opts?: { retain?: boolean; qos?: 0 | 1 | 2 }): Promise<unknown>;
+  subscribe(topic: string): unknown;
+  on(event: "connect", cb: () => void): unknown;
+  on(event: "error", cb: (e: Error) => void): unknown;
+  on(event: "message", cb: (topic: string, payload: Buffer) => void): unknown;
+  once(event: "connect", cb: () => void): unknown;
+  endAsync(): Promise<unknown>;
+}
+
+type CommandHandler = (payload: string) => void | Promise<void>;
+
 export class MqttBridge {
-  private client!: MqttClient;
-  private relays = new Map<string, Relay>(); // command_topic -> relay (IPERCOM open_door_req)
-  private tvRelays = new Map<string, TvRelay>(); // command_topic -> 2Voice relay (opendoor/DTMF)
-  private tvPrewarm = new Map<string, { placeId: string; name: string }>(); // command_topic -> place
-  private tvAnnounce = new Map<string, { placeId: string; name: string }>(); // command_topic -> place
-  private hangups = new Map<string, HangupPlace>(); // command_topic -> place whose call to end
-  private onHangup?: (placeId: string) => Promise<boolean>;
-  private nextCams = new Map<string, HangupPlace>(); // command_topic -> 2Voice place to switch
-  private onNextCamera?: (placeId: string) => Promise<boolean>;
+  private client!: MqttLike;
+  private handlers = new Map<string, CommandHandler>(); // command_topic -> what a message there does
   private doorbells: Doorbell[] = [];
+  private counts = { relays: 0, tvRelays: 0 };
   private availTopic = "urmet/callme/availability";
   private prefix: string; // HA MQTT-discovery topic prefix (default "homeassistant")
 
@@ -75,6 +72,8 @@ export class MqttBridge {
       username?: string;
       password?: string;
       discoveryPrefix?: string;
+      /** Test seam: builds the client. Defaults to mqtt.connect. */
+      connect?: (url: string, opts: IClientOptions) => MqttLike;
     },
     private callme: CallMe,
     private twoVoice?: TwoVoiceService, // present when 2Voice places are detected
@@ -88,7 +87,8 @@ export class MqttBridge {
     twoVoiceDoors: TwoVoiceDoor[] = [],
     twoVoiceDoorbells: TwoVoiceDoorbell[] = [],
   ) {
-    this.client = mqtt.connect(this.url, {
+    const connect = this.options.connect ?? ((u, o) => mqtt.connect(u, o) as unknown as MqttClient);
+    this.client = connect(this.url, {
       username: this.options.username,
       password: this.options.password,
       will: {
@@ -108,14 +108,14 @@ export class MqttBridge {
     // whole add-on and take every entity offline.
     this.client.on("error", (e) => log.error(`MQTT error: ${e.message}`));
     await new Promise<void>((res) => this.client.once("connect", () => res()));
-    this.client.on("message", (t, p) => this.onCommand(t, p.toString()));
+    this.client.on("message", (t, p) => void this.onCommand(t, p.toString()));
     this.clearStaleDiscovery(doors);
-    this.publishDiscovery(doors);
-    this.publishTwoVoice(twoVoiceDoors);
+    this.publishDoors(doors);
+    this.publishTwoVoiceDoors(twoVoiceDoors);
     this.publishDoorbells(doors);
     this.publishTwoVoiceDoorbells(twoVoiceDoorbells);
     log.info(
-      `connected to broker; published ${this.relays.size} IPERCOM + ${this.tvRelays.size} 2Voice ` +
+      `connected to broker; published ${this.counts.relays} IPERCOM + ${this.counts.tvRelays} 2Voice ` +
         `button entities, ${this.doorbells.length} doorbell(s)`,
     );
   }
@@ -149,7 +149,7 @@ export class MqttBridge {
     }
   }
 
-  private deviceFor(placeId: string, name: string, model = "CallMe / Ipercom") {
+  private deviceFor(placeId: string, name: string, model = MODEL_IPERCOM) {
     return {
       identifiers: [`urmet_${sanitize(placeId)}`],
       name: `Urmet ${name}`,
@@ -158,94 +158,132 @@ export class MqttBridge {
     };
   }
 
-  /** One `button` per 2Voice place (Phase 1: door only). A press runs the liblinphone `opendoor`
-   *  path (register the channel account -> auto_insertion call -> DTMF) via TwoVoiceService. */
-  private publishTwoVoice(doors: TwoVoiceDoor[]) {
-    for (const d of doors) {
-      const uid = sanitize(`urmet_${d.placeId}_2voice_${d.kind}`);
+  /** Publish one discovery config (retained) and, for a commandable entity, subscribe its command
+   *  topic and remember what a message there does. `uid` is the unique_id and names both topics, so
+   *  the ids older builds published stay stable. */
+  private publishEntity(
+    component: "button" | "event" | "notify",
+    uid: string,
+    cfg: Record<string, unknown>,
+    handler?: CommandHandler,
+  ): void {
+    const full: Record<string, unknown> = {
+      ...cfg,
+      unique_id: uid,
+      availability_topic: this.availTopic,
+    };
+    if (handler) {
       const cmd = `urmet/callme/${uid}/set`;
-      this.tvRelays.set(cmd, {
-        uid,
-        placeId: d.placeId,
-        kind: d.kind,
-        name: `${d.name} ${d.kind}`,
-      });
-      const cfg = {
-        name: `${d.name} ${d.kind}`,
-        unique_id: uid,
-        command_topic: cmd,
-        payload_press: "OPEN",
-        icon: d.kind === "gate" ? "mdi:door-sliding" : "mdi:door",
-        availability_topic: this.availTopic,
-        device: this.deviceFor(d.placeId, d.name, "CallMe / 2Voice"),
-      };
-      this.client.publish(
-        `${this.prefix}/button/${uid}/config`,
-        JSON.stringify(cfg),
-        { retain: true },
-      );
+      full.command_topic = cmd;
+      this.handlers.set(cmd, handler);
       this.client.subscribe(cmd);
     }
-    this.publishTwoVoicePrewarm(doors);
-    this.publishTwoVoiceAnnounce(doors);
+    this.client.publish(`${this.prefix}/${component}/${uid}/config`, JSON.stringify(full), {
+      retain: true,
+    });
   }
 
-  /** One `button` per 2Voice place that PRE-WARMS the call (opens the auto_insertion call without a
-   *  tone) so a following door/gate press is instant. This mirrors placing the call when the station
-   *  is picked, a step before the unlock button. Users trigger it from any automation (e.g.
-   *  doorbell ring -> press ready, or dashboard-open -> press ready). One per place, not per kind. */
-  private publishTwoVoicePrewarm(doors: TwoVoiceDoor[]) {
-    const seen = new Set<string>();
-    for (const d of doors) {
-      if (seen.has(d.placeId)) continue;
-      seen.add(d.placeId);
-      const uid = sanitize(`urmet_${d.placeId}_2voice_prewarm`);
-      const cmd = `urmet/callme/${uid}/set`;
-      this.tvPrewarm.set(cmd, { placeId: d.placeId, name: d.name });
-      const cfg = {
-        name: `${d.name} ready`,
-        unique_id: uid,
-        command_topic: cmd,
-        payload_press: "WARM",
-        icon: "mdi:phone-outgoing",
-        availability_topic: this.availTopic,
-        device: this.deviceFor(d.placeId, d.name, "CallMe / 2Voice"),
-      };
-      this.client.publish(
-        `${this.prefix}/button/${uid}/config`,
-        JSON.stringify(cfg),
-        { retain: true },
-      );
-      this.client.subscribe(cmd);
+  /** Run a press/command handler, logging the outcome in the entity's terms; never throws. */
+  private async run(what: string, fn: () => void | Promise<void>, ok: string): Promise<void> {
+    try {
+      await fn();
+      log.info(`${what}: ${ok}`);
+    } catch (e) {
+      log.error(`${what} FAILED:`, (e as Error).message);
     }
   }
 
-  /** One `notify` entity per 2Voice place that plays an announcement out of the door station
-   *  (announce.ts): `notify.send_message` with text speaks it through a Home Assistant TTS engine, an
-   *  http(s) URL of an audio file plays the file. Published only with an Announcer (2Voice). */
-  private publishTwoVoiceAnnounce(doors: TwoVoiceDoor[]) {
-    if (!this.announcer) return;
-    const seen = new Set<string>();
+  /** One `button` entity PER openable relay (door/gate) of an IPERCOM entrance. The relay is a
+   *  momentary door strike with no state feedback, so a stateless button (press = open pulse)
+   *  models it honestly - no fabricated locked/unlocked state. */
+  private publishDoors(doors: Door[]) {
     for (const d of doors) {
-      if (seen.has(d.placeId)) continue;
-      seen.add(d.placeId);
-      const uid = sanitize(`urmet_${d.placeId}_2voice_announce`);
-      const cmd = `urmet/callme/${uid}/set`;
-      this.tvAnnounce.set(cmd, { placeId: d.placeId, name: d.name });
-      const cfg = {
-        name: `${d.name} announce`,
-        unique_id: uid,
-        command_topic: cmd,
-        icon: "mdi:bullhorn",
-        availability_topic: this.availTopic,
-        device: this.deviceFor(d.placeId, d.name, "CallMe / 2Voice"),
-      };
-      this.client.publish(
-        `${this.prefix}/notify/${uid}/config`,
-        JSON.stringify(cfg),
-        { retain: true },
+      const relays: Array<"door" | "gate"> = [];
+      if (d.hasDoor) relays.push("door");
+      if (d.hasGate) relays.push("gate");
+      for (const type of relays) {
+        const name = `${d.name} ${type}`;
+        this.counts.relays++;
+        this.publishEntity(
+          "button",
+          sanitize(`urmet_${d.placeId}_${d.doorId}_${type}`),
+          {
+            name,
+            payload_press: "OPEN",
+            icon: type === "gate" ? "mdi:door-sliding" : "mdi:door",
+            device: this.deviceFor(d.placeId, d.name),
+          },
+          (payload) => {
+            log.info(`press ${payload} for ${name}`);
+            return this.run(
+              `open ${name} (door_id=${d.doorId})`,
+              () => this.callme.open(d.doorId, type, d.placeId),
+              "OK",
+            );
+          },
+        );
+      }
+    }
+  }
+
+  /** Per 2Voice place: a door and a gate `button` (press -> the liblinphone `opendoor` path: a silent
+   *  auto_insertion call + in-call tone), a "ready" button that pre-warms that call, and a `notify`
+   *  entity for announcements. */
+  private publishTwoVoiceDoors(doors: TwoVoiceDoor[]) {
+    const tv = this.twoVoice;
+    if (!tv) return;
+    const places = new Map<string, string>(); // placeId -> name (one ready/announce per place)
+    for (const d of doors) {
+      places.set(d.placeId, d.name);
+      const name = `${d.name} ${d.kind}`;
+      this.counts.tvRelays++;
+      this.publishEntity(
+        "button",
+        sanitize(`urmet_${d.placeId}_2voice_${d.kind}`),
+        {
+          name,
+          payload_press: "OPEN",
+          icon: d.kind === "gate" ? "mdi:door-sliding" : "mdi:door",
+          device: this.deviceFor(d.placeId, d.name, MODEL_TWOVOICE),
+        },
+        (payload) => {
+          log.info(`press ${payload} for ${name} (2Voice)`);
+          return this.run(`open ${name} (2Voice)`, () => tv.open(d.placeId, d.kind), "OK");
+        },
       );
-      this.client.subscribe(cmd);
+    }
+    for (const [placeId, name] of places) {
+      // Pre-warm: open the auto_insertion call NOW with no tone so a following door/gate press rides
+      // an already-established call (instant). Mirrors placing the call when the station is picked, a
+      // step before the unlock button. Fire-and-forget; the helper releases the bus on its own.
+      this.publishEntity(
+        "button",
+        sanitize(`urmet_${placeId}_2voice_prewarm`),
+        {
+          name: `${name} ready`,
+          payload_press: "WARM",
+          icon: "mdi:phone-outgoing",
+          device: this.deviceFor(placeId, name, MODEL_TWOVOICE),
+        },
+        (payload) => {
+          log.info(`pre-warm ${payload} for ${name} (2Voice)`);
+          tv.prewarm(placeId);
+        },
+      );
+      // Announcements: `notify.send_message` with text speaks it through a Home Assistant TTS engine, an
+      // http(s) URL of an audio file plays the file (announce.ts logs its own progress and outcome).
+      const announcer = this.announcer;
+      if (announcer)
+        this.publishEntity(
+          "notify",
+          sanitize(`urmet_${placeId}_2voice_announce`),
+          {
+            name: `${name} announce`,
+            icon: "mdi:bullhorn",
+            device: this.deviceFor(placeId, name, MODEL_TWOVOICE),
+          },
+          (payload) => void announcer.announce(placeId, payload),
+        );
     }
   }
 
@@ -254,26 +292,27 @@ export class MqttBridge {
    *  call at once instead of waiting for the reader-idle window; `handler` resolves whether a call
    *  was up. */
   publishHangup(places: HangupPlace[], handler: (placeId: string) => Promise<boolean>) {
-    this.onHangup = handler;
     for (const p of places) {
-      const uid = sanitize(`urmet_${p.placeId}_hangup`);
-      const cmd = `urmet/callme/${uid}/set`;
-      this.hangups.set(cmd, p);
-      const cfg = {
-        name: `${p.name} hang up`,
-        unique_id: uid,
-        command_topic: cmd,
-        payload_press: "HANGUP",
-        icon: "mdi:phone-hangup",
-        availability_topic: this.availTopic,
-        device: this.deviceFor(p.placeId, p.name, p.model),
-      };
-      this.client.publish(
-        `${this.prefix}/button/${uid}/config`,
-        JSON.stringify(cfg),
-        { retain: true },
+      const name = `${p.name} hang up`;
+      this.publishEntity(
+        "button",
+        sanitize(`urmet_${p.placeId}_hangup`),
+        {
+          name,
+          payload_press: "HANGUP",
+          icon: "mdi:phone-hangup",
+          device: this.deviceFor(p.placeId, p.name, p.model),
+        },
+        async (payload) => {
+          log.info(`press ${payload} for ${name}`);
+          try {
+            const ended = await handler(p.placeId);
+            log.info(`hang up ${p.name}: ${ended ? "call ended" : "no camera call was up"}`);
+          } catch (e) {
+            log.error(`hang up ${p.name} FAILED:`, (e as Error).message);
+          }
+        },
       );
-      this.client.subscribe(cmd);
     }
     log.info(`published ${places.length} hang-up button(s)`);
   }
@@ -283,88 +322,75 @@ export class MqttBridge {
    *  panel (TwoVoiceVideoService.nextCamera), and the door/gate buttons then open the panel being
    *  shown. `handler` resolves whether the switch went through. */
   publishNextCamera(places: HangupPlace[], handler: (placeId: string) => Promise<boolean>) {
-    this.onNextCamera = handler;
     for (const p of places) {
-      const uid = sanitize(`urmet_${p.placeId}_next_camera`);
-      const cmd = `urmet/callme/${uid}/set`;
-      this.nextCams.set(cmd, p);
-      const cfg = {
-        name: `${p.name} next camera`,
-        unique_id: uid,
-        command_topic: cmd,
-        payload_press: "NEXT",
-        icon: "mdi:camera-switch",
-        availability_topic: this.availTopic,
-        device: this.deviceFor(p.placeId, p.name, p.model),
-      };
-      this.client.publish(
-        `${this.prefix}/button/${uid}/config`,
-        JSON.stringify(cfg),
-        { retain: true },
+      const name = `${p.name} next camera`;
+      this.publishEntity(
+        "button",
+        sanitize(`urmet_${p.placeId}_next_camera`),
+        {
+          name,
+          payload_press: "NEXT",
+          icon: "mdi:camera-switch",
+          device: this.deviceFor(p.placeId, p.name, p.model),
+        },
+        async (payload) => {
+          log.info(`press ${payload} for ${name}`);
+          try {
+            const switched = await handler(p.placeId);
+            log.info(
+              `next camera ${p.name}: ${switched ? "switched" : "not switched (no camera call up, or the switch did not go out)"}`,
+            );
+          } catch (e) {
+            log.error(`next camera ${p.name} FAILED:`, (e as Error).message);
+          }
+        },
       );
-      this.client.subscribe(cmd);
     }
     log.info(`published ${places.length} next-camera button(s)`);
   }
 
-  /** One doorbell `event` entity per 2Voice place. The ring arrives on the channel account carrying
-   *  the calling-station (OUT) username in its From, so we key the match on that. Pushed into the
-   *  same `doorbells` list so `ringDoorbell` routes to it. Independent of 2Voice door-open - the ring
-   *  works regardless of unlock (only `doorbell` gates the ring itself, via startDoorbell). */
-  private publishTwoVoiceDoorbells(places: TwoVoiceDoorbell[]) {
-    for (const p of places) {
-      const uid = sanitize(`urmet_${p.placeId}_2voice_doorbell`);
-      this.doorbells.push({
-        uid,
-        placeId: p.placeId,
-        topologyCanon: canonTopo(p.station),
-        name: `${p.name} doorbell`,
-      });
-      const cfg = {
-        name: `${p.name} doorbell`,
-        unique_id: uid,
-        state_topic: `urmet/callme/${uid}/event`,
-        event_types: ["ring"],
-        device_class: "doorbell",
-        availability_topic: this.availTopic,
-        device: this.deviceFor(p.placeId, p.name, "CallMe / 2Voice"),
-      };
-      this.client.publish(
-        `${this.prefix}/event/${uid}/config`,
-        JSON.stringify(cfg),
-        { retain: true },
-      );
-    }
+  private publishDoorbell(
+    uid: string,
+    placeId: string,
+    placeName: string,
+    topology: string,
+    model?: string,
+  ) {
+    const name = `${placeName} doorbell`;
+    this.doorbells.push({ uid, placeId, topologyCanon: canonTopo(topology), name });
+    this.publishEntity("event", uid, {
+      name,
+      state_topic: `urmet/callme/${uid}/event`,
+      event_types: ["ring"],
+      device_class: "doorbell",
+      device: this.deviceFor(placeId, placeName, model),
+    });
   }
 
   /** One doorbell `event` entity (device_class doorbell) PER door/panel, keyed by
    *  topological code so a ring routes to the exact entrance. */
   private publishDoorbells(doors: Door[]) {
-    for (const d of doors) {
-      const uid = sanitize(`urmet_${d.placeId}_${d.doorId}_doorbell`);
-      this.doorbells.push({
-        uid,
-        placeId: d.placeId,
-        topologyCanon: canonTopo(d.topology),
-        name: `${d.name} doorbell`,
-      });
-      const cfg = {
-        name: `${d.name} doorbell`,
-        unique_id: uid,
-        state_topic: `urmet/callme/${uid}/event`,
-        event_types: ["ring"],
-        device_class: "doorbell",
-        availability_topic: this.availTopic,
-        device: this.deviceFor(d.placeId, d.name),
-      };
-      this.client.publish(
-        `${this.prefix}/event/${uid}/config`,
-        JSON.stringify(cfg),
-        {
-          retain: true,
-        },
+    for (const d of doors)
+      this.publishDoorbell(
+        sanitize(`urmet_${d.placeId}_${d.doorId}_doorbell`),
+        d.placeId,
+        d.name,
+        d.topology,
       );
-    }
+  }
+
+  /** One doorbell `event` entity per 2Voice place. The ring arrives on the channel account carrying
+   *  the calling-station (OUT) username in its From, so we key the match on that. Independent of 2Voice
+   *  door-open - the ring works regardless of unlock (only `doorbell` gates the ring itself). */
+  private publishTwoVoiceDoorbells(places: TwoVoiceDoorbell[]) {
+    for (const p of places)
+      this.publishDoorbell(
+        sanitize(`urmet_${p.placeId}_2voice_doorbell`),
+        p.placeId,
+        p.name,
+        p.station,
+        MODEL_TWOVOICE,
+      );
   }
 
   /** Fire a `ring` event on the ringing door's entity. Matches the panel's topological code
@@ -395,105 +421,10 @@ export class MqttBridge {
       );
   }
 
-  /** One `button` entity PER openable relay (door/gate). The relay is a momentary door
-   *  strike with no state feedback, so a stateless button (press = open pulse) models it
-   *  honestly - no fabricated locked/unlocked state. */
-  private publishDiscovery(doors: Door[]) {
-    for (const d of doors) {
-      const relays: Array<"door" | "gate"> = [];
-      if (d.hasDoor) relays.push("door");
-      if (d.hasGate) relays.push("gate");
-      for (const type of relays) {
-        const uid = sanitize(`urmet_${d.placeId}_${d.doorId}_${type}`);
-        const cmd = `urmet/callme/${uid}/set`;
-        this.relays.set(cmd, {
-          uid,
-          doorId: d.doorId,
-          doorType: type,
-          placeId: d.placeId,
-          name: `${d.name} ${type}`,
-        });
-        const cfg = {
-          name: `${d.name} ${type}`,
-          unique_id: uid,
-          command_topic: cmd,
-          payload_press: "OPEN",
-          icon: type === "gate" ? "mdi:door-sliding" : "mdi:door",
-          availability_topic: this.availTopic,
-          device: this.deviceFor(d.placeId, d.name),
-        };
-        this.client.publish(
-          `${this.prefix}/button/${uid}/config`,
-          JSON.stringify(cfg),
-          { retain: true },
-        );
-        this.client.subscribe(cmd);
-      }
-    }
-  }
-
-  /** A press on any relay's command topic pulses that door open. No state to track -
-   *  the strike is momentary and gives no feedback; success/failure is logged only. */
+  /** A message on a command topic runs that entity's handler. Unknown topics are ignored. */
   private async onCommand(topic: string, payload: string) {
-    const relay = this.relays.get(topic);
-    if (relay) {
-      log.info(`press ${payload} for ${relay.name}`);
-      try {
-        await this.callme.open(relay.doorId, relay.doorType, relay.placeId);
-        log.info(`open ${relay.name} (door_id=${relay.doorId}) OK`);
-      } catch (e) {
-        log.error(
-          `open ${relay.name} (door_id=${relay.doorId}) FAILED:`,
-          (e as Error).message,
-        );
-      }
-      return;
-    }
-    const tv = this.tvRelays.get(topic);
-    if (tv && this.twoVoice) {
-      log.info(`press ${payload} for ${tv.name} (2Voice)`);
-      try {
-        await this.twoVoice.open(tv.placeId, tv.kind);
-        log.info(`open ${tv.name} (2Voice) OK`);
-      } catch (e) {
-        log.error(`open ${tv.name} (2Voice) FAILED:`, (e as Error).message);
-      }
-      return;
-    }
-    const warm = this.tvPrewarm.get(topic);
-    if (warm && this.twoVoice) {
-      log.info(`pre-warm ${payload} for ${warm.name} (2Voice)`);
-      this.twoVoice.prewarm(warm.placeId); // fire-and-forget: opens the call, no tone
-      return;
-    }
-    const ann = this.tvAnnounce.get(topic);
-    if (ann && this.announcer) {
-      void this.announcer.announce(ann.placeId, payload); // logs its own progress and outcome
-      return;
-    }
-    const hang = this.hangups.get(topic);
-    if (hang && this.onHangup) {
-      log.info(`press ${payload} for ${hang.name} hang up`);
-      try {
-        const ended = await this.onHangup(hang.placeId);
-        log.info(`hang up ${hang.name}: ${ended ? "call ended" : "no camera call was up"}`);
-      } catch (e) {
-        log.error(`hang up ${hang.name} FAILED:`, (e as Error).message);
-      }
-      return;
-    }
-    const next = this.nextCams.get(topic);
-    if (next && this.onNextCamera) {
-      log.info(`press ${payload} for ${next.name} next camera`);
-      try {
-        const switched = await this.onNextCamera(next.placeId);
-        log.info(
-          `next camera ${next.name}: ${switched ? "switched" : "not switched (no camera call up, or the switch did not go out)"}`,
-        );
-      } catch (e) {
-        log.error(`next camera ${next.name} FAILED:`, (e as Error).message);
-      }
-    }
+    const handler = this.handlers.get(topic);
+    if (handler) await handler(payload);
   }
 
   /** Mark the entities unavailable and disconnect. AWAITED: the retained "offline" must be acked

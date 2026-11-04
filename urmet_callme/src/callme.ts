@@ -81,14 +81,15 @@ export interface AvailableDevice {
 }
 
 export class Place {
-  channel: number;
-  incomingUser: string; // INCOMING/channel account username (doorbell calls arrive here)
-  incomingPw: string; // token password / INCOMING credentials ("" when absent)
-  outgoingUser: string; // gateway-query target (OUTGOING)
-  outgoingPw: string; // OUTGOING account password ("" when absent; needed for the 2Voice path)
+  // The account fields are (re)assigned by update(), hence the definite-assignment marks.
+  channel!: number;
+  incomingUser!: string; // INCOMING/channel account username (doorbell calls arrive here)
+  incomingPw!: string; // token password / INCOMING credentials ("" when absent)
+  outgoingUser!: string; // gateway-query target (OUTGOING)
+  outgoingPw!: string; // OUTGOING account password ("" when absent; needed for the 2Voice path)
   id: string;
-  name: string;
-  uidType: string; // raw device model code from get_my_devices ("1060" = IPERCOM, "1760/16" = 2Voice)
+  name!: string;
+  uidType!: string; // raw device model code from get_my_devices ("1060" = IPERCOM, "1760/16" = 2Voice)
   // Set when the family can't be read from uid_type - i.e. on the place synthesized from the
   // instance account, where the cloud described no device at all (see CallMe.instancePlace).
   familyOverride?: Family;
@@ -99,6 +100,16 @@ export class Place {
     d: PlaceData,
     public realm: string,
   ) {
+    this.id = `${d.device_uid || d.Mac_Address}-${d.channel_number}`;
+    this.update(d);
+  }
+
+  /** Refresh the account data from a (re)fetched get_my_devices entry. The services that drive the
+   *  helpers (door2voice, video2voice, announce) hold Place objects by reference, so a reconnect must
+   *  update the existing object rather than replace it, or rotated channel credentials never reach
+   *  them until a restart (see CallMe.connect). The id is derived from the same entry and never
+   *  changes, so it is set once in the constructor. */
+  update(d: PlaceData): void {
     this.channel = parseInt(d.channel_number, 10);
     this.incomingUser = d.channel_id || "";
     // "*" is the cloud's "no account here" placeholder - treat it as absent, not a password.
@@ -112,7 +123,6 @@ export class Place {
     // Display name precedence: relation_name -> device_name -> "APT-<channel>".
     this.name = d.relation_name || d.device_name || `APT-${d.channel_number}`;
     this.uidType = d.uid_type || "";
-    this.id = `${d.device_uid || d.Mac_Address}-${d.channel_number}`;
   }
   get outgoingUri() {
     return `sip:${this.outgoingUser}@${this.realm}`;
@@ -172,7 +182,24 @@ export class CallMe {
     );
     const data = await cloud.getMyDevices();
     if (data.length) {
-      this.places = data.map((d) => new Place(d, this.realm));
+      // Update the places IN PLACE, keyed by id: on a reconnect the 2Voice/video/announce services
+      // still hold the Place objects handed out at startup, so a fresh array would leave them with
+      // stale credentials (Place.update). Places the cloud no longer lists are dropped with a warning.
+      const next: Place[] = [];
+      for (const d of data) {
+        const fresh = new Place(d, this.realm);
+        const existing = this.places.find((p) => p.id === fresh.id);
+        if (existing) {
+          existing.update(d);
+          next.push(existing);
+        } else next.push(fresh);
+      }
+      const gone = this.places.filter((p) => !next.includes(p));
+      if (gone.length)
+        log.warn(
+          `get_my_devices no longer lists place(s) ${gone.map((p) => p.id).join(", ")}; their entities stay until a restart`,
+        );
+      this.places = next;
     } else {
       // Phase-B CallMe devices (1083/58A family) are not listed by the cloud. The 2Voice door-open
       // path only needs this account plus the station URI, which comes from the SIP registration
@@ -438,12 +465,16 @@ export class CallMe {
           log.error(`doorbell handler error: ${(e as Error).message}`);
         }
       };
+      // Recorded BEFORE the first attempt: a listener whose first connect/REGISTER fails (cloud or
+      // registrar hiccup at startup) is then retried by maintainDoorbell instead of being lost until
+      // the next add-on restart.
+      this.doorbellClients.push({ sip, place });
       try {
         await sip.connect();
         const st = await sip.register();
         if (st !== 200) {
           log.warn(
-            `doorbell listener register failed for ${place.incomingUser} (${st})`,
+            `doorbell listener register failed for ${place.incomingUser} (${st}); retrying on the next maintenance tick`,
           );
           sip.close();
           continue;
@@ -451,10 +482,9 @@ export class CallMe {
         log.info(
           `doorbell listener registered as ${place.incomingUser} (place ${place.id})`,
         );
-        this.doorbellClients.push({ sip, place });
       } catch (e) {
         log.warn(
-          `doorbell listener setup failed for place ${place.id}: ${(e as Error).message}`,
+          `doorbell listener setup failed for place ${place.id}: ${(e as Error).message}; retrying on the next maintenance tick`,
         );
       }
     }
@@ -463,16 +493,20 @@ export class CallMe {
   /** Keepalive / re-register the doorbell listeners; call from the maintenance loop. Each listener
    *  refreshes on its OWN granted expiry (dueForReregister), so a capped lifetime can't lapse it. */
   async maintainDoorbell(): Promise<void> {
-    for (const { sip } of this.doorbellClients) {
+    for (const { sip, place } of this.doorbellClients) {
       try {
         if (!sip.alive()) {
           await sip.connect();
-          await sip.register();
-        } else if (sip.dueForReregister()) {
-          await sip.register();
+          const st = await sip.register();
+          if (st === 200)
+            log.info(`doorbell listener re-registered as ${place.incomingUser} (place ${place.id})`);
+          else log.warn(`doorbell listener register failed for ${place.incomingUser} (${st})`);
+        } else {
+          sip.keepalive();
+          if (sip.dueForReregister()) await sip.register();
         }
-      } catch {
-        /* retry next tick */
+      } catch (e) {
+        log.debug(`doorbell listener ${place.id}: ${(e as Error).message}; retry next tick`);
       }
     }
   }
