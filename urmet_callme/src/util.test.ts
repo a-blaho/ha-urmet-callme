@@ -35,7 +35,7 @@ test("stableUuid seeds used on the wire are pinned", () => {
     stableUuid("urmet-opendoor:user:place1"),
     "06a3a7f5-2773-e405-7224-d551a6e52c24",
   );
-  // The recv seeds (video.ts: the shared account B; video2voice.ts: channel account + place) used to
+  // The recv seeds (video.ts: the shared account B; the former video2voice.ts: channel account + place) used to
   // go through a duplicate of this function in video.ts; same recipe, so the same bindings.
   assert.equal(stableUuid("urmet-recv:userB"), "f86eb632-e31d-57c9-b963-5270befc26cb");
   assert.equal(stableUuid("urmet-recv:user:place1"), "0bf72356-9f74-9992-222f-807a54ae0dd3");

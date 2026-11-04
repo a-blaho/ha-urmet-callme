@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { CallMe, Door } from "./callme.js";
-import type { TwoVoiceService } from "./door2voice.js";
 import { MqttBridge, MqttLike } from "./mqtt.js";
+import type { TwoVoiceStation } from "./twoVoiceStation.js";
 
 /** An in-memory broker-less client: records publishes/subscriptions, lets the test inject messages. */
 class FakeMqtt implements MqttLike {
@@ -47,7 +47,7 @@ function bridge(fake: FakeMqtt, tv?: object) {
     places: [{ id: "dev-1" }],
     open: async (...args: unknown[]) => void opened.push(args),
   } as unknown as CallMe;
-  const b = new MqttBridge("mqtt://fake", { connect: () => fake }, callme, tv as TwoVoiceService);
+  const b = new MqttBridge("mqtt://fake", { connect: () => fake }, callme, tv as TwoVoiceStation);
   return { b, opened };
 }
 

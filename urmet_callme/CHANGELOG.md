@@ -22,6 +22,15 @@
   without a spurious `socket error` line every 25 s first.
 - The add-on's own SIP client now presents the official app's User-Agent, as the media helpers already
   did.
+- **2Voice: one helper per station.** The door opener (`opendoor`) and the camera receiver's 2Voice
+  mode (`recv`) are merged into one `station` process per 2Voice place, which owns the single call to
+  the station: door and gate tones, "ready", announcements, the held doorbell ring and the camera all
+  ride that one call. Before, two processes registered the same channel account and had to hand the
+  call back and forth (release before a camera call, tone on whichever held it). Visible effects: one
+  SIP binding per place instead of two; opening the camera while a door call is up re-uses that call
+  instead of hanging it up and placing another (instant picture); a viewer coming back within the
+  keep-alive rides the still-open call. Log lines are now tagged `[station]` instead of `[opendoor]`
+  and `[recv]`/`[video2v]`. Needs confirmation on a 2Voice station (the maintainer has only Ipercom).
 - Cleanup, no behaviour change: the `opendoor` helper's single-shot and no-keep-alive modes are gone
   (`door_open_2voice_keepalive: 0` still means a fresh call per press; the call is held half a second
   for the tone to land), `recv`'s dev-only knobs are gone, the FIFO paths and the helper command

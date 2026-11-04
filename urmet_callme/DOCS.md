@@ -168,11 +168,11 @@ helper is holding (a "… ready" pre-warm, or the short keep-alive after an unlo
 nothing while the camera is up - the call is already there. This mirrors the app's behaviour and is
 confirmed on a cloud-listed 2Voice station: the gate opened and the video continued uninterrupted. If
 a press during a preview does not open the door on yours, please open an issue with a
-`log_level: debug` log (the `[recv] DTMF … sent on the camera call` line shows the tone going out).
+`log_level: debug` log (the `[station] sent DTMF …` line shows the tone going out).
 
 **Experimental / what to check:** the call is _meant_ to be silent (it should open the door without
 ringing your indoor monitor). If you test this, watch that your monitor stays quiet. Set
-`log_level: debug` and the add-on log shows each step (`[opendoor] …`) for troubleshooting.
+`log_level: debug` and the add-on log shows each step (`[station] …`) for troubleshooting.
 
 ### Announcements (2Voice, experimental)
 
@@ -251,19 +251,18 @@ Everything is logged to the add-on log, timestamped and tagged by component
 Announcements are logged step by step at `info`, numbered (`[announce] #3 …`) so one can be followed
 through the log:
 
-- `[announce]`: the request, the TTS engine and rendered clip (or the URL), which call carries it
-  (camera call or door helper), what ffmpeg found in the source (`source: Stream #0:0: Audio: …`),
-  when the call started taking the audio, and a closing `done` / `FAILED` line with the reason.
-- `[opendoor] announce: …`: the door helper's side - placing or reusing the call, `audio (media up): PCMU/8000, our direction sendrecv, station offered …`
-  (we can only be heard when our direction allows sending), the open-audio tone, and the audio RTP
-  packets sent after each clip.
-- `[opendoor] ring: …`: a doorbell ring the door helper holds unanswered, and whether an announcement
-  or door press during it answered it. `[opendoor] camera: …` / `[video2v] … showing the ring call`:
-  the camera showing the ring call during it.
-- `[opendoor] talk-out: …` / `[atap] talk-out: …` (camera call): when the clip reached the call, a level
-  line per second while it plays, and a summary - audio length, peak level, clipping, and dropouts
-  (gaps where the source was slower than real time) - with a plain-language warning when the clip is
-  very quiet, clips, or stutters.
+- `[announce]`: the request, the TTS engine and rendered clip (or the URL), what ffmpeg found in the
+  source (`source: Stream #0:0: Audio: …`), when the call started taking the audio, and a closing
+  `done` / `FAILED` line with the reason.
+- `[station] announce: …`: the station helper's side - placing or reusing the call, `audio (media up):
+  PCMU/8000, our direction sendrecv, station offered …` (we can only be heard when our direction allows
+  sending), the open-audio tone, and the audio RTP packets sent after each clip.
+- `[station] ring: …`: a doorbell ring the helper holds unanswered, and whether an announcement or door
+  press during it answered it. `[station] camera: …`: the camera showing the ring call, the call
+  already up, or a camera call placed for it.
+- `[atap] talk-out: …`: when the clip reached the call, a level line per second while it plays, and a
+  summary - audio length, peak level, clipping, and dropouts (gaps where the source was slower than
+  real time) - with a plain-language warning when the clip is very quiet, clips, or stutters.
 
 Passwords/tokens are redacted.
 

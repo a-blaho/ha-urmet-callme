@@ -129,9 +129,14 @@ line parser), tests for `SipClient` (fake socket: REGISTER/407/census, MESSAGE c
 ring/CANCEL), the helper protocol and the MQTT bridge, and this repo's `CLAUDE.md`. Not yet verified
 on the Green.
 
-**Phase 2, protocol-neutral merge:** the `station` helper (opendoor + recv-outgoing) and
-`TwoVoiceStation` service; shared `lpcommon.h` for core setup; machine-line protocol. Verify on the
-Green with the dev-testing checks from memory (stop the store add-on, grep a marker in the log).
+**Phase 2, protocol-neutral merge — DONE on `refactor/phase-1` (2026-11-04):** `video-recv/station.c`
+(opendoor.c + recv.c's outgoing mode: one process per 2Voice place owns the station call; door, camera,
+ring, announcements, next camera on it), `recv.c` slimmed to the Ipercom receiver, `lpcommon.h` (core
+setup, PCM tap card, silence/talk source, keyframe INFO), `src/twoVoiceStation.ts` replacing
+`door2voice.ts` + `video2voice.ts`, the eight cross-callbacks in `index.ts` gone, `announce.ts`
+simplified (no camera take-over replay). The helper line protocol is unchanged apart from the added
+`CAMERA live` line. Compiled in Docker; **not verified on hardware** (no 2Voice station available to
+the maintainer): the first 2Voice user report after release is the test.
 
 **Phase 3, behaviour (Uin decompiled; see `PROTOCOL-UIN.md` in the sibling repo):** 120 s call cap,
 channel `flags`, UA constant; then two hardware-gated experiments on a 1760: the call-less

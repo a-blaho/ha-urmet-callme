@@ -10,7 +10,8 @@ media (two small C helpers). Not affiliated with Urmet.
 ```
 urmet_callme/
   src/            TypeScript control plane (node:test unit tests live beside the modules)
-  video-recv/     recv.c (camera receiver), opendoor.c (2Voice station helper), shared headers
+  video-recv/     recv.c (Ipercom camera receiver), station.c (2Voice station helper: door, camera,
+                  ring, announcements on the one call), lpcommon.h / h264tap.h / talkout.h shared
   stream.sh       go2rtc exec target: asks for the call, then ffmpeg re-encodes the tapped FIFOs
   config.yaml     add-on manifest; version must match package.json and have a CHANGELOG section
   Dockerfile      Ubuntu 24.04 + node 22 + liblinphone + go2rtc + ffmpeg, single stage on purpose
@@ -32,8 +33,8 @@ reverse-engineering/  GIT-IGNORED: the official apps, their jadx output and the 
 | `urmetCrypto.ts`, `token.ts`, `query.ts` | the `sipdata` cipher, the MESSAGE token, the MESSAGE body |
 | `sipClient.ts` | one TLS socket per account: REGISTER, out-of-dialog MESSAGE, inbound INVITE ring-only |
 | `callme.ts` | places, families (`familyOf`), gateway resolve, doors, Ipercom door open, camera requests, doorbell listeners, phase-B station discovery |
-| `door2voice.ts` | 2Voice door/gate/ready/announce over the persistent `opendoor` helper |
-| `video.ts` / `video2voice.ts` | Ipercom (shared account B, one call at a time) / 2Voice (call per place) camera services |
+| `twoVoiceStation.ts` | 2Voice: one persistent `station` helper per place; door/gate/ready/announce and, with video, the camera on its single call |
+| `video.ts` | Ipercom camera service (shared account B, one call at a time, `recv`) |
 | `cameraPipeline.ts`, `go2rtc.ts`, `helperProtocol.ts` | shared FIFO/control-endpoint pieces, the hardened go2rtc config, the helper stdin/stdout alphabet |
 | `announce.ts` | 2Voice announcements (TTS or URL → talk FIFO) |
 | `mqtt.ts` | MQTT discovery entities and command routing (`publishEntity`) |
@@ -48,8 +49,9 @@ reverse-engineering/  GIT-IGNORED: the official apps, their jadx output and the 
 - **Wire identities are pinned.** `stableUuid` seeds (`urmet-callme:`, `urmet-opendoor:`, `urmet-recv:`)
   are the registrar bindings of the running processes; changing one makes a restart add a binding
   instead of replacing it. The tests pin them.
-- **One call per 2Voice station.** The camera call *is* the door call; `door2voice.ts` and
-  `video2voice.ts` coordinate through the callbacks wired in `index.ts` so only one process holds it.
+- **One call per 2Voice station.** The camera call *is* the door call, so one `station` process per
+  place owns it and serves door, camera, ring and announcements on it; never spawn a second
+  liblinphone process against a 2Voice station.
 - **Entity ids are retained MQTT state.** `publishEntity` uids (`urmet_<place>_<door>_<kind>`, …) must
   stay stable across releases; `clearStaleDiscovery` purges ids older builds used.
 - **Helper protocol.** The stdin letters and stdout `RESULT`/`RING`/`CAMERA` lines are defined once in
@@ -68,7 +70,7 @@ npm run build       # dist/ as the image builds it
 ```
 
 The C helpers need `liblinphone-dev` (Ubuntu 24.04); CI compiles them, or use Docker locally:
-`docker run --rm -v "$PWD/video-recv:/s" ubuntu:24.04 sh -c 'apt-get update -qq && apt-get install -y -qq build-essential liblinphone-dev >/dev/null && cc -O2 -Wall /s/recv.c -llinphone -lbctoolbox -lbellesip -lmediastreamer -lortp -o /tmp/recv && cc -O2 -Wall /s/opendoor.c -llinphone -lbctoolbox -lbellesip -lmediastreamer -lortp -o /tmp/opendoor'`.
+`docker run --rm -v "$PWD/video-recv:/s" ubuntu:24.04 sh -c 'apt-get update -qq && apt-get install -y -qq build-essential liblinphone-dev >/dev/null && cc -O2 -Wall /s/recv.c -llinphone -lbctoolbox -lbellesip -lmediastreamer -lortp -o /tmp/recv && cc -O2 -Wall /s/station.c -llinphone -lbctoolbox -lbellesip -lmediastreamer -lortp -o /tmp/station'`.
 
 Testing on real hardware: `deploy-local.sh` (it detects `/local_apps` vs `/addons`). On the HA Green,
 stop the store add-on first (it reclaims the go2rtc ports on every Supervisor restart) and prove the

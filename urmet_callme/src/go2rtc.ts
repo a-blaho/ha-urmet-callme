@@ -1,5 +1,5 @@
 // The embedded go2rtc: its (hardened) config and a supervised process. Shared by the IPERCOM
-// (video.ts) and 2Voice (video2voice.ts) video services, which only ever run one at a time.
+// (video.ts) and 2Voice (twoVoiceStation.ts) video services, which only ever run one at a time.
 //
 // SECURITY. Under host networking go2rtc's API listens on the LAN (the WebRTC card needs it), with
 // no authentication: browsers cannot carry HTTP basic-auth on the card's fetch/WebSocket, so

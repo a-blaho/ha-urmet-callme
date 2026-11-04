@@ -5,11 +5,11 @@
 //
 // How the audio gets there: every 2Voice place has a talk FIFO (talkFifoOf). ffmpeg decodes the
 // source to raw s16le 8 kHz mono (G.711 is forced on the call) and writes it into the FIFO, and the
-// helper that holds the call to the station reads it in real time in place of the silence it sends
-// (video-recv/talkout.h): opendoor when nobody is watching the camera (TwoVoiceService.startTalk
-// asks it to place/hold a call), or the camera's recv while the camera call is up. ffmpeg's open of
-// the FIFO blocks until a call's audio graph opens it, so the first progress report from ffmpeg is
-// also the moment the call started taking the clip.
+// place's station helper reads it in real time in place of the silence it sends on the call to the
+// station (video-recv/talkout.h) -- the call being viewed on the camera, one it holds, or one it
+// places for the clip (TwoVoiceStation.startTalk). ffmpeg's open of the FIFO blocks until the call's
+// audio graph opens it, so the first progress report from ffmpeg is also the moment the call started
+// taking the clip.
 //
 // Logging: every announcement gets a number (#n) and logs each step with its time since the
 // request: source resolved (TTS engine/URL), which call carries it, when the call took the audio,
@@ -17,15 +17,15 @@
 // (call setup, open-audio digit, levels/dropouts per clip, RTP counters) with the same "announce" /
 // "talk-out" wording, so one announcement can be followed through the whole log.
 import { ChildProcess, spawn } from "node:child_process";
-import { talkFifoOf, TwoVoiceService } from "./door2voice.js";
 import { isDebug, logger } from "./logger.js";
+import { talkFifoOf, TwoVoiceStation } from "./twoVoiceStation.js";
 
 const log = logger("announce");
 
 // Silence ahead of the clip: the station may need a moment after the call comes up (and after the
 // open-audio digit) before its speaker plays, which would otherwise eat the first syllable.
 const LEAD_IN_MS = 400;
-// No progress from ffmpeg within this long = no call took the clip (opendoor's own limits are 20 s
+// No progress from ffmpeg within this long = no call took the clip (the station helper's own limits are 20 s
 // to get media + 25 s for the clip to start; this is the backstop above both).
 const START_TIMEOUT_MS = 50000;
 const HA_TIMEOUT_MS = 20000; // a TTS engine renders the whole clip before answering
@@ -123,7 +123,7 @@ export class Announcer {
   private stopping = false;
 
   constructor(
-    private tv: TwoVoiceService,
+    private tv: TwoVoiceStation,
     private opts: AnnounceOptions,
     private haBase = process.env.HA_URL || "http://supervisor/core",
     private haToken = process.env.HA_TOKEN || process.env.SUPERVISOR_TOKEN || "",
@@ -161,36 +161,26 @@ export class Announcer {
       }
     }
 
-    // 2. A call to carry it: the live camera call, or one the door helper places/holds.
-    const route = this.tv.startTalk(placeId);
-    if (!route) {
-      log.error(`#${id} ${at()} FAILED: no call possible for ${name} (door helper not ready)`);
+    // 2. A call to carry it: the station helper places one, or rides the one it has (the camera being
+    //    viewed, a pre-warm, the keep-alive after a press, the held ring it answers).
+    if (!this.tv.startTalk(placeId)) {
+      log.error(`#${id} ${at()} FAILED: no call possible for ${name} (station helper not ready)`);
       return false;
     }
-    log.info(
-      `#${id} ${at()} route: ${route === "camera" ? "the live camera call" : "a call held by the door helper"}`,
-    );
+    log.info(`#${id} ${at()} asked the station helper for a call`);
 
     // 3. Decode into the place's talk FIFO. One clip per place: a newer one replaces it.
-    const ok = await this.play(placeId, id, at, input, auth, route);
-    if (ok !== "camera-took-over") return ok;
-    // The camera was opened while the door helper's call was coming up or playing: the camera call
-    // has to hang that call up first (the two collide at the station), which broke the clip. The
-    // camera call reads the same talk FIFO, so play the clip again from the start on it.
-    log.info(`#${id} ${at()} the camera call took the line; playing the clip again on it`);
-    return (await this.play(placeId, id, at, input, auth, "camera")) === true;
+    return this.play(placeId, id, at, input, auth);
   }
 
-  /** Write one clip into the place's talk FIFO with ffmpeg. "camera-took-over" = the door helper's
-   *  call was dropped for the camera's before the clip finished (the caller replays it). */
+  /** Write one clip into the place's talk FIFO with ffmpeg. */
   private play(
     placeId: string,
     id: number,
     at: () => string,
     input: string,
     auth: string | undefined,
-    route: "camera" | "door",
-  ): Promise<boolean | "camera-took-over"> {
+  ): Promise<boolean> {
     const t0 = Date.now();
     const prev = this.playing.get(placeId);
     if (prev) {
@@ -216,7 +206,7 @@ export class Announcer {
         if (took) return;
         log.error(
           `#${id} ${at()} FAILED: no call took the clip within ${START_TIMEOUT_MS / 1000}s ` +
-            "(see the [opendoor]/[recv] lines above for why the call did not come up)",
+            "(see the [station] lines above for why the call did not come up)",
         );
         timedOut = true;
         ff.kill("SIGTERM");
@@ -283,16 +273,6 @@ export class Announcer {
           return resolve(true);
         }
         const brokenPipe = errors.some((e) => /broken pipe/i.test(e));
-        if (
-          route === "door" &&
-          !this.stopping &&
-          !timedOut &&
-          (brokenPipe || !errors.length) &&
-          this.tv.cameraLive(placeId)
-        ) {
-          log.info(`#${id} ${at()} the door helper's call was released after ${audio}`);
-          return resolve("camera-took-over");
-        }
         const why = brokenPipe
           ? "the call ended mid-clip"
           : errors.length

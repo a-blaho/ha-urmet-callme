@@ -7,9 +7,9 @@
 import mqtt, { IClientOptions, MqttClient } from "mqtt";
 import { Announcer } from "./announce.js";
 import { CallMe, Door, DoorbellRing } from "./callme.js";
-import { TwoVoiceDoor, TwoVoiceService } from "./door2voice.js";
 import { logger } from "./logger.js";
 import { uriUser } from "./sipClient.js";
+import { TwoVoiceDoor, TwoVoiceStation } from "./twoVoiceStation.js";
 import { sanitize } from "./util.js";
 
 const log = logger("mqtt");
@@ -76,7 +76,7 @@ export class MqttBridge {
       connect?: (url: string, opts: IClientOptions) => MqttLike;
     },
     private callme: CallMe,
-    private twoVoice?: TwoVoiceService, // present when 2Voice places are detected
+    private twoVoice?: TwoVoiceStation, // present when 2Voice places are detected
     private announcer?: Announcer, // 2Voice announcements (the `notify` entities)
   ) {
     this.prefix = options.discoveryPrefix || "homeassistant";
@@ -226,9 +226,9 @@ export class MqttBridge {
     }
   }
 
-  /** Per 2Voice place: a door and a gate `button` (press -> the liblinphone `opendoor` path: a silent
-   *  auto_insertion call + in-call tone), a "ready" button that pre-warms that call, and a `notify`
-   *  entity for announcements. */
+  /** Per 2Voice place: a door and a gate `button` (press -> the station helper sends the tone on its
+   *  call, placing a silent auto_insertion call if none is up), a "ready" button that pre-warms that
+   *  call, and a `notify` entity for announcements. */
   private publishTwoVoiceDoors(doors: TwoVoiceDoor[]) {
     const tv = this.twoVoice;
     if (!tv) return;

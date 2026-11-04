@@ -15,7 +15,7 @@ const INTRODUCE_WAIT_MS = 4000;
 
 /** Device family, derived from the raw get_my_devices `uid_type` MODEL code. IPERCOM opens doors
  *  with a cloud open_door_req (pure-Node); 2Voice opens with an in-call DTMF tone (the liblinphone
- *  `opendoor` path). */
+ *  `station` helper). */
 export type Family = "ipercom" | "twovoice" | "unknown";
 export function familyOf(uidType: string): Family {
   const u = (uidType || "").toLowerCase().replace(/\s+/g, "");
@@ -105,7 +105,7 @@ export class Place {
   }
 
   /** Refresh the account data from a (re)fetched get_my_devices entry. The services that drive the
-   *  helpers (door2voice, video2voice, announce) hold Place objects by reference, so a reconnect must
+   *  helpers (twoVoiceStation, announce) hold Place objects by reference, so a reconnect must
    *  update the existing object rather than replace it, or rotated channel credentials never reach
    *  them until a restart (see CallMe.connect). The id is derived from the same entry and never
    *  changes, so it is set once in the constructor. */
@@ -374,7 +374,7 @@ export class CallMe {
 
   /** Record the station SIP user and persist it. `source` (census/ring/disk) is logged so we can
    *  see, from a tester's log, WHERE a station came from and whether a later ring changes it. The
-   *  `mac-shaped` flag matters because door2voice sends the `mac` header only for a MAC-shaped
+   *  `mac-shaped` flag matters because twoVoiceStation sends the `mac` header only for a MAC-shaped
    *  account (58A) and `auto_insertion` otherwise -- if a ring overwrites a MAC-shaped station with
    *  a differently-shaped one, the header choice flips (a suspected failure mode we're verifying). */
   private setStation(place: Place, user: string, source: string): void {

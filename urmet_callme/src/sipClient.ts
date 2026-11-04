@@ -524,7 +524,7 @@ export class SipClient {
       this.grantedExpires = granted;
       this.lastRegisterMs = Date.now();
       // DIAGNOSTIC: is OUR binding still in the registrar's response? On the synthesized 58A place
-      // the opendoor helper registers this SAME account on its own connection; if its +sip.instance
+      // the station helper registers this SAME account on its own connection; if its +sip.instance
       // collides with ours it would REPLACE our binding (killing doorbell + door commands) rather
       // than add one. A "MISSING" here after the helper spawns is the smoking gun for that.
       log.debug(

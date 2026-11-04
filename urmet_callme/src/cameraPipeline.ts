@@ -1,4 +1,4 @@
-// The pieces of the camera pipeline that both video services (video.ts for Ipercom, video2voice.ts for
+// The pieces of the camera pipeline that both video services (video.ts for Ipercom, twoVoiceStation.ts for
 // 2Voice) share: the per-camera FIFO pair the media helper writes and stream.sh's ffmpeg reads, and the
 // loopback HTTP control endpoint stream.sh and the helper call back into. The per-family call control
 // stays in the services; only one of them runs at a time (index.ts).
