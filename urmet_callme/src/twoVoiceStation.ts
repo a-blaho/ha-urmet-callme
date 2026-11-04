@@ -206,10 +206,12 @@ export class TwoVoiceStation {
           await waitForExit(old, 1000);
         }
       }
-      if (!this.stopping) this.spawn(placeId);
     } finally {
       h.restarting = false;
     }
+    // After the flag is down: spawn() refuses while a restart is in flight (that guard is for the
+    // delayed respawn timer), and nothing async runs between here and it.
+    if (!this.stopping) this.spawn(placeId);
   }
 
   private stationUri(p: Place): string {
