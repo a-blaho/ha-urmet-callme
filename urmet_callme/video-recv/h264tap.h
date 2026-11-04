@@ -16,6 +16,7 @@
 #include <mediastreamer2/rfc3984.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,8 +33,13 @@ static char g_tap_target[256] = "";
 /* Bumped by the includer after it changes the camera targets (g_tap_target and its audio FIFO) on a
  * call whose media graph is already running: the taps then drop their descriptor, take the new path
  * (the control plane may have re-made the FIFO, so the old descriptor points at an unlinked inode)
- * and gate their output on a fresh keyframe. Read by the ticker thread, written by the main one. */
-static volatile int g_tap_gen = 0;
+ * and gate their output on a fresh keyframe. The main thread writes the targets and the generation,
+ * the media ticker threads snapshot them: both sides hold g_tap_lock (tap_targets_lock/unlock) for
+ * that, so a tap never copies a half-written path or sees the bump before the paths. */
+static int g_tap_gen = 0;
+static pthread_mutex_t g_tap_lock = PTHREAD_MUTEX_INITIALIZER;
+static void tap_targets_lock(void) { pthread_mutex_lock(&g_tap_lock); }
+static void tap_targets_unlock(void) { pthread_mutex_unlock(&g_tap_lock); }
 
 /* ---- H.264 tap: a custom mediastreamer "decoder" that does NOT decode. Registered as the
  * H264 decoder so liblinphone negotiates H264 recvonly and routes the received RTP to it.
@@ -157,9 +163,11 @@ static void read_target_line(char *out, size_t outsz, int lineno) {
 static void tap_init(MSFilter *f) {
   TapState *s = ms_new0(TapState, 1);
   s->fd = -1;
+  tap_targets_lock();
   s->gen = g_tap_gen;
   if (g_tap_target[0]) snprintf(s->path, sizeof s->path, "%s", g_tap_target);
   else read_target_line(s->path, sizeof s->path, 0);
+  tap_targets_unlock();
   s->unpacker = rfc3984_new_with_factory(f->factory);
   f->data = s;
   if (s->path[0]) TAP_LOG("[tap] H264 tap decoder instantiated -> %s\n", s->path);
@@ -169,16 +177,22 @@ static void tap_init(MSFilter *f) {
 
 static void tap_process(MSFilter *f) {
   TapState *s = (TapState *)f->data;
-  if (s->gen != g_tap_gen) {
+  /* Snapshot the target under the lock (the main thread may be changing it right now). */
+  tap_targets_lock();
+  const int changed = s->gen != g_tap_gen;
+  if (changed) {
+    s->gen = g_tap_gen;
+    snprintf(s->path, sizeof s->path, "%s", g_tap_target);
+  }
+  tap_targets_unlock();
+  if (changed) {
     /* The camera target changed on this live call: the camera asked for the call's video after its
      * graph started (a door call, an answered ring), or the picture ended and a viewer came back on
      * the same held call. Drop the old descriptor (the control plane re-makes the FIFO per request:
      * a fresh inode), take the new path, and start over as at the start of a call: the black
      * priming stream, then output from the next SPS/IDR. The call's GOP so far went by unseen, so a
      * reader joining mid-GOP would only get undecodable P-frames; the main loop nudges for an IDR. */
-    s->gen = g_tap_gen;
     if (s->fd >= 0) { close(s->fd); s->fd = -1; }
-    snprintf(s->path, sizeof s->path, "%s", g_tap_target);
     s->started = 0;
     s->last_black_ms = 0;
     if (s->path[0]) TAP_LOG("[tap] camera target set -> %s (output from the next SPS/IDR)\n", s->path);

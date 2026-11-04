@@ -6,7 +6,8 @@
  *
  * Before including, the includer defines:
  *   TAP_LOG(fmt, ...)          its log function (also used by h264tap.h)
- *   static void lp_atap_target(char *out, size_t outsz)   -- defined AFTER the include is fine --
+ *   static void lp_atap_target(char *out, size_t outsz)   -- defined AFTER the include is fine;
+ *                                                            called with tap_targets_lock held --
  *                              the PCM FIFO the audio tap writes this call's decoded audio to
  *                              ("" = discard)
  *   static int lp_atap_adopt;  1 = re-ask lp_atap_target while the path is still empty (the
@@ -124,8 +125,10 @@ static void awrite_init(MSFilter *f) {
   s->fd = -1;
   s->rate = 48000; /* defaults; overwritten by whatever liblinphone SETs on the card */
   s->nch = 1;
+  tap_targets_lock();
   s->gen = g_tap_gen;
   lp_atap_target(s->path, sizeof s->path);
+  tap_targets_unlock();
   f->data = s;
 }
 
@@ -140,13 +143,18 @@ static void awrite_announce(AudioTap *s) {
 static void awrite_process(MSFilter *f) {
   AudioTap *s = (AudioTap *)f->data;
   awrite_announce(s);
-  if (s->gen != g_tap_gen) {
-    /* The camera targets changed on this live call (see g_tap_gen): reopen by path. */
+  /* The camera targets changed on this live call (see g_tap_gen): reopen by path. The snapshot is
+   * taken under the targets lock, like the H.264 tap's. */
+  tap_targets_lock();
+  const int changed = s->gen != g_tap_gen;
+  if (changed) {
     s->gen = g_tap_gen;
-    if (s->fd >= 0) { close(s->fd); s->fd = -1; }
+    lp_atap_target(s->path, sizeof s->path);
+  } else if (!s->path[0] && lp_atap_adopt) {
     lp_atap_target(s->path, sizeof s->path);
   }
-  if (!s->path[0] && lp_atap_adopt) lp_atap_target(s->path, sizeof s->path);
+  tap_targets_unlock();
+  if (changed && s->fd >= 0) { close(s->fd); s->fd = -1; }
   if (s->fd < 0 && s->path[0]) {
     /* Same O_RDWR|O_NONBLOCK trick as the H264 tap: we hold the FIFO open so writes never
      * EPIPE when ffmpeg comes and goes; a full pipe just returns EAGAIN and we drop. */

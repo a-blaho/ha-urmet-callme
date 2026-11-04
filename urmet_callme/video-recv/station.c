@@ -189,9 +189,11 @@ static void camera_off(const char *why) {
   if (!g_cam_on) return;
   g_cam_on = 0;
   g_cam_live = 0;
+  tap_targets_lock();
   g_tap_target[0] = '\0';
   g_cam_audio[0] = '\0';
   g_tap_gen++; /* the taps on a call that stays up close their FIFOs */
+  tap_targets_unlock();
   g_video_deadline = 0;
   g_switch_vfu_until = 0;
   g_last_drain = 0;
@@ -200,9 +202,11 @@ static void camera_off(const char *why) {
 
 static void camera_fail(const char *why) {
   g_cam_on = 0;
+  tap_targets_lock();
   g_tap_target[0] = '\0';
   g_cam_audio[0] = '\0';
   g_tap_gen++;
+  tap_targets_unlock();
   slog("[station] camera: %s\nCAMERA fail %s\n", why, why);
 }
 
@@ -559,9 +563,11 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
     camera_fail("no FIFO paths given");
     return;
   }
+  tap_targets_lock();
   snprintf(g_tap_target, sizeof g_tap_target, "%s", h264);
   snprintf(g_cam_audio, sizeof g_cam_audio, "%s", pcm);
   g_tap_gen++; /* the taps of a call already up reopen on these paths and gate on a fresh keyframe */
+  tap_targets_unlock();
   g_cam_on = 1;
   g_cam_live = 0;
   g_cam_pending = 0;
@@ -615,9 +621,11 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
     g_cam_pending = 1;
     bye_call(lc);
     g_cam_on = 1; /* bye_call turned the camera off; the pending camera call turns it back on */
+    tap_targets_lock();
     snprintf(g_tap_target, sizeof g_tap_target, "%s", h264);
     snprintf(g_cam_audio, sizeof g_cam_audio, "%s", pcm);
     g_tap_gen++;
+    tap_targets_unlock();
     g_redial_at_ms = now + redial_delay_ms();
     slog("CAMERA ok\n");
     return;

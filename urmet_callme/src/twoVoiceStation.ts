@@ -44,6 +44,7 @@ const SWITCH_TIMEOUT_MS = 45000;
 // answers at once, placing the call in the background).
 const CAMERA_REPLY_MS = 3000;
 const RESPAWN_MS = 3000; // auto-restart a helper that died (e.g. registration dropped)
+const RESTART_EXIT_MS = 3000; // how long a restart waits for the old helper to exit before SIGKILL
 const IDLE_SECONDS = 10; // camera off (and the call released after the keep-alive) with no reader this long
 
 /** Announcements (announce.ts): the place's talk FIFO. PCM written here (s16le, 8 kHz mono) goes
@@ -78,6 +79,7 @@ interface Helper {
   camWaiters: ((failure: string | undefined) => void)[];
   ringing: boolean; // the helper holds the place's doorbell ring call: "RING held/gone"
   camOn: boolean; // the camera is being fed (CAMERA ok seen, no CAMERA end yet)
+  restarting?: boolean; // restart() is waiting for the old child to exit; a second request joins it
 }
 
 export interface TwoVoiceStationOptions {
@@ -152,7 +154,7 @@ export class TwoVoiceStation {
     const h = this.helpers.get(placeId);
     if (!h || !h.place.outgoingUser) return;
     if (h.child && h.outUri === this.stationUri(h.place)) return;
-    this.restart(placeId, "its station changed");
+    void this.restart(placeId, "its station changed");
   }
 
   /** After a reconnect re-read the places (callme.connect updates them in place): a helper took its
@@ -167,23 +169,47 @@ export class TwoVoiceStation {
         h.inPw !== h.place.incomingPw ||
         h.outUri !== this.stationUri(h.place)
       )
-        this.restart(placeId, "its account or station changed");
+        void this.restart(placeId, "its account or station changed");
     }
   }
 
-  /** Replace the place's helper (if one runs) with one spawned from the place's current values. */
-  private restart(placeId: string, why: string): void {
+  /** Replace the place's helper (if one runs) with one spawned from the place's current values. The
+   *  old process is gone BEFORE the new one starts: both would register the same channel account from
+   *  the same liblinphone data dir, and the old one may still hold the station call. One restart per
+   *  place at a time; a request arriving during the wait is covered, spawn() reads the place then. */
+  private async restart(placeId: string, why: string): Promise<void> {
     const h = this.helpers.get(placeId);
-    if (!h) return;
-    if (h.child) {
-      log.info(`2Voice helper for ${placeId}: ${why}; restarting it`);
-      h.child.removeAllListeners("exit");
-      h.child.kill("SIGTERM");
-      h.child = undefined;
-      h.ringing = false;
-      h.camOn = false;
+    if (!h || h.restarting) return;
+    h.restarting = true;
+    try {
+      const old = h.child;
+      if (old) {
+        log.info(`2Voice helper for ${placeId}: ${why}; restarting it`);
+        old.removeAllListeners("exit");
+        h.child = undefined;
+        h.ringing = false;
+        h.camOn = false;
+        for (const w of h.camWaiters.splice(0)) w("the station helper is restarting");
+        for (const w of [...h.tones.splice(0), ...h.switches.splice(0)]) {
+          clearTimeout(w.timer);
+          w.reject(new Error("station helper restarting"));
+        }
+        try {
+          old.stdin?.end(); // stdin closed -> the helper hangs up and exits on its own
+        } catch {
+          /* ignore */
+        }
+        old.kill("SIGTERM");
+        if (!(await waitForExit(old, RESTART_EXIT_MS))) {
+          log.warn(`2Voice helper for ${placeId} did not exit within ${RESTART_EXIT_MS}ms; killing it`);
+          old.kill("SIGKILL");
+          await waitForExit(old, 1000);
+        }
+      }
+      if (!this.stopping) this.spawn(placeId);
+    } finally {
+      h.restarting = false;
     }
-    this.spawn(placeId);
   }
 
   private stationUri(p: Place): string {
