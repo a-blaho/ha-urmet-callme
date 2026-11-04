@@ -258,7 +258,7 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
       g_switching = 1;
       g_switch_left = g_cam_steps;
       g_cam_steps = 0;
-      g_switch_next_ms = now_ms() + switch_gap_ms();
+      g_switch_next_ms = g_switch_left ? now_ms() + switch_gap_ms() : now_ms();
     }
     if (g_cam_on) expect_picture();
     break;
@@ -445,7 +445,9 @@ static void bye_call(LinphoneCore *lc) {
   g_ended = 0; /* consume: place_call sets it fresh for the next call */
   g_audio_opened = 0;
   /* A camera switch re-dial and a camera call pending after an audio-only one keep the camera on and
-   * its targets: the next call carries the picture. */
+   * its targets: the next call carries the picture. The pending one waits the re-dial pause from
+   * here: the station declines a call placed right after the last one ended. */
+  if (g_cam_pending) g_redial_at_ms = now_ms() + redial_delay_ms();
   if (g_cam_on && !g_redial_req && !g_redialing && !g_cam_pending)
     camera_off("the call carrying the picture ended");
 }
@@ -617,15 +619,13 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
        * clip and break its ffmpeg). The keep-alive releases the call after the clip and the pending
        * camera call follows; the viewer's stream.sh waits for it. */
       slog("[station] camera: the call up is audio only and carries an announcement -> the camera call follows it\n");
-      g_cam_pending = 1;
-      g_redial_at_ms = now; /* no gap needed beyond the call's own end */
+      g_cam_pending = 1; /* bye_call (keep-alive idle, after the clip) schedules the camera call */
       slog("CAMERA ok\n");
       return;
     }
     slog("[station] camera: the call up is audio only -> ending it and placing a camera call\n");
-    g_cam_pending = 1; /* keeps the camera on and its targets through bye_call */
+    g_cam_pending = 1; /* keeps the camera on and its targets through bye_call, which schedules it */
     bye_call(lc);
-    g_redial_at_ms = now + redial_delay_ms();
     slog("CAMERA ok\n");
     return;
   }
@@ -769,9 +769,22 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
     /* Re-dial (camera switch with the audio open) or a camera call pending after an audio-only call:
      * place it once the station has released the line. */
     if (!g_call && g_reg_ok && (g_redialing || g_cam_pending) && now >= g_redial_at_ms) {
-      if (place_call(lc, out_uri, "camera", 1)) {
+      if (g_cam_pending && g_ring && phase_b_mac()) {
+        /* place_call would answer the held ring, which a phase-B station carries audio only: say so
+         * now instead of showing nothing until the keyframe deadline. */
+        g_cam_pending = 0;
+        camera_fail("the station is ringing (a phase-B ring carries no video)");
+      } else if (place_call(lc, out_uri, "camera", 1)) {
         call_placed_at = now;
-        if (g_cam_pending) { g_cam_pending = 0; slog("[station] camera: call placed after the audio-only one\n"); }
+        if (g_cam_pending) {
+          /* From here it is a re-dial with no '3' to send: a decline before media (the station still
+           * releasing the line) is retried like a switch's instead of ending the camera. */
+          g_cam_pending = 0;
+          g_redialing = 1;
+          g_redial_tries = REDIAL_TRIES;
+          g_cam_steps = 0;
+          slog("[station] camera: call placed after the audio-only one\n");
+        }
       } else {
         g_redialing = 0;
         g_cam_pending = 0;

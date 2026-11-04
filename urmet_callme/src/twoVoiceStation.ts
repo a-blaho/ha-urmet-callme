@@ -9,15 +9,15 @@
 // Why persistent: a cold SIP register per press cost ~2-3 s; the helper registers once at startup and
 // each press pays only the call-setup time (or nothing, on a call already up: keep-alive, pre-warm, or
 // the camera being viewed -- exactly how the app unlocks while viewing).
-import { ChildProcess, execFileSync, spawn } from "node:child_process";
-import { mkdirSync, unlinkSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
 import type { Server } from "node:http";
 import { macHeaderOf, Place } from "./place.js";
 import { listenControl, makeFifos, type ControlHandler } from "./cameraPipeline.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { cameraCommand, HelperCommand, parseHelperLine } from "./helperProtocol.js";
 import { isDebug, logger } from "./logger.js";
-import { waitForExit } from "./proc.js";
+import { ChildLike, waitForExit } from "./proc.js";
 import { camFifos, sanitize, stableUuid } from "./util.js";
 
 const log = logger("2voice");
@@ -46,6 +46,43 @@ const SWITCH_TIMEOUT_MS = 45000;
 const CAMERA_REPLY_MS = 18000;
 const RESPAWN_MS = 3000; // auto-restart a helper that died (e.g. registration dropped)
 const RESTART_EXIT_MS = 3000; // how long a restart waits for the old helper to exit before SIGKILL
+
+/** The timings above, overridable (tests run the lifecycle in milliseconds). */
+export interface HelperTiming {
+  openTimeoutMs: number;
+  switchTimeoutMs: number;
+  cameraReplyMs: number;
+  respawnMs: number;
+  restartExitMs: number;
+}
+const DEFAULT_TIMING: HelperTiming = {
+  openTimeoutMs: OPEN_TIMEOUT_MS,
+  switchTimeoutMs: SWITCH_TIMEOUT_MS,
+  cameraReplyMs: CAMERA_REPLY_MS,
+  respawnMs: RESPAWN_MS,
+  restartExitMs: RESTART_EXIT_MS,
+};
+
+/** The slice of a spawned helper process the service uses. node's ChildProcess is one; a test's
+ *  fake child (streams + an exit it triggers) is another. */
+export interface HelperChild extends ChildLike {
+  stdin: { writable: boolean; write(s: string): unknown; end(): unknown } | null;
+  stdout: { setEncoding(e: BufferEncoding): unknown; on(ev: "data", cb: (d: string) => void): unknown } | null;
+  on(ev: "error", cb: (e: Error) => void): unknown;
+  on(ev: "exit", cb: (code: number | null) => void): unknown;
+  removeAllListeners(ev: string): unknown;
+  kill(signal?: NodeJS.Signals): unknown;
+}
+/** What the service does to the system: spawn a helper, (re)create a FIFO. Injected by tests. */
+export interface HelperProcs {
+  spawn(command: string, args: string[], env: NodeJS.ProcessEnv): HelperChild;
+  mkfifo(path: string): void;
+}
+const realProcs: HelperProcs = {
+  // stdin = commands; stdout = RESULT/RING/CAMERA + [station] logs (parsed + forwarded); stderr -> log.
+  spawn: (command, args, env) => spawn(command, args, { env, stdio: ["pipe", "pipe", "inherit"] }),
+  mkfifo: (path) => makeFifos(path),
+};
 const IDLE_SECONDS = 10; // camera off (and the call released after the keep-alive) with no reader this long
 
 /** Announcements (announce.ts): the place's talk FIFO. PCM written here (s16le, 8 kHz mono) goes
@@ -67,7 +104,7 @@ interface Waiter {
 
 interface Helper {
   place: Place;
-  child?: ChildProcess;
+  child?: HelperChild;
   outUri?: string; // station URI the live child was spawned with (it takes it as argv)
   inUser?: string; // channel account the live child registers (argv too): a change needs a respawn
   inPw?: string;
@@ -88,6 +125,8 @@ export interface TwoVoiceStationOptions {
   prewarmHoldMs: number; // how long a prewarm() (ready button) keeps the call open
   talkDtmf: string; // announcements: the open-audio digit sent first ("" = none)
   audioAtStart: boolean; // `video_2voice_audio`: open the station's audio on every camera call
+  timing?: Partial<HelperTiming>; // test seam
+  procs?: HelperProcs; // test seam
 }
 
 export class TwoVoiceStation {
@@ -98,12 +137,17 @@ export class TwoVoiceStation {
   private go2rtc?: Go2rtcProcess;
   private server?: Server;
   private callPort = 0;
+  private readonly t: HelperTiming;
+  private readonly procs: HelperProcs;
 
   constructor(
     private places: Place[],
     private realm: string,
     private opts: TwoVoiceStationOptions,
-  ) {}
+  ) {
+    this.t = { ...DEFAULT_TIMING, ...opts.timing };
+    this.procs = opts.procs ?? realProcs;
+  }
 
   /** The 2Voice places' openable relays: a DOOR (DTMF '1') and a GATE (DTMF '2') per place. 2Voice
    *  has no capability discovery for a gate - the app hardcodes GATE_DTMF='2' and offers both - so we
@@ -132,12 +176,7 @@ export class TwoVoiceStation {
         camOn: false,
       });
       try {
-        unlinkSync(talkFifoOf(p.id));
-      } catch {
-        /* not there */
-      }
-      try {
-        execFileSync("mkfifo", [talkFifoOf(p.id)]);
+        this.procs.mkfifo(talkFifoOf(p.id));
       } catch (e) {
         log.warn(`announcement FIFO for ${p.id} not created: ${(e as Error).message}`);
       }
@@ -154,7 +193,7 @@ export class TwoVoiceStation {
     if (this.stopping) return;
     const h = this.helpers.get(placeId);
     if (!h || !h.place.outgoingUser) return;
-    if (h.child && h.outUri === this.stationUri(h.place)) return;
+    if (h.child && h.outUri === h.place.outgoingUri) return;
     void this.restart(placeId, "its station changed");
   }
 
@@ -164,11 +203,16 @@ export class TwoVoiceStation {
   placesRefreshed(): void {
     if (this.stopping) return;
     for (const [placeId, h] of this.helpers) {
-      if (!h.child) continue;
+      if (!h.child) {
+        // Never spawned (no station at start(), and stationLearned missed it) or between an exit and
+        // its respawn: a station known by now gets its helper; the respawn timer's spawn() then no-ops.
+        if (h.place.outgoingUser && !h.restarting) this.spawn(placeId);
+        continue;
+      }
       if (
         h.inUser !== h.place.incomingUser ||
         h.inPw !== h.place.incomingPw ||
-        h.outUri !== this.stationUri(h.place)
+        h.outUri !== h.place.outgoingUri
       )
         void this.restart(placeId, "its account or station changed");
     }
@@ -201,8 +245,8 @@ export class TwoVoiceStation {
           /* ignore */
         }
         old.kill("SIGTERM");
-        if (!(await waitForExit(old, RESTART_EXIT_MS))) {
-          log.warn(`2Voice helper for ${placeId} did not exit within ${RESTART_EXIT_MS}ms; killing it`);
+        if (!(await waitForExit(old, this.t.restartExitMs))) {
+          log.warn(`2Voice helper for ${placeId} did not exit within ${this.t.restartExitMs}ms; killing it`);
           old.kill("SIGKILL");
           await waitForExit(old, 1000);
         }
@@ -215,10 +259,6 @@ export class TwoVoiceStation {
     if (!this.stopping) this.spawn(placeId);
   }
 
-  private stationUri(p: Place): string {
-    return `sip:${p.outgoingUser}@${p.realm}`;
-  }
-
   private spawn(placeId: string): void {
     if (this.stopping) return;
     const h = this.helpers.get(placeId);
@@ -228,7 +268,7 @@ export class TwoVoiceStation {
     if (h.child || h.restarting) return;
     const p = h.place;
     if (!p.outgoingUser) return; // station still unknown; stationLearned() spawns us later
-    const outUri = this.stationUri(p);
+    const outUri = p.outgoingUri;
     const mac = macHeaderOf(p.outgoingUser);
     // DIAGNOSTIC: log EXACTLY which door-open header this station will get. `mac` is the 58A path;
     // `auto_insertion` is cloud-listed 2Voice. If a 58A ends up on auto_insertion (because its
@@ -243,28 +283,24 @@ export class TwoVoiceStation {
     } catch {
       /* the helper falls back to a default dir */
     }
-    // stdin = commands; stdout = RESULT/RING/CAMERA + [station] logs (we parse + forward); stderr -> log.
-    const child = spawn("station", [p.incomingUser, p.incomingPw, outUri], {
-      env: {
-        ...process.env,
-        SIP_REALM: this.realm,
-        STATION_DATA_DIR: dataDir,
-        STATION_KEEPALIVE_MS: String(this.opts.keepaliveMs),
-        STATION_PREWARM_HOLD_MS: String(this.opts.prewarmHoldMs),
-        STATION_IDLE_SECONDS: String(IDLE_SECONDS),
-        STATION_UUID: instanceUuid(p.incomingUser, p.id),
-        STATION_AUDIO_IN: talkFifoOf(p.id),
-        STATION_TALK_DTMF: this.opts.talkDtmf,
-        // Hold a doorbell ring so an announcement / door press during it can answer it (the station
-        // refuses new calls while it rings) and the camera can show it. A pre-warm never answers it.
-        STATION_ANSWER_RING: "1",
-        ...(mac ? { STATION_MAC: mac } : {}),
-        // The entrance sound on the camera stream; without it the audio stays closed like the app's,
-        // so next camera is a live '3' instead of a new call.
-        ...(this.opts.audioAtStart ? { STATION_OPEN_AUDIO_AT_START: "1" } : {}),
-        ...(isDebug() ? { STATION_DEBUG: "1" } : {}),
-      },
-      stdio: ["pipe", "pipe", "inherit"],
+    const child = this.procs.spawn("station", [p.incomingUser, p.incomingPw, outUri], {
+      ...process.env,
+      SIP_REALM: this.realm,
+      STATION_DATA_DIR: dataDir,
+      STATION_KEEPALIVE_MS: String(this.opts.keepaliveMs),
+      STATION_PREWARM_HOLD_MS: String(this.opts.prewarmHoldMs),
+      STATION_IDLE_SECONDS: String(IDLE_SECONDS),
+      STATION_UUID: instanceUuid(p.incomingUser, p.id),
+      STATION_AUDIO_IN: talkFifoOf(p.id),
+      STATION_TALK_DTMF: this.opts.talkDtmf,
+      // Hold a doorbell ring so an announcement / door press during it can answer it (the station
+      // refuses new calls while it rings) and the camera can show it. A pre-warm never answers it.
+      STATION_ANSWER_RING: "1",
+      ...(mac ? { STATION_MAC: mac } : {}),
+      // The entrance sound on the camera stream; without it the audio stays closed like the app's,
+      // so next camera is a live '3' instead of a new call.
+      ...(this.opts.audioAtStart ? { STATION_OPEN_AUDIO_AT_START: "1" } : {}),
+      ...(isDebug() ? { STATION_DEBUG: "1" } : {}),
     });
     h.child = child;
     h.outUri = outUri;
@@ -287,15 +323,15 @@ export class TwoVoiceStation {
         w.reject(new Error(`station helper exited (code ${code ?? "killed"})`));
       }
       if (!this.stopping) {
-        log.warn(`2Voice helper [${p.id}] exited (code ${code}); respawning in ${RESPAWN_MS}ms`);
-        setTimeout(() => this.spawn(placeId), RESPAWN_MS);
+        log.warn(`2Voice helper [${p.id}] exited (code ${code}); respawning in ${this.t.respawnMs}ms`);
+        setTimeout(() => this.spawn(placeId), this.t.respawnMs);
       }
     });
     log.info(`2Voice station helper starting for ${p.id} (${p.name}) via ${p.outgoingUser}`);
   }
 
   // Assemble the helper's stdout into lines: consume the machine lines, forward the rest to the log.
-  private onStdout(placeId: string, child: ChildProcess, data: string): void {
+  private onStdout(placeId: string, child: HelperChild, data: string): void {
     const h = this.helpers.get(placeId);
     // A retired helper (restart(), or one that exited) may still flush buffered lines after its exit
     // event: they must not answer the replacement's queued commands or set its camera state.
@@ -386,7 +422,7 @@ export class TwoVoiceStation {
     log.info(`opening ${kind} on 2Voice place ${placeId} (${h.place.name})`);
     // No busy-reject: the helper queues tones received while the call is setting up and sends them at
     // StreamsRunning, so a rapid second press (door then gate) isn't lost.
-    return this.command(h, h.tones, DIGIT[kind], OPEN_TIMEOUT_MS);
+    return this.command(h, h.tones, DIGIT[kind], this.t.openTimeoutMs);
   }
 
   /** Pre-warm a place's call (the "ready" button): open the station call NOW, with no tone, so the
@@ -447,7 +483,8 @@ export class TwoVoiceStation {
     usable.forEach((p, i) => {
       const f = camFifos(i);
       this.cams.push({ place: p, h264: f.h264, pcm: f.pcm });
-      makeFifos(f.h264, f.pcm);
+      this.procs.mkfifo(f.h264);
+      this.procs.mkfifo(f.pcm);
     });
     log.info(`2Voice cameras: ${this.cams.map((c, i) => `[${i}] ${c.place.name}`).join(", ")}`);
     const handler: ControlHandler = (req, res) => {
@@ -505,7 +542,8 @@ export class TwoVoiceStation {
     if (!pending) {
       // (Re)make the FIFOs before the helper opens them: a stale reader-less FIFO from the previous
       // viewer could otherwise hold the old pipe buffer.
-      makeFifos(cam.h264, cam.pcm);
+      this.procs.mkfifo(cam.h264);
+      this.procs.mkfifo(cam.pcm);
       log.info(`2Voice camera [${i}] ${cam.place.name}: requesting the picture`);
     }
     return new Promise((resolve, reject) => {
@@ -521,7 +559,7 @@ export class TwoVoiceStation {
         const k = h.camWaiters.indexOf(finish);
         if (k >= 0) h.camWaiters.splice(k, 1);
         finish("no reply from the station helper");
-      }, CAMERA_REPLY_MS);
+      }, this.t.cameraReplyMs);
       h.camWaiters.push(finish);
       if (!pending) h.child!.stdin!.write(cameraCommand(cam.h264, cam.pcm) + "\n");
     });
@@ -546,7 +584,7 @@ export class TwoVoiceStation {
       return false;
     }
     try {
-      await this.command(h, h.switches, HelperCommand.NEXT_CAMERA, SWITCH_TIMEOUT_MS);
+      await this.command(h, h.switches, HelperCommand.NEXT_CAMERA, this.t.switchTimeoutMs);
       return true;
     } catch (e) {
       log.info(`next camera on ${h.place.name}: ${(e as Error).message}`);
@@ -560,7 +598,7 @@ export class TwoVoiceStation {
     this.stopping = true;
     this.server?.close();
     this.go2rtc?.stop();
-    const children: ChildProcess[] = [];
+    const children: HelperChild[] = [];
     for (const h of this.helpers.values()) {
       for (const w of [...h.tones, ...h.switches]) clearTimeout(w.timer);
       h.tones = [];
