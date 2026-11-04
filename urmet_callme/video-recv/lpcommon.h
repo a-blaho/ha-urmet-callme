@@ -58,6 +58,7 @@ static const char *lp_realm(void) {
 static MSFactory *g_factory = NULL;        /* stashed for the sound-card filter factories */
 static const char *lp_talk_env = NULL;     /* env var naming the announcement FIFO (talkout.h) */
 static int lp_atap_adopt = 0;              /* see the header comment */
+static int g_lp_debug = 0;                 /* LpSetup.debug: the per-second diagnostics print */
 static void lp_atap_target(char *out, size_t outsz);
 
 static const char *dir_name(LinphoneMediaDirection d) {
@@ -204,8 +205,10 @@ static void awrite_process(MSFilter *f) {
       else if (!all_dropped && s->stalled)
         TAP_LOG("[atap] PCM FIFO draining again\n");
       s->stalled = all_dropped;
-      TAP_LOG("[atap] audio ~1s: %ld buf, avg=%ld peak=%d (of 32768), total=%ldB dropped=%ld\n",
-              s->win_frames, avg, s->win_peak, s->bytes, s->win_dropped);
+      /* The level line itself is a line a second for the whole call: debug only. */
+      if (g_lp_debug)
+        TAP_LOG("[atap] audio ~1s: %ld buf, avg=%ld peak=%d (of 32768), total=%ldB dropped=%ld\n",
+                s->win_frames, avg, s->win_peak, s->bytes, s->win_dropped);
     }
     s->win_frames = 0;
     s->win_dropped = 0;
@@ -376,16 +379,22 @@ typedef struct {
   const char *pass;
   const char *data_dir;   /* writable, UNIQUE per process (a shared sqlite DB corrupts account state) */
   const char *uuid;       /* stable +sip.instance id ("" / NULL = let liblinphone invent one) */
-  int want_video;         /* build the video graphs at all (a phase-B door call is audio only) */
+  int want_video;         /* build the video graphs at all */
+  int accept_video;       /* answer video the peer offers (an INVITE or a re-INVITE adding it) */
   int auto_initiate;      /* offer video on outgoing calls */
-  int debug;              /* liblinphone's own trace */
+  int debug;              /* our per-second diagnostics, plus liblinphone's warnings */
+  int trace;              /* liblinphone's full trace: a hundred lines a second, drowns the add-on log */
 } LpSetup;
 
 static LinphoneCore *lp_create_core(const LpSetup *s, LinphoneCoreCbs *cbs) {
   LinphoneFactory *factory = linphone_factory_get();
-  if (s->debug) {
+  g_lp_debug = s->debug;
+  /* liblinphone's own log: its warnings and errors at debug (a failed REGISTER, a refused SRTP, a
+   * codec mismatch say why in there), the full message trace only when asked for by name - at
+   * ~100 lines/s it pushed the add-on's own lines out of the Supervisor log window in under a minute. */
+  if (s->trace || s->debug) {
     LinphoneLoggingService *ls = linphone_logging_service_get();
-    linphone_logging_service_set_log_level(ls, LinphoneLogLevelDebug);
+    linphone_logging_service_set_log_level(ls, s->trace ? LinphoneLogLevelDebug : LinphoneLogLevelWarning);
   }
 
   /* Give liblinphone writable dirs; otherwise it errors opening its sqlite DB, which can stall the
@@ -431,7 +440,7 @@ static LinphoneCore *lp_create_core(const LpSetup *s, LinphoneCoreCbs *cbs) {
   ms_snd_card_manager_register_desc(ms_factory_get_snd_card_manager(g_factory), &pcm_card_desc);
 
   LinphoneVideoActivationPolicy *vap = linphone_factory_create_video_activation_policy(factory);
-  linphone_video_activation_policy_set_automatically_accept(vap, s->want_video);
+  linphone_video_activation_policy_set_automatically_accept(vap, s->want_video && s->accept_video);
   linphone_video_activation_policy_set_automatically_initiate(vap, s->want_video && s->auto_initiate);
   linphone_core_set_video_activation_policy(lc, vap);
   linphone_video_activation_policy_unref(vap);

@@ -12,7 +12,7 @@
 import { ChildProcess, execFileSync, spawn } from "node:child_process";
 import { mkdirSync, unlinkSync } from "node:fs";
 import type { Server } from "node:http";
-import { Place } from "./place.js";
+import { macHeaderOf, Place } from "./place.js";
 import { listenControl, makeFifos, type ControlHandler } from "./cameraPipeline.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { cameraCommand, HelperCommand, parseHelperLine } from "./helperProtocol.js";
@@ -45,17 +45,6 @@ const SWITCH_TIMEOUT_MS = 45000;
 const CAMERA_REPLY_MS = 3000;
 const RESPAWN_MS = 3000; // auto-restart a helper that died (e.g. registration dropped)
 const IDLE_SECONDS = 10; // camera off (and the call released after the keep-alive) with no reader this long
-
-/** The station's MAC in `mac`-header form (colons), when its account IS a MAC. Those are the "phase B"
- *  devices (the 1083/58A family): the cloud does not list them, the app builds their account from the
- *  MAC it learns at introduction, and it dials them with a `mac` header instead of `auto_insertion:
- *  true` - they answer 486 Busy to the latter. A cloud-listed station has a generated account name, no
- *  MAC shape, and keeps the auto_insertion header. Returns "" for a non-MAC account. */
-export function macHeaderOf(user: string): string {
-  return /^([0-9a-f]{2}_){5}[0-9a-f]{2}$/i.test(user)
-    ? user.replace(/_/g, ":")
-    : "";
-}
 
 /** Announcements (announce.ts): the place's talk FIFO. PCM written here (s16le, 8 kHz mono) goes
  *  out on the station call as its audio (the helper reads it as STATION_AUDIO_IN, talkout.h). */
@@ -262,11 +251,12 @@ export class TwoVoiceStation {
       }
       if (ev.kind === "camera") {
         log.debug(line);
+        // One V is in flight at a time (camera() joins a pending one), so its reply answers every waiter.
         if (ev.status === "ok") {
           h.camOn = true;
-          h.camWaiters.shift()?.(undefined);
+          for (const w of h.camWaiters.splice(0)) w(undefined);
         } else if (ev.status === "fail") {
-          h.camWaiters.shift()?.(ev.why || "failed");
+          for (const w of h.camWaiters.splice(0)) w(ev.why || "failed");
         } else if (ev.status === "live") {
           log.info(`2Voice camera ${h.place.name}: video established`);
         } else if (ev.status === "end") {
@@ -443,10 +433,15 @@ export class TwoVoiceStation {
     const cam = this.cams[i];
     const h = this.helperReady(cam.place.id);
     if (h.camOn) return Promise.resolve();
-    // (Re)make the FIFOs before the helper opens them: a stale reader-less FIFO from the previous
-    // viewer could otherwise hold the old pipe buffer.
-    makeFifos(cam.h264, cam.pcm);
-    log.info(`2Voice camera [${i}] ${cam.place.name}: requesting the picture`);
+    // A request already in flight (two viewers racing, go2rtc restarting the producer) is joined, not
+    // repeated: re-making the FIFOs now would pull them from under the helper as it opens them.
+    const pending = h.camWaiters.length > 0;
+    if (!pending) {
+      // (Re)make the FIFOs before the helper opens them: a stale reader-less FIFO from the previous
+      // viewer could otherwise hold the old pipe buffer.
+      makeFifos(cam.h264, cam.pcm);
+      log.info(`2Voice camera [${i}] ${cam.place.name}: requesting the picture`);
+    }
     return new Promise((resolve, reject) => {
       let done = false;
       const finish = (failure: string | undefined) => {
@@ -462,7 +457,7 @@ export class TwoVoiceStation {
         finish("no reply from the station helper");
       }, CAMERA_REPLY_MS);
       h.camWaiters.push(finish);
-      h.child!.stdin!.write(cameraCommand(cam.h264, cam.pcm) + "\n");
+      if (!pending) h.child!.stdin!.write(cameraCommand(cam.h264, cam.pcm) + "\n");
     });
   }
 

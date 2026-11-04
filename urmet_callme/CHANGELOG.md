@@ -15,7 +15,8 @@
 - **Reconnects now refresh the places' credentials.** After a SIP reconnect the add-on re-read
   `get_my_devices` but handed the new data to a fresh set of places, while the 2Voice door helper, the
   camera and announcements kept the old ones; rotated channel credentials or a changed station only
-  took effect after a restart. The existing places are updated in place now.
+  took effect after a restart. The existing places are updated in place now, and a doorbell listener
+  that has to reconnect re-reads them instead of re-registering its old password.
 - **A doorbell listener whose first registration fails is retried** on the maintenance tick instead
   of being dropped until the next restart.
 - The connection probe no longer writes to a dead socket, so a dropped SIP connection is reconnected
@@ -40,6 +41,11 @@
   discovery, the Ipercom video service tracks its one call as one explicit state instead of nine
   fields, and the camera account is minted through the session already logged in instead of a second
   cloud login.
+- **Readable logs with video on.** The media helper's per-second audio level line (`[atap] audio
+  ~1s: …`) now prints only at `log_level: debug`; it used to run at every level for the whole call.
+  `debug` no longer dumps liblinphone's full trace, which at ~100 lines a second pushed the add-on's
+  own lines out of the Supervisor log window in under a minute: it logs liblinphone's warnings
+  instead, and the full trace is a developer switch (`RECV_TRACE` / `STATION_TRACE`).
 
 ## 1.1.0
 

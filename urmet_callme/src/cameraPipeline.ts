@@ -31,7 +31,17 @@ export function listenControl(
   handler: ControlHandler,
   tag: string,
 ): Promise<{ server: Server; port: number }> {
-  const server = createServer((req, res) => void handler(req, res));
+  const server = createServer((req, res) => {
+    // An async handler's rejection would otherwise be an unhandled one (Node exits) with the response
+    // left open: log it and fail the request.
+    Promise.resolve()
+      .then(() => handler(req, res))
+      .catch((e) => {
+        log.error(`${tag}: ${req.method} ${req.url}: ${(e as Error).message}`);
+        if (!res.headersSent) res.writeHead(500);
+        res.end();
+      });
+  });
   // Without an 'error' handler an EADDRINUSE (e.g. a respawn race) is an unhandled 'error' event
   // that crashes the process.
   server.on("error", (e) => log.error(`${tag} error: ${(e as Error).message}`));

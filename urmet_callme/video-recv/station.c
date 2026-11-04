@@ -35,7 +35,7 @@
  *        STATION_KEEPALIVE_MS, STATION_PREWARM_HOLD_MS, STATION_IDLE_SECONDS, STATION_MAC,
  *        STATION_AUDIO_IN, STATION_TALK_DTMF, STATION_TALK_START_MS, STATION_ANSWER_RING,
  *        STATION_OPEN_AUDIO_AT_START, STATION_SWITCH_GAP_MS, STATION_CAM_CYCLE,
- *        STATION_REDIAL_DELAY_MS, STATION_DEBUG, SIP_REALM, RECV_BLACK_FRAME (h264tap.h)
+ *        STATION_REDIAL_DELAY_MS, STATION_DEBUG, STATION_TRACE, SIP_REALM, RECV_BLACK_FRAME (h264tap.h)
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -579,12 +579,16 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
     return;
   }
   if (g_call) {
-    const LinphoneCallParams *cp = linphone_call_get_current_params(g_call);
+    /* Negotiated params once the media runs; before that (a door call still in setup) our own offer,
+     * so an audio-only phase-B door call is not mistaken for one that will carry a picture. */
+    const LinphoneCallParams *cp =
+        g_streams ? linphone_call_get_current_params(g_call) : linphone_call_get_params(g_call);
     int has_video = cp && linphone_call_params_video_enabled(cp) &&
                     linphone_call_params_get_video_direction(cp) != LinphoneMediaDirectionInactive;
-    if (g_call_is_ring || g_call_is_camera || has_video || !g_streams) {
-      slog("[station] camera: showing the call already up (%s)\n",
-           g_call_is_ring ? "answered ring" : g_call_is_camera ? "camera call" : "door call with video");
+    if (g_call_is_ring || g_call_is_camera || has_video) {
+      slog("[station] camera: showing the call already up (%s%s)\n",
+           g_call_is_ring ? "answered ring" : g_call_is_camera ? "camera call" : "door call with video",
+           g_streams ? "" : ", media not up yet");
       if (g_streams) {
         expect_picture();
         nudge_keyframe(g_call, "for the camera joining a live call");
@@ -938,7 +942,8 @@ int main(int argc, char **argv) {
             "    an announcement or door press during it answers it.\n"
             "  STATION_OPEN_AUDIO_AT_START=1: open the audio on every camera call (the entrance sound;\n"
             "    next camera then re-dials). STATION_MAC: phase-B station (dial with a `mac` header).\n"
-            "  env: STATION_DATA_DIR=<dir> (unique per place), STATION_UUID, SIP_REALM, STATION_DEBUG=1\n",
+            "  env: STATION_DATA_DIR=<dir> (unique per place), STATION_UUID, SIP_REALM, STATION_DEBUG=1\n"
+            "    (per-second audio level + liblinphone warnings), STATION_TRACE=1 (liblinphone's full trace)\n",
             argv[0]);
     return 2;
   }
@@ -964,9 +969,14 @@ int main(int argc, char **argv) {
       .pass = in_pass,
       .data_dir = getenv("STATION_DATA_DIR"),
       .uuid = getenv("STATION_UUID"),
-      .want_video = phase_b_mac() == NULL, /* phase-B: audio only, incl. a station's re-INVITE offering video */
+      /* The graphs are always built: the camera call needs them on every station (the phase-B camera
+       * used to be recv's, with video). A phase-B door call is audio only (place_call disables video
+       * on it) and a video stream such a station adds by re-INVITE is answered inactive. */
+      .want_video = 1,
+      .accept_video = phase_b_mac() == NULL,
       .auto_initiate = 1,
       .debug = getenv("STATION_DEBUG") != NULL,
+      .trace = getenv("STATION_TRACE") != NULL,
   };
   LinphoneCore *lc = lp_create_core(&setup, cbs);
   linphone_core_cbs_unref(cbs);

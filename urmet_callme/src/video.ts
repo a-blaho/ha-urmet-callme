@@ -410,10 +410,12 @@ export class VideoService {
       }
       return;
     }
-    // A stale prior call for THIS camera (requested and never answered, or ended but not yet cancelled)
-    // -> clean it up first, keeping the slot.
+    // A stale prior call (requested and never answered, or ended but not yet cancelled) -> clean it up
+    // first, keeping the slot. Usually this camera's own; another camera's when the busy watchdog
+    // freed the slot while its gateway request was still pending, which must be cancelled there or
+    // the panel can still connect it later into THIS camera's FIFOs.
     const retried = current?.cam === idx ? current.retried : false;
-    if (current?.cam === idx) await this.cancel(idx, true);
+    if (current) await this.cancel(current.cam, true);
     this.writeTarget(idx); // point the shared recv at THIS camera's FIFOs before it answers
     const call: Call = { cam: idx, state: "requested", placedAt: Date.now(), retried };
     this.call = call;

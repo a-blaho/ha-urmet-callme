@@ -2,7 +2,7 @@
 // parts that hang off it (ipercom.ts for the gateway protocol, doorbell.ts for the per-place ring
 // listeners, stationDiscovery.ts for the phase-B place the cloud does not list). index.ts talks to
 // this one object; the modules behind it never see each other.
-import { Cloud, InstanceAccount } from "./cloud.js";
+import { Cloud, InstanceAccount, isPowerDown } from "./cloud.js";
 import { DoorbellListeners, DoorbellRing } from "./doorbell.js";
 import { AvailableDevice, DeviceCallOpts, Door, IpercomGateway } from "./ipercom.js";
 import { logger, redact } from "./logger.js";
@@ -64,6 +64,12 @@ export class CallMe {
           existing.update(d);
           next.push(existing);
         } else next.push(fresh);
+        // The app marks such a place unavailable and offers no calls on it; we keep the entities but
+        // say why a camera or door call to it is about to fail.
+        if (isPowerDown(d))
+          log.warn(
+            `place ${fresh.id} (${fresh.name}): the cloud reports its main power supply DOWN; calls to it will likely fail until it is back`,
+          );
       }
       const gone = this.places.filter((p) => !next.includes(p));
       if (gone.length)

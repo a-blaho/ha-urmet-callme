@@ -210,7 +210,8 @@ int main(int argc, char **argv) {
             "RECV_HANGUP_URL=<url> (pinged on the idle hang-up), "
             "RECV_CONNECTED_URL=<url> (pinged at StreamsRunning), "
             "RECV_ENDED_URL=<url> (pinged when the call is over), "
-            "RECV_IDLE_SECONDS=<n> (default 10), SIP_REALM, RECV_DEBUG=1 (SIP trace)\n"
+            "RECV_IDLE_SECONDS=<n> (default 10), SIP_REALM, RECV_DEBUG=1 (per-second audio level, "
+            "RTP counters, liblinphone warnings), RECV_TRACE=1 (liblinphone's full trace)\n"
             "  SIGUSR1 ends the current call (in-dialog BYE) and stays registered; SIGUSR2 asks the "
             "panel for a keyframe (a reader re-attached to the live call).\n",
             argv[0]);
@@ -237,8 +238,10 @@ int main(int argc, char **argv) {
       .data_dir = getenv("RECV_DATA_DIR"),
       .uuid = getenv("RECV_UUID"),
       .want_video = 1,
+      .accept_video = 1,
       .auto_initiate = 0, /* inbound only: accept the panel's video, never offer */
       .debug = getenv("RECV_DEBUG") != NULL,
+      .trace = getenv("RECV_TRACE") != NULL,
   };
   LinphoneCore *lc = lp_create_core(&setup, cbs);
   linphone_core_cbs_unref(cbs);

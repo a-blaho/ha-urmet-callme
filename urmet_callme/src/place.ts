@@ -18,6 +18,17 @@ export function familyOf(uidType: string): Family {
   return "unknown";
 }
 
+/** The station's MAC in `mac`-header form (colons), when its account IS a MAC. Those are the "phase B"
+ *  devices (the 1083/58A family): the cloud does not list them, the app builds their account from the
+ *  MAC it learns at introduction, and it dials them with a `mac` header instead of `auto_insertion:
+ *  true` - they answer 486 Busy to the latter. A cloud-listed station has a generated account name, no
+ *  MAC shape, and keeps the auto_insertion header. Returns "" for a non-MAC account. */
+export function macHeaderOf(user: string): string {
+  return /^([0-9a-f]{2}_){5}[0-9a-f]{2}$/i.test(user)
+    ? user.replace(/_/g, ":")
+    : "";
+}
+
 export class Place {
   // The account fields are (re)assigned by update(), hence the definite-assignment marks.
   channel!: number;

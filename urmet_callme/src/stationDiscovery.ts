@@ -9,7 +9,7 @@
 import { InstanceAccount, PlaceData } from "./cloud.js";
 import { DoorbellRing } from "./doorbell.js";
 import { logger } from "./logger.js";
-import { Place } from "./place.js";
+import { macHeaderOf, Place } from "./place.js";
 import { buildBody } from "./query.js";
 import { callerName, SipClient, uriUser } from "./sipClient.js";
 import { loadStation, saveStation } from "./station.js";
@@ -182,7 +182,7 @@ export class StationDiscovery {
     const previous = place.outgoingUser;
     place.outgoingUser = user;
     saveStation(place.id, user);
-    const macShaped = /^([0-9a-f]{2}_){5}[0-9a-f]{2}$/i.test(user);
+    const macShaped = macHeaderOf(user) !== "";
     log.info(
       `station ${user} (mac-shaped=${macShaped}) for place ${place.id} from ${source}` +
         (previous ? ` (was ${previous})` : ""),
