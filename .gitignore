@@ -2,7 +2,6 @@ node_modules
 dist
 .dev-data
 
-# Safety net: the reverse-engineering material lives in a separate repo and is Urmet IP.
 *.apk
 *.xapk
 callme/
@@ -10,6 +9,4 @@ callme/
 .DS_Store
 ._*
 
-# Reverse-engineering material: the official apps (Urmet IP), their jadx output and the protocol
-# notes derived from them. Never committed; see reverse-engineering/README.md.
 reverse-engineering/
