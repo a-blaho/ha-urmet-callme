@@ -6,7 +6,9 @@
 // The strike is momentary with no state feedback, so a stateless button models it (no lock state).
 import mqtt, { IClientOptions, MqttClient } from "mqtt";
 import { Announcer } from "./announce.js";
-import { CallMe, Door, DoorbellRing } from "./callme.js";
+import { CallMe } from "./callme.js";
+import { DoorbellRing } from "./doorbell.js";
+import { Door } from "./ipercom.js";
 import { logger } from "./logger.js";
 import { uriUser } from "./sipClient.js";
 import { TwoVoiceDoor, TwoVoiceStation } from "./twoVoiceStation.js";

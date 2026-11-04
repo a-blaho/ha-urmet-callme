@@ -35,7 +35,11 @@
   (`door_open_2voice_keepalive: 0` still means a fresh call per press; the call is held half a second
   for the tone to land), `recv`'s dev-only knobs are gone, the FIFO paths and the helper command
   alphabet are each defined once, MQTT entities are published through one routine (ids unchanged),
-  and the SIP client, the helper protocol and the MQTT bridge have unit tests.
+  the SIP client, the helper protocol and the MQTT bridge have unit tests, the CallMe client is split
+  into the session, the Ipercom gateway protocol, the doorbell listeners and the phase-B station
+  discovery, the Ipercom video service tracks its one call as one explicit state instead of nine
+  fields, and the camera account is minted through the session already logged in instead of a second
+  cloud login.
 
 ## 1.1.0
 

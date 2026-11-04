@@ -138,6 +138,16 @@ simplified (no camera take-over replay). The helper line protocol is unchanged a
 `CAMERA live` line. Compiled in Docker; **not verified on hardware** (no 2Voice station available to
 the maintainer): the first 2Voice user report after release is the test.
 
-**Phase 3, behaviour (Uin decompiled; see `PROTOCOL-UIN.md` in the sibling repo):** 120 s call cap,
-channel `flags`, UA constant; then two hardware-gated experiments on a 1760: the call-less
-`open_door_req` door path (item 8) and the Uin-style `Subject`+`mac` INVITE headers (item 9).
+**Phase 2b, the remaining structure — DONE on `refactor/phase-1` (2026-11-04):** `callme.ts` split into
+`place.ts`, `ipercom.ts` (gateway protocol), `doorbell.ts` (listeners), `stationDiscovery.ts` (phase-B)
+with `CallMe` as the thin session facade; `video.ts` keeps one `holder` and one `Call`
+(`requested | live | ended`) instead of nine fields; `VideoService` mints the camera account through
+`CallMe.cloud` (one login per start). `video.ts` is the one piece the maintainer can verify on the
+Green; do that before the PR.
+
+**Phase 3, behaviour:** the **120 s call cap is dropped** — the app's `in_call_timeout` is a phone-UI
+guard, the add-on already ends calls nobody reads, and a hard cap would interrupt a dashboard every two
+minutes; if a 2Voice user ever reports a card holding the bus, add an optional 2Voice view limit
+(default off). Still open: a log line for places the cloud flags powered down (`flags` bit 0), dropping
+`clearStaleDiscovery` after one more release, and the two hardware-gated experiments on a 1760: the
+call-less `open_door_req` door path (item 8) and the Uin-style `Subject`+`mac` INVITE headers (item 9).

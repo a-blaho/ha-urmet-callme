@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { CallMe, Door } from "./callme.js";
+import type { CallMe } from "./callme.js";
+import type { Door } from "./ipercom.js";
 import { MqttBridge, MqttLike } from "./mqtt.js";
 import type { TwoVoiceStation } from "./twoVoiceStation.js";
 

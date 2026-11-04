@@ -32,9 +32,10 @@ reverse-engineering/  GIT-IGNORED: the official apps, their jadx output and the 
 | `cloud.ts` | Urmet cloud HTTP: login, `sipdata`, `get_my_devices`, unique account creation |
 | `urmetCrypto.ts`, `token.ts`, `query.ts` | the `sipdata` cipher, the MESSAGE token, the MESSAGE body |
 | `sipClient.ts` | one TLS socket per account: REGISTER, out-of-dialog MESSAGE, inbound INVITE ring-only |
-| `callme.ts` | places, families (`familyOf`), gateway resolve, doors, Ipercom door open, camera requests, doorbell listeners, phase-B station discovery |
+| `callme.ts` | the session: cloud login, instance SIP account, places (updated in place on reconnect), SIP registration; thin by-place-id delegates to the three below |
+| `place.ts`, `ipercom.ts`, `doorbell.ts`, `stationDiscovery.ts` | the place model and `familyOf`; the Ipercom gateway MESSAGE protocol (resolve, doors, devices, open, call/cancel); per-place doorbell listeners; the phase-B place the cloud does not list (introduction, census, ring) |
 | `twoVoiceStation.ts` | 2Voice: one persistent `station` helper per place; door/gate/ready/announce and, with video, the camera on its single call |
-| `video.ts` | Ipercom camera service (shared account B, one call at a time, `recv`) |
+| `video.ts` | Ipercom camera service: shared account B, `recv`, one slot (`holder`) and one explicit call state (`requested` / `live` / `ended`) |
 | `cameraPipeline.ts`, `go2rtc.ts`, `helperProtocol.ts` | shared FIFO/control-endpoint pieces, the hardened go2rtc config, the helper stdin/stdout alphabet |
 | `announce.ts` | 2Voice announcements (TTS or URL → talk FIFO) |
 | `mqtt.ts` | MQTT discovery entities and command routing (`publishEntity`) |

@@ -12,7 +12,7 @@
 import { ChildProcess, execFileSync, spawn } from "node:child_process";
 import { mkdirSync, unlinkSync } from "node:fs";
 import type { Server } from "node:http";
-import { Place } from "./callme.js";
+import { Place } from "./place.js";
 import { listenControl, makeFifos, type ControlHandler } from "./cameraPipeline.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { cameraCommand, HelperCommand, parseHelperLine } from "./helperProtocol.js";

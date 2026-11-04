@@ -2,7 +2,8 @@
 // and keep the SIP registration alive.
 import { readFileSync } from "node:fs";
 import { Announcer } from "./announce.js";
-import { CallMe, Door } from "./callme.js";
+import { CallMe } from "./callme.js";
+import { Door } from "./ipercom.js";
 import { Go2rtcPorts } from "./go2rtc.js";
 import { startIngressServer } from "./ingress.js";
 import { logger, setLevel } from "./logger.js";
@@ -253,13 +254,7 @@ async function main() {
   if (cfg.video) {
     try {
       if (ipercomPlaces.length) {
-        video = new VideoService(
-          callme,
-          ipercomPlaces.map((p) => p.id),
-          cfg.email,
-          cfg.password,
-          cfg.go2rtcPorts,
-        );
+        video = new VideoService(callme, ipercomPlaces.map((p) => p.id), cfg.email, cfg.go2rtcPorts);
         await video.start();
       } else if (twoVoice) {
         await twoVoice.startVideo(cfg.go2rtcPorts);
