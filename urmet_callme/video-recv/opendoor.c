@@ -50,22 +50,37 @@
  * uses, minus the FIFO tap (door-open needs no audio content, only that a stream runs). ---- */
 static MSFactory *g_factory = NULL;
 
+/* Camera audio FIFO while a ring call feeds the camera ('V', see ring_camera): the received PCM goes
+ * there, like recv's audio tap. Empty = discard. */
+static char g_cam_audio[256] = "";
+
 typedef struct {
   int rate;
   int nch;
+  int fd; /* camera PCM FIFO, opened O_RDWR|O_NONBLOCK like recv's taps (no EPIPE, drop when full) */
 } NullSink;
 
 static void nullsink_init(MSFilter *f) {
   NullSink *s = ms_new0(NullSink, 1);
   s->rate = 8000;
   s->nch = 1;
+  s->fd = -1;
   f->data = s;
 }
 static void nullsink_process(MSFilter *f) {
+  NullSink *s = (NullSink *)f->data;
+  if (s->fd < 0 && g_cam_audio[0]) s->fd = open(g_cam_audio, O_RDWR | O_NONBLOCK);
   mblk_t *im;
-  while ((im = ms_queue_get(f->inputs[0])) != NULL) freemsg(im); /* discard: no speaker */
+  while ((im = ms_queue_get(f->inputs[0])) != NULL) {
+    if (s->fd >= 0) (void)!write(s->fd, im->b_rptr, (size_t)(im->b_wptr - im->b_rptr));
+    freemsg(im); /* otherwise discard: no speaker */
+  }
 }
-static void nullsink_uninit(MSFilter *f) { ms_free(f->data); }
+static void nullsink_uninit(MSFilter *f) {
+  NullSink *s = (NullSink *)f->data;
+  if (s->fd >= 0) close(s->fd);
+  ms_free(s);
+}
 static int nullsink_set_sr(MSFilter *f, void *a) { ((NullSink *)f->data)->rate = *(int *)a; return 0; }
 static int nullsink_get_sr(MSFilter *f, void *a) { *(int *)a = ((NullSink *)f->data)->rate; return 0; }
 static int nullsink_set_nch(MSFilter *f, void *a) { ((NullSink *)f->data)->nch = *(int *)a; return 0; }
@@ -106,6 +121,12 @@ static void olog(const char *fmt, ...) {
   vprintf(fmt, ap);
   va_end(ap);
 }
+
+/* The camera's H.264 tap (shared with recv.c). Registered as our H264 decoder: with no camera target
+ * it just discards the video (cheaper than decoding it for the headless display, as before); while a
+ * ring call feeds the camera it writes the stream to the camera's FIFO. */
+#define TAP_LOG olog
+#include "h264tap.h"
 typedef struct {
   int rate;
   int nch;
@@ -216,6 +237,8 @@ static int g_talk_digit_sent = 0; /* the open-audio digit went out on this call 
  * every new call, so an announcement or door press during the ring can't place its own call; it
  * answers this one instead (answer_ring). NULL = no ring, or not holding rings. */
 static LinphoneCall *g_ring = NULL;
+static int g_call_is_ring = 0; /* g_call is a ring we answered (not a call we placed) */
+static int g_cam_on = 0;       /* the ring call (held or answered) feeds the camera ('V') */
 
 static void on_sig(int _s) { (void)_s; g_running = 0; }
 
@@ -267,6 +290,19 @@ static void on_reg_state(LinphoneCore *lc, LinphoneProxyConfig *cfg,
   else if (state == LinphoneRegistrationFailed) g_reg_failed = 1;
 }
 
+/* The ring call is gone (ended while held, or the answered ring ended): stop feeding the camera and
+ * tell the control plane, which then places normal camera calls again. */
+static void ring_gone(void) {
+  if (g_cam_on) {
+    g_cam_on = 0;
+    g_tap_target[0] = '\0';
+    g_cam_audio[0] = '\0';
+    printf("[opendoor] camera: the ring call ended, so did its picture\nCAMERA end\n");
+  }
+  printf("RING gone\n");
+  fflush(stdout);
+}
+
 static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
                           LinphoneCallState state, const char *message) {
   (void)lc;
@@ -283,7 +319,7 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     if (!g_ring && getenv("OPENDOOR_ANSWER_RING")) {
       g_ring = linphone_call_ref(call);
       printf("[opendoor] ring: holding the doorbell call unanswered (an announcement or door press "
-             "during the ring answers it)\n");
+             "during the ring answers it; the camera shows it without answering)\nRING held\n");
       fflush(stdout);
     } else {
       linphone_call_decline(call, LinphoneReasonBusy);
@@ -310,6 +346,7 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
       fflush(stdout);
       linphone_call_unref(g_ring);
       g_ring = NULL;
+      ring_gone();
       break;
     }
     /* DIAGNOSTIC (58A support): print the SIP status the station returned. A `486 Busy Here` here
@@ -322,6 +359,10 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
            message ? message : "");
     fflush(stdout);
     if (g_call == call) g_ended = 1;
+    if (g_call == call && g_call_is_ring) {
+      g_call_is_ring = 0;
+      ring_gone();
+    }
     break;
   }
   case LinphoneCallEnd:
@@ -331,9 +372,14 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
       fflush(stdout);
       linphone_call_unref(g_ring);
       g_ring = NULL;
+      ring_gone();
       break;
     }
     if (state == LinphoneCallEnd) log_audio_rtp(call, "call ended");
+    if (g_call == call && g_call_is_ring) {
+      g_call_is_ring = 0;
+      ring_gone();
+    }
     printf("[opendoor] call finished: %s\n", message ? message : "");
     fflush(stdout);
     if (g_call == call) g_ended = 1;
@@ -343,12 +389,6 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
   }
 }
 
-/* Monotonic milliseconds. */
-static long long now_ms(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 
 #define OPENDOOR_STREAMS_TIMEOUT_MS 20000 /* after the INVITE, wait this long for media */
 /* Pre-warm hold: how long to keep a call opened by a 'W' (warm) command up while waiting for the
@@ -386,21 +426,101 @@ static int answer_ring(LinphoneCore *lc, const char *what) {
     linphone_call_params_enable_video(p, TRUE); /* as on our own calls: receive only, discarded */
     linphone_call_params_set_video_direction(p, LinphoneMediaDirectionRecvOnly);
   }
+  /* Make it g_call BEFORE accepting: the media of an incoming call comes up inside the accept
+   * (StreamsRunning fires synchronously), so clearing g_streams afterwards lost it and a queued door
+   * tone waited forever for media that was already up (#19). */
+  g_call = c; /* keeps the ref taken when the ring arrived */
+  g_call_is_ring = 1;
+  g_streams = 0;
+  g_ended = 0;
+  g_talk_digit_sent = 1;
   LinphoneStatus rc = linphone_call_accept_with_params(c, p);
   linphone_call_params_unref(p);
   printf("[opendoor] ring: the station is ringing -> answering the ring call for the %s (%s)\n",
          what, rc == 0 ? "ok; the phone app stops ringing" : "FAILED, declining it");
   fflush(stdout);
   if (rc != 0) {
+    g_call = NULL;
+    g_call_is_ring = 0;
+    g_ended = 0;
     linphone_call_decline(c, LinphoneReasonBusy);
     linphone_call_unref(c);
     return 0;
   }
-  g_call = c; /* keeps the ref taken when the ring arrived */
-  g_streams = 0;
-  g_ended = 0;
-  g_talk_digit_sent = 1;
   return 1;
+}
+
+/* The camera opened during a ring ('V <h264 fifo> <pcm fifo>'): feed it from the ring call, as the
+ * official app's "view camera" button does on its incoming-call screen. A ring still ringing gets
+ * early media (183 + SDP: the station streams while the call keeps ringing, so the phones keep
+ * ringing too), and only when its video is recvonly/sendrecv for us -- the app's isEarlyMediaAllowed
+ * check. A ring already answered (for an announcement / door press) just has its video and audio
+ * redirected to the camera. Replies "CAMERA ok" or "CAMERA fail <why>" (the control plane then
+ * places a normal camera call); "CAMERA end" follows when the ring call ends. */
+static void ring_camera(const char *h264, const char *pcm) {
+  LinphoneCall *c = g_ring ? g_ring : (g_call && g_call_is_ring ? g_call : NULL);
+  if (!c || !h264[0] || !pcm[0]) {
+    printf("[opendoor] camera: no ring call to show\nCAMERA fail no ring\n");
+    fflush(stdout);
+    return;
+  }
+  if (c == g_ring) {
+    const LinphoneCallParams *cp = linphone_call_get_current_params(c);
+    LinphoneMediaDirection vd =
+        cp && linphone_call_params_video_enabled(cp) ? linphone_call_params_get_video_direction(cp)
+                                                     : LinphoneMediaDirectionInactive;
+    if (vd != LinphoneMediaDirectionRecvOnly && vd != LinphoneMediaDirectionSendRecv) {
+      printf("[opendoor] camera: the ring call offers no video for us (%s)\nCAMERA fail no video\n",
+             dir_name(vd));
+      fflush(stdout);
+      return;
+    }
+  }
+  snprintf(g_tap_target, sizeof g_tap_target, "%s", h264);
+  snprintf(g_cam_audio, sizeof g_cam_audio, "%s", pcm);
+  g_cam_on = 1;
+  if (c == g_ring) {
+    LinphoneStatus st = linphone_call_accept_early_media(c);
+    printf("[opendoor] camera: showing the ringing call (early media, as the app's \"view camera\"; "
+           "the phones keep ringing) -> %s\n", st == 0 ? "ok" : "FAILED");
+    if (st != 0) {
+      g_cam_on = 0;
+      g_tap_target[0] = '\0';
+      g_cam_audio[0] = '\0';
+      printf("CAMERA fail early media refused\n");
+      fflush(stdout);
+      return;
+    }
+  } else {
+    printf("[opendoor] camera: showing the answered ring call\n");
+  }
+  printf("CAMERA ok\n");
+  fflush(stdout);
+}
+
+/* The rest of a 'V' command line from stdin (the control plane writes it in one go). */
+static void read_rest_of_line(char *out, size_t outsz) {
+  size_t n = 0;
+  for (int spins = 0; spins < 200;) {
+    char c;
+    ssize_t r = read(STDIN_FILENO, &c, 1);
+    if (r == 1) {
+      if (c == '\n') break;
+      if (n + 1 < outsz) out[n++] = c;
+      continue;
+    }
+    if (r == 0) break;
+    usleep(1000);
+    spins++;
+  }
+  out[n] = '\0';
+}
+
+static void handle_camera_command(void) {
+  char line[600], h264[256] = "", pcm[256] = "";
+  read_rest_of_line(line, sizeof line);
+  if (sscanf(line, " %255s %255s", h264, pcm) < 2) h264[0] = pcm[0] = '\0';
+  ring_camera(h264, pcm);
 }
 
 /* Place an auto_insertion call to out_uri (or, while a ring is held, answer it -- see answer_ring).
@@ -418,6 +538,7 @@ static LinphoneCall *place_call(LinphoneCore *lc, LinphoneFactory *factory, cons
     }
     if (answer_ring(lc, what)) return g_call;
   }
+  g_call_is_ring = 0;
   g_streams = 0;
   g_ended = 0;
   g_talk_digit_sent = 0;
@@ -470,6 +591,10 @@ static void bye_call(LinphoneCore *lc) {
     }
     linphone_call_unref(c);
     g_call = NULL;
+    if (g_call_is_ring) { /* its End did not arrive in time: report the ring gone ourselves */
+      g_call_is_ring = 0;
+      ring_gone();
+    }
   }
   g_ended = 0; /* consume: place_call sets it fresh for the next call */
 }
@@ -668,6 +793,10 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
         talk_deadline = now + OPENDOOR_STREAMS_TIMEOUT_MS + talk_start;
         continue;
       }
+      if (c == 'V') {
+        handle_camera_command();
+        continue;
+      }
       if (c == 'H') {
         /* Release (hang up): the user pressed "hang up", or the camera is about to place ITS call
          * to this station and a held pre-warm/keep-alive call of ours would collide with it. A tone
@@ -768,7 +897,10 @@ static void keepalive_loop(LinphoneCore *lc, LinphoneFactory *factory, const cha
     }
     /* Idle -> release the bus/monitor. A pre-warm holds the call up until warm_deadline even with no
      * tone yet (last_activity stays 0), so require both the keep-alive idle AND the warm window past. */
-    if (g_call && g_streams && !g_talk_active && now - last_activity > keepalive_ms &&
+    /* An answered ring that feeds the camera stays up while someone watches (its FIFO drains), like
+     * the camera's own call (recv's RECV_IDLE_SECONDS). */
+    const int cam_watched = g_cam_on && g_call_is_ring && g_last_drain && time(NULL) - g_last_drain < 10;
+    if (g_call && g_streams && !g_talk_active && !cam_watched && now - last_activity > keepalive_ms &&
         now > warm_deadline && now > talk_deadline) {
       printf("[opendoor] keep-alive idle -> hanging up\n");
       fflush(stdout);
@@ -792,7 +924,8 @@ int main(int argc, char **argv) {
             "    silence; 'T' holds a call for a clip (OPENDOOR_TALK_DTMF = open-audio digit to send,\n"
             "    empty = none; OPENDOOR_TALK_START_MS = how long the clip may take to start).\n"
             "  OPENDOOR_ANSWER_RING=1: hold a doorbell ring unanswered; an announcement or door press\n"
-            "    during it answers it (the station refuses new calls while it rings).\n"
+            "    during it answers it (the station refuses new calls while it rings), and\n"
+            "    'V <h264 fifo> <pcm fifo>' shows it on the camera (early media, like the app).\n"
             "  env: OPENDOOR_DATA_DIR=<dir> (unique per place), OPENDOOR_DEBUG=1 (SIP trace)\n",
             argv[0]);
     return 2;
@@ -872,6 +1005,9 @@ int main(int argc, char **argv) {
   /* Register the null sound card so an audio stream can negotiate headless (see the card above). */
   g_factory = linphone_core_get_ms_factory(lc);
   ms_snd_card_manager_register_desc(ms_factory_get_snd_card_manager(g_factory), &null_card_desc);
+  /* Our H264 tap as the decoder (prepended, so it wins over openh264; see h264tap.h). */
+  ms_factory_register_filter(g_factory, &tap_desc);
+  load_black_frame();
 
   /* The station's TLS cert chain isn't ours to validate. */
   linphone_core_verify_server_certificates(lc, FALSE);
@@ -986,6 +1122,8 @@ int main(int argc, char **argv) {
           run_open(lc, factory, out_uri, c, 1); /* prints RESULT (ok as soon as the tone is out) */
         else if (n == 1 && c == 'T')
           run_talk(lc, factory, out_uri); /* announcement: place a call, play the clip, hang up */
+        else if (n == 1 && c == 'V')
+          handle_camera_command(); /* camera during a ring: show the ring call */
       }
     }
   } else {

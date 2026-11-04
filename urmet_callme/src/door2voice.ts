@@ -75,7 +75,13 @@ interface Helper {
   // consecutive presses all reach opendoor -- it queues the tones and sends them at StreamsRunning /
   // on the keep-alive call, and reports RESULT per command in order.
   pending: PendingOpen[];
+  ringing: boolean; // opendoor holds the place's doorbell ring call (held or answered): "RING held/gone"
+  // showRing() calls awaiting opendoor's "CAMERA ok|fail <why>" reply, in order.
+  camWaiters: ((failure: string | undefined) => void)[];
 }
+
+// How long opendoor may take to answer a 'V' (it reads stdin every 50 ms and replies at once).
+const CAMERA_REPLY_MS = 3000;
 
 export class TwoVoiceService {
   private helpers = new Map<string, Helper>(); // placeId -> its persistent opendoor
@@ -91,6 +97,8 @@ export class TwoVoiceService {
   videoLive?: (placeId: string) => boolean;
   /** Set by index.ts: opens the station's audio on the live camera call before an announcement. */
   cameraOpenAudio?: (placeId: string) => void;
+  /** Set by index.ts: the ring call that fed the place's camera (showRing) has ended. */
+  onRingCameraEnd?: (placeId: string) => void;
 
   constructor(
     private places: Place[],
@@ -119,7 +127,7 @@ export class TwoVoiceService {
         );
         continue;
       }
-      this.helpers.set(p.id, { place: p, buf: "", pending: [] });
+      this.helpers.set(p.id, { place: p, buf: "", pending: [], ringing: false, camWaiters: [] });
       try {
         unlinkSync(talkFifoOf(p.id));
       } catch {
@@ -208,6 +216,11 @@ export class TwoVoiceService {
     );
     child.on("exit", (code) => {
       h.child = undefined;
+      if (h.ringing) {
+        h.ringing = false;
+        this.onRingCameraEnd?.(placeId);
+      }
+      for (const w of h.camWaiters.splice(0)) w("the door helper exited");
       for (const p of h.pending) {
         clearTimeout(p.timer);
         p.reject(new Error(`opendoor exited (code ${code ?? "killed"})`));
@@ -236,6 +249,19 @@ export class TwoVoiceService {
       const line = h.buf.slice(0, nl).trimEnd();
       h.buf = h.buf.slice(nl + 1);
       if (!line) continue;
+      // Machine lines (ring state, camera replies) are consumed here; opendoor logs each in words.
+      if (line === "RING held" || line === "RING gone") {
+        h.ringing = line === "RING held";
+        log.debug(line);
+        continue;
+      }
+      const cam = /^CAMERA (ok|fail|end)\b ?(.*)$/.exec(line);
+      if (cam) {
+        log.debug(line);
+        if (cam[1] === "end") this.onRingCameraEnd?.(placeId);
+        else h.camWaiters.shift()?.(cam[1] === "ok" ? undefined : cam[2] || "failed");
+        continue;
+      }
       log.info(line); // opendoor lines are already "[opendoor] …"
       const r = parseResult(line);
       if (r && h.pending.length > 0) {
@@ -328,6 +354,37 @@ export class TwoVoiceService {
     const h = this.helpers.get(placeId);
     if (!h?.child?.stdin?.writable) return;
     h.child.stdin.write("H\n");
+  }
+
+  /** True while the door helper holds the place's doorbell ring call (still ringing, or answered for
+   *  an announcement / door press). The station refuses new calls meanwhile. */
+  ringing(placeId: string): boolean {
+    return this.helpers.get(placeId)?.ringing ?? false;
+  }
+
+  /** Show the place's ring call on its camera, as the official app's "view camera" button does on its
+   *  incoming-call screen: opendoor accepts early media on the ringing call (the phones keep ringing)
+   *  and taps its video/audio into the camera's FIFOs. Resolves undefined when it is showing, or with
+   *  the reason it can't (no ring, no video offered, refused, timeout). */
+  showRing(placeId: string, h264Fifo: string, pcmFifo: string): Promise<string | undefined> {
+    const h = this.helpers.get(placeId);
+    if (!h?.child?.stdin?.writable) return Promise.resolve("door helper not ready");
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (failure: string | undefined) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(failure);
+      };
+      const timer = setTimeout(() => {
+        const k = h.camWaiters.indexOf(finish);
+        if (k >= 0) h.camWaiters.splice(k, 1);
+        finish("no reply from the door helper");
+      }, CAMERA_REPLY_MS);
+      h.camWaiters.push(finish);
+      h.child!.stdin!.write(`V ${h264Fifo} ${pcmFifo}\n`);
+    });
   }
 
   /** The place's name, for logs. */

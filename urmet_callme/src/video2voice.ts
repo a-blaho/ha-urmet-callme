@@ -61,6 +61,14 @@ export class TwoVoiceVideoService {
   /** Set by index.ts: called right before a camera call is placed, so the door helper can release a
    *  call it is holding to the same station (a pre-warm / keep-alive), which ours would collide with. */
   onBeforeCall?: (placeId: string) => void;
+  /** Set by index.ts: while the door helper holds the place's doorbell ring (`ringing`), the station
+   *  refuses new calls, so the camera shows the ring call instead (`showRing`: early media, as the
+   *  app's "view camera"), which resolves undefined when showing, or with the reason it can't (we then
+   *  place a normal camera call). */
+  ringing?: (placeId: string) => boolean;
+  showRing?: (placeId: string, h264Fifo: string, pcmFifo: string) => Promise<string | undefined>;
+  private ringCams = new Set<number>(); // cameras currently fed by the door helper's ring call
+  private calling = new Map<number, Promise<void>>(); // camera requests being resolved (call())
 
   constructor(
     private places: Place[],
@@ -206,14 +214,7 @@ export class TwoVoiceVideoService {
     this.stdoutBuf.set(i, buf);
   }
 
-  // Spawn recv in OUTGOING mode for camera i: register the place's channel account and place the
-  // auto_insertion audio+video call to its OUT account, tapping to this camera's FIFOs. recv exits on
-  // its own when the call ends (viewer gone / idle), and we respawn on the next /call.
-  private startRecv(i: number) {
-    if (this.stopping || this.recvs.has(i)) return;
-    const cam = this.cams[i];
-    // A pre-warm / keep-alive call the door helper holds to this station would collide with ours.
-    this.onBeforeCall?.(cam.place.id);
+  private makeFifos(cam: Cam) {
     for (const fifo of [cam.fifo, cam.afifo]) {
       try {
         unlinkSync(fifo);
@@ -222,6 +223,53 @@ export class TwoVoiceVideoService {
       }
       execFileSync("mkfifo", [fifo]);
     }
+  }
+
+  /** A camera request: show the ring call while the door helper holds one (see ringCamera),
+   *  otherwise place our own camera call. */
+  private call(i: number): Promise<void> {
+    if (this.ringCams.has(i) || this.recvs.has(i)) return Promise.resolve(); // already streaming
+    let p = this.calling.get(i); // a second viewer while the first request resolves: share it
+    if (!p) {
+      p = this.resolveCall(i).finally(() => this.calling.delete(i));
+      this.calling.set(i, p);
+    }
+    return p;
+  }
+
+  private async resolveCall(i: number): Promise<void> {
+    const cam = this.cams[i];
+    if (!this.stopping && this.showRing && this.ringing?.(cam.place.id)) {
+      log.info(`2Voice camera [${i}] ${cam.place.name}: the station is ringing -> showing the ring call`);
+      this.makeFifos(cam); // first: opendoor opens them as soon as the early media starts
+      const failure = await this.showRing(cam.place.id, cam.fifo, cam.afifo);
+      if (!failure) {
+        this.ringCams.add(i);
+        return;
+      }
+      log.info(
+        `2Voice camera [${i}] ${cam.place.name}: can't show the ring call (${failure}); placing a camera call`,
+      );
+    }
+    this.startRecv(i);
+  }
+
+  /** The ring call that fed the place's camera ended: the next request places a normal camera call. */
+  ringCameraEnded(placeId: string): void {
+    const i = this.camIndex(placeId);
+    if (this.ringCams.delete(i))
+      log.info(`2Voice camera [${i}] ${this.cams[i].place.name}: the ring call ended`);
+  }
+
+  // Spawn recv in OUTGOING mode for camera i: register the place's channel account and place the
+  // auto_insertion audio+video call to its OUT account, tapping to this camera's FIFOs. recv exits on
+  // its own when the call ends (viewer gone / idle), and we respawn on the next /call.
+  private startRecv(i: number) {
+    if (this.stopping || this.recvs.has(i)) return;
+    const cam = this.cams[i];
+    // A pre-warm / keep-alive call the door helper holds to this station would collide with ours.
+    this.onBeforeCall?.(cam.place.id);
+    this.makeFifos(cam);
     const targetFile = `/tmp/recv2v_target_${i}`;
     writeFileSync(targetFile, `${cam.fifo}\n${cam.afifo}\n`);
     const dataDir = `/tmp/lp_2v_vid_${i}/`; // unique per camera (shared sqlite corrupts account state)
@@ -310,8 +358,10 @@ export class TwoVoiceVideoService {
       const i = parseInt(u.searchParams.get("cam") || "0", 10) || 0;
       if (!this.cams[i]) return void res.writeHead(400).end("no such camera");
       if (u.pathname === "/call") {
-        this.startRecv(i); // idempotent: no-op if already streaming this camera
-        return void res.writeHead(200).end("ok");
+        // Idempotent: a no-op if already streaming this camera. Answers once the stream source is
+        // chosen, so stream.sh opens the FIFOs only after they were (re)made.
+        void this.call(i).then(() => res.writeHead(200).end("ok"));
+        return;
       }
       if (u.pathname === "/hangup") {
         this.stopRecv(i);

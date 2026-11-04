@@ -58,6 +58,7 @@ COPY src ./src
 COPY video-recv/recv.c ./recv.c
 COPY video-recv/opendoor.c ./opendoor.c
 COPY video-recv/talkout.h ./talkout.h
+COPY video-recv/h264tap.h ./h264tap.h
 COPY stream.sh ./stream.sh
 
 # Build the TS control plane, compile the liblinphone receiver + 2Voice door-opener, drop dev deps.

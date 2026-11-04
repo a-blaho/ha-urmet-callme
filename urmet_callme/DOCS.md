@@ -207,12 +207,17 @@ replaces one still playing, and clips are cut at `announce_max_seconds`.
 announcement - or a door/gate press - sent during the ring then **answers the ring call** and plays on
 it instead, so an automation can reply to a visitor right away ("Please leave the parcel in the
 lockers"). Answering takes the call, so the CallMe app on your phones stops ringing, just as when
-someone answers it. The "… ready" (pre-warm) button never answers a ring, and the camera is not
-available until the ring ends.
+someone answers it. The "… ready" (pre-warm) button never answers a ring.
+
+**The camera during a ring** shows the ring call itself, the way the official app's "view camera"
+button on its incoming-call screen does: the station streams the picture while the call keeps ringing,
+so your phones keep ringing too (this needs `video: true`). An announcement or door press then answers
+that same call, and the picture stays. When the ring ends, the stream stops; opening the camera again
+places a normal camera call.
 
 Confirmed on a cloud-listed 2Voice station
-([issue #19](https://github.com/a-blaho/ha-urmet-callme/issues/19)); answering a ring is new and not
-yet confirmed. Please report how it behaves on yours there, with the add-on log of one announcement -
+([issue #19](https://github.com/a-blaho/ha-urmet-callme/issues/19)); the camera during a ring is new and
+not yet confirmed. Please report how it behaves on yours there, with the add-on log of one announcement -
 every step is logged at the default `info` level (see [Logging](#logging)).
 
 ## Options
@@ -253,7 +258,8 @@ through the log:
   (we can only be heard when our direction allows sending), the open-audio tone, and the audio RTP
   packets sent after each clip.
 - `[opendoor] ring: …`: a doorbell ring the door helper holds unanswered, and whether an announcement
-  or door press during it answered it.
+  or door press during it answered it. `[opendoor] camera: …` / `[video2v] … showing the ring call`:
+  the camera showing the ring call during it.
 - `[opendoor] talk-out: …` / `[atap] talk-out: …` (camera call): when the clip reached the call, a level
   line per second while it plays, and a summary - audio length, peak level, clipping, and dropouts
   (gaps where the source was slower than real time) - with a plain-language warning when the clip is

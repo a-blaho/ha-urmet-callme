@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **2Voice: the camera works during a ring, like the app's "view camera"
+  ([#19](https://github.com/a-blaho/ha-urmet-callme/issues/19)).** A ringing station refuses new
+  calls, so opening the camera during a ring used to hang up the add-on's call (cutting an
+  announcement short) and then get declined anyway. The camera now shows the ring call itself, as the
+  official app's incoming-call screen does: the station streams the picture while the call keeps
+  ringing, so the phones keep ringing too, and a face-recognition automation gets a picture right
+  away. An announcement or door press then answers that same call, and the picture stays. Not yet
+  confirmed on a station.
+- **2Voice: a door press during a ring now opens the door.** 1.0.20 answered the ring for it but never
+  sent the tone: the call's media came up while it was being answered, and that was then forgotten.
+
 ## 1.1.0
 
 - **2Voice: "next camera" now switches on the live call, like the app

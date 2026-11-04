@@ -286,6 +286,10 @@ async function main() {
     tv.videoLive = (placeId) => v2.hasCall(placeId);
     if (cfg.announceOpenAudio) tv.cameraOpenAudio = (placeId) => v2.openAudio(placeId);
     v2.onBeforeCall = (placeId) => tv.release(placeId);
+    // During a ring the camera shows the ring call (early media, like the app's "view camera").
+    v2.ringing = (placeId) => tv.ringing(placeId);
+    v2.showRing = (placeId, h264, pcm) => tv.showRing(placeId, h264, pcm);
+    tv.onRingCameraEnd = (placeId) => v2.ringCameraEnded(placeId);
   }
 
   // "Hang up" button per place with a camera: ends its live camera call now, and on 2Voice also any
