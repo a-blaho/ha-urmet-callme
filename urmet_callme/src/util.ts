@@ -23,12 +23,14 @@ export function sipUri(address: string): string {
   return /^sips?:/i.test(a) ? a : `sip:${a}`;
 }
 
-/** The `RESULT <cmd> ok|fail` line the liblinphone helpers print per command: door/gate tones '1'/'2'
- *  (opendoor always; recv when it takes tones on the live camera call) and camera switches 'N' (recv
- *  only). Every command recv answers must match, or its pending queue shifts onto the wrong press.
- *  Matched anywhere in the line: recv's lines carry a timestamp prefix, opendoor's a `[opendoor]`
- *  tag, and a fail may carry a reason. */
-export function parseResult(line: string): { digit: "1" | "2" | "N"; ok: boolean } | null {
-  const m = /RESULT ([12N]) (ok|fail)/.exec(line);
-  return m ? { digit: m[1] as "1" | "2" | "N", ok: m[2] === "ok" } : null;
+/** The SIP User-Agent every component presents: the official app's, which the 2Voice station may gate
+ *  outgoing calls on. The C helpers carry the same literal (they cannot import this). */
+export const SIP_USER_AGENT = "UrmetCallForwarding-Android";
+
+/** The per-camera FIFO pair the media helper writes and stream.sh's ffmpeg reads: raw Annex-B H.264 and
+ *  raw PCM (s16le 8 kHz mono, G.711 forced). Camera `i` is the go2rtc stream `urmet_cam_<i>`; the paths
+ *  are passed to stream.sh as arguments. stream.sh re-checks them against this exact shape before
+ *  handing them to ffmpeg (go2rtc's LAN API lets anyone choose the arguments), so keep the two in step. */
+export function camFifos(i: number): { h264: string; pcm: string } {
+  return { h264: `/tmp/urmet_cam_${i}.h264`, pcm: `/tmp/urmet_cam_${i}.pcm` };
 }

@@ -3,7 +3,7 @@
 # that tap is VERSION-FRAGILE: on Debian trixie (liblinphone 5.3.105 / mediastreamer2 v14) it stops
 # producing frames -- the camera call connects but recv never reports media, so stream.sh gets a 503
 # and go2rtc shows the camera "unavailable" (the 2Voice video regression Noemi caught, 2026-09).
-# Door-open is unaffected (opendoor.c places the same call but does NOT tap video). Ubuntu 24.04 is
+# 2Voice door-open is unaffected (station.c's door call does not need the tap). Ubuntu 24.04 is
 # the PROVEN media environment -- do NOT "modernize" the base to Debian/Alpine without re-verifying
 # video on a real panel. ubuntu:24.04 is multi-arch, so the composable-actions CI
 # (.github/workflows) still builds per-arch with no build.yaml. No S6 here, so config.yaml sets
@@ -29,7 +29,7 @@ ARG GO2RTC_SHA256_ARM64=359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa
 # /usr/share/belr/grammars/identity_grammar. Without it liblinphone FATALs ("Unable to load Identity
 # Address grammar") and recv crash-loops. liblinphone-dev alone only provides the sdp/vcard grammars.
 # Do NOT drop linphone-cli to slim the image. On Ubuntu, liblinphone-dev pulls the mediastreamer/ortp
-# dev symlinks, so recv/opendoor link -lmediastreamer -lortp (NOT the Debian -lmediastreamer2).
+# dev symlinks, so recv/station link -lmediastreamer -lortp (NOT the Debian -lmediastreamer2).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl build-essential pkg-config \
@@ -56,11 +56,14 @@ COPY package.json package-lock.json* tsconfig.json tsconfig.build.json ./
 RUN npm ci
 COPY src ./src
 COPY video-recv/recv.c ./recv.c
-COPY video-recv/opendoor.c ./opendoor.c
+COPY video-recv/station.c ./station.c
+COPY video-recv/lpcommon.h ./lpcommon.h
 COPY video-recv/talkout.h ./talkout.h
+COPY video-recv/h264tap.h ./h264tap.h
 COPY stream.sh ./stream.sh
 
-# Build the TS control plane, compile the liblinphone receiver + 2Voice door-opener, drop dev deps.
+# Build the TS control plane, compile the liblinphone helpers (recv = the Ipercom camera receiver,
+# station = the 2Voice station helper), drop dev deps.
 # Also generate a tiny black H.264 keyframe (SPS+PPS+IDR, CIF 352x288 baseline): recv writes it to the
 # output FIFO at the start of each call so ffmpeg (and thus go2rtc) can ADVERTISE the video track
 # immediately, before the panel's first real keyframe (~4s later) -- otherwise the on-demand WebRTC
@@ -68,8 +71,8 @@ COPY stream.sh ./stream.sh
 RUN npm run build \
  && cc -O2 -Wall recv.c -llinphone -lbctoolbox -lbellesip -lmediastreamer -lortp \
       -o /usr/local/bin/recv \
- && cc -O2 -Wall opendoor.c -llinphone -lbctoolbox -lbellesip -lmediastreamer -lortp \
-      -o /usr/local/bin/opendoor \
+ && cc -O2 -Wall station.c -llinphone -lbctoolbox -lbellesip -lmediastreamer -lortp \
+      -o /usr/local/bin/station \
  && ffmpeg -hide_banner -loglevel error -f lavfi -i color=black:s=352x288:r=25 \
       -frames:v 1 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -f h264 /app/black.h264 \
  && chmod +x /app/stream.sh \

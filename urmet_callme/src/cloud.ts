@@ -27,6 +27,15 @@ export interface PlaceData {
   Mac_Address?: string;
   device_name?: string; // installation name
   relation_name?: string; // user's own label for the place; preferred for display
+  // Channel flags bitmask (the app's FlagsHandler): bit 0 = MAIN_POWER_SUPPLY_DOWN (the app then marks
+  // the place unavailable and strips its calls), bit 1 = JOIN_ONLY_BY_TOKEN, bit 2 = JOIN_DISABLED.
+  flags?: number | string;
+}
+
+/** True when the cloud flags the place's main power supply as down (bit 0 of `flags`). */
+export function isPowerDown(d: PlaceData): boolean {
+  const n = typeof d.flags === "string" ? parseInt(d.flags, 10) : d.flags;
+  return !!n && Number.isFinite(n) && (n & 1) === 1;
 }
 // A `credentials` / `out_credentials_password` value of "*" is the cloud's placeholder for
 // "no such account" - treat it as absent, never as a real password.

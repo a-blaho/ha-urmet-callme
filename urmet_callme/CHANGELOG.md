@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+- **2Voice: the camera works during a ring, like the app's "view camera"
+  ([#19](https://github.com/a-blaho/ha-urmet-callme/issues/19)).** A ringing station refuses new
+  calls, so opening the camera during a ring used to hang up the add-on's call (cutting an
+  announcement short) and then get declined anyway. The camera now shows the ring call itself, as the
+  official app's incoming-call screen does: the station streams the picture while the call keeps
+  ringing, so the phones keep ringing too, and a face-recognition automation gets a picture right
+  away. An announcement or door press then answers that same call, and the picture stays. Not yet
+  confirmed on a station.
+- **2Voice: a door press during a ring now opens the door.** 1.0.20 answered the ring for it but never
+  sent the tone: the call's media came up while it was being answered, and that was then forgotten.
+- **Reconnects now refresh the places' credentials.** After a SIP reconnect the add-on re-read
+  `get_my_devices` but handed the new data to a fresh set of places, while the 2Voice door helper, the
+  camera and announcements kept the old ones; rotated channel credentials or a changed station only
+  took effect after a restart. The existing places are updated in place now, a doorbell listener
+  that has to reconnect re-reads them instead of re-registering its old password, and a 2Voice
+  helper whose channel account or station changed is restarted with the new values.
+- **A doorbell listener whose first registration fails is retried** on the maintenance tick instead
+  of being dropped until the next restart.
+- The connection probe no longer writes to a dead socket, so a dropped SIP connection is reconnected
+  without a spurious `socket error` line every 25 s first.
+- The add-on's own SIP client now presents the official app's User-Agent, as the media helpers already
+  did.
+- **2Voice: one helper per station.** The door opener (`opendoor`) and the camera receiver's 2Voice
+  mode (`recv`) are merged into one `station` process per 2Voice place, which owns the single call to
+  the station: door and gate tones, "ready", announcements, the held doorbell ring and the camera all
+  ride that one call. Before, two processes registered the same channel account and had to hand the
+  call back and forth (release before a camera call, tone on whichever held it). Visible effects: one
+  SIP binding per place instead of two; opening the camera while a door call is up re-uses that call
+  instead of hanging it up and placing another (instant picture); a viewer coming back within the
+  keep-alive rides the still-open call. Log lines are now tagged `[station]` instead of `[opendoor]`
+  and `[recv]`/`[video2v]`. Needs confirmation on a 2Voice station (the maintainer has only Ipercom).
+- Cleanup, no behaviour change: the `opendoor` helper's single-shot and no-keep-alive modes are gone
+  (`door_open_2voice_keepalive: 0` still means a fresh call per press; the call is held half a second
+  for the tone to land), `recv`'s dev-only knobs are gone, the FIFO paths and the helper command
+  alphabet are each defined once, MQTT entities are published through one routine (ids unchanged),
+  the SIP client, the helper protocol, the MQTT bridge and the 2Voice helper lifecycle (spawn, restart, respawn, replies) have unit tests, the CallMe client is split
+  into the session, the Ipercom gateway protocol, the doorbell listeners and the phase-B station
+  discovery, the Ipercom video service tracks its one call as one explicit state instead of nine
+  fields, and the camera account is minted through the session already logged in instead of a second
+  cloud login.
+- **Hardening of the camera stream producer.** `stream.sh` now accepts only the arguments the add-on
+  itself generates (a camera index, the control port, go2rtc's RTSP output and that camera's two
+  FIFOs). go2rtc's API is reachable on the LAN without authentication and lets a client add a stream
+  that runs the script; before, such a stream could point ffmpeg at any file or URL in the container.
+- **2Voice fixes found in review** (unverified on a station): a door or pre-warm call placed after an
+  announcement no longer opens the station's sound (`4`) on its own; "next camera" without a camera
+  picture is a no-op again instead of hanging up and re-dialing whatever call the helper holds; the
+  camera sound option also applies when the camera joins a call that is already up; a camera asked
+  for during an announcement keeps its targets until its own call comes up.
+- **Readable logs with video on.** The media helper's per-second audio level line (`[atap] audio
+  ~1s: …`) now prints only at `log_level: debug`; it used to run at every level for the whole call.
+  `debug` no longer dumps liblinphone's full trace, which at ~100 lines a second pushed the add-on's
+  own lines out of the Supervisor log window in under a minute: it logs liblinphone's warnings
+  instead, and the full trace is a developer switch (`RECV_TRACE` / `STATION_TRACE`).
+
 ## 1.1.0
 
 - **2Voice: "next camera" now switches on the live call, like the app

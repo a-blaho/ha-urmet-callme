@@ -4,9 +4,26 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as tls from "node:tls";
 import { logger } from "./logger.js";
-import { stableUuid } from "./util.js";
+import { SIP_USER_AGENT, stableUuid } from "./util.js";
 
 const log = logger("sip");
+
+/** The slice of tls.TLSSocket the client uses. A test substitutes an in-memory fake through
+ *  SipSocketFactory; production uses tls.connect. */
+export interface SipSocket {
+  write(data: string | Buffer): unknown;
+  destroy(): void;
+  readonly destroyed: boolean;
+  on(event: "data", cb: (d: Buffer | string) => void): unknown;
+  on(event: "error", cb: (e: Error) => void): unknown;
+  on(event: "close", cb: () => void): unknown;
+  setTimeout(ms: number): unknown;
+  readonly localAddress?: string;
+  readonly localPort?: number;
+}
+export type SipSocketFactory = (host: string, port: number, onConnect: () => void) => SipSocket;
+const tlsSocketFactory: SipSocketFactory = (host, port, onConnect) =>
+  tls.connect({ host, port, servername: host }, onConnect);
 
 const md5 = (s: string) => createHash("md5").update(s).digest("hex");
 const rnd = (n = 12) => randomBytes(24).toString("hex").slice(0, n);
@@ -95,7 +112,7 @@ export interface SipBinding {
 }
 
 export class SipClient {
-  private socket!: tls.TLSSocket;
+  private socket!: SipSocket;
   private localIp = "";
   private localPort = 0;
   // Our public mapping as Flexisip sees it (from received=/rport= on responses).
@@ -104,9 +121,8 @@ export class SipClient {
   private publicIp = "";
   private publicPort = 0;
   // RFC 5626 outbound: a stable instance id gives ONE binding (re-registers replace it,
-  // instead of piling up) and makes Flexisip hand back a pub-gruu.
+  // instead of piling up).
   private instanceId = "";
-  private pubGruu = "";
   // Registration refresh is driven by the expiry the REGISTRAR GRANTS (the Contact `expires=` /
   // `Expires` header on the 200 OK), not a fixed timer - Flexisip may cap our requested value well
   // below it, and refreshing on a stale fixed interval could then let the binding lapse.
@@ -146,24 +162,22 @@ export class SipClient {
     private password: string,
     private realm: string,
     private transport = "tls",
+    private socketFactory: SipSocketFactory = tlsSocketFactory,
   ) {}
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       let settled = false;
       this.closing = false;
-      this.socket = tls.connect(
-        { host: this.server, port: this.port, servername: this.server },
-        () => {
-          this.localIp = this.socket.localAddress || "0.0.0.0";
-          this.localPort = this.socket.localPort || 0;
-          log.info(
-            `TLS connected ${this.localIp}:${this.localPort} -> ${this.server}:${this.port}`,
-          );
-          settled = true;
-          resolve();
-        },
-      );
+      this.socket = this.socketFactory(this.server, this.port, () => {
+        this.localIp = this.socket.localAddress || "0.0.0.0";
+        this.localPort = this.socket.localPort || 0;
+        log.info(
+          `TLS connected ${this.localIp}:${this.localPort} -> ${this.server}:${this.port}`,
+        );
+        settled = true;
+        resolve();
+      });
       this.socket.on("data", (d) => {
         // The socket has no encoding set, so `d` is always a Buffer at runtime; newer @types/node
         // type the event as Buffer | string, hence the guard.
@@ -197,16 +211,17 @@ export class SipClient {
       /* ignore */
     }
   }
-  private keepalive() {
-    this.socket.write("\r\n\r\n");
+  /** CRLF keepalive (RFC 5626 double CRLF): keeps the NAT mapping and the registrar's connection warm.
+   *  Call it from the maintenance loop while alive(); a write to a dead socket would only raise an
+   *  async 'error' (logged as "socket error" on every tick), which is why the probe below no longer
+   *  does it. */
+  keepalive(): void {
+    if (this.alive()) this.socket.write("\r\n\r\n");
   }
+  /** True while the TLS socket exists and was not destroyed (a remote close destroys it). Pure probe,
+   *  no side effect. */
   alive(): boolean {
-    try {
-      this.keepalive();
-      return !this.socket.destroyed;
-    } catch {
-      return false;
-    }
+    return !!this.socket && !this.socket.destroyed;
   }
 
   private uri() {
@@ -253,7 +268,7 @@ export class SipClient {
       );
     lines.push(
       ...extra,
-      `User-Agent: UrmetCallForwarding-Node`,
+      `User-Agent: ${SIP_USER_AGENT}`,
       `Content-Length: ${Buffer.byteLength(body)}`,
     );
     return { msg: lines.join("\r\n") + "\r\n\r\n" + body, branch };
@@ -494,7 +509,7 @@ export class SipClient {
       this.callIdReg,
     );
     // On the 200, read our binding back from the Contact line carrying our instance uuid: the
-    // pub-gruu AND the expiry the registrar actually granted (which drives the refresh cadence).
+    // expiry the registrar actually granted (which drives the refresh cadence).
     if (res && res.status === 200) {
       const line = (res.headers["_raw"] || "")
         .split("\r\n")
@@ -509,7 +524,7 @@ export class SipClient {
       this.grantedExpires = granted;
       this.lastRegisterMs = Date.now();
       // DIAGNOSTIC: is OUR binding still in the registrar's response? On the synthesized 58A place
-      // the opendoor helper registers this SAME account on its own connection; if its +sip.instance
+      // the station helper registers this SAME account on its own connection; if its +sip.instance
       // collides with ours it would REPLACE our binding (killing doorbell + door commands) rather
       // than add one. A "MISSING" here after the helper spawns is the smoking gun for that.
       log.debug(
@@ -527,11 +542,7 @@ export class SipClient {
             /\+sip\.instance="?<?urn:uuid:([^">]+)>?"?/.exec(l)?.[1] || "",
           push: /pn-provider=|pn-prid=/i.test(l),
         }));
-      const m = line && /pub-gruu="([^"]+)"/.exec(line);
-      if (m) this.pubGruu = m[1];
-      log.info(
-        `registered (granted expires ${granted}s)${this.pubGruu ? `, pub-gruu ${this.pubGruu}` : ""}`,
-      );
+      log.info(`registered (granted expires ${granted}s)`);
     }
     return res?.status ?? 0;
   }

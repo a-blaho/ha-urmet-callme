@@ -2,14 +2,14 @@
 // and keep the SIP registration alive.
 import { readFileSync } from "node:fs";
 import { Announcer } from "./announce.js";
-import { CallMe, Door } from "./callme.js";
-import { TwoVoiceDoor, TwoVoiceService } from "./door2voice.js";
+import { CallMe } from "./callme.js";
+import { Door } from "./ipercom.js";
 import { Go2rtcPorts } from "./go2rtc.js";
 import { startIngressServer } from "./ingress.js";
 import { logger, setLevel } from "./logger.js";
 import { MqttBridge } from "./mqtt.js";
+import { TwoVoiceDoor, TwoVoiceStation } from "./twoVoiceStation.js";
 import { VideoService } from "./video.js";
-import { TwoVoiceVideoService } from "./video2voice.js";
 
 const log = logger("main");
 
@@ -176,18 +176,19 @@ async function main() {
     station: p.outgoingUser,
   }));
 
-  // 2Voice door-open. Auto-enabled for any detected 2Voice place (like IPERCOM doors): each gets a
-  // door + gate button, opened via the persistent opendoor helper.
-  let twoVoice: TwoVoiceService | undefined;
+  // 2Voice: one persistent `station` helper per detected 2Voice place owns the single call to its
+  // station and does door/gate, pre-warm, announcements, the held ring and (with video) the camera on
+  // it. Auto-enabled like IPERCOM doors: each place gets a door + gate button.
+  let twoVoice: TwoVoiceStation | undefined;
   let announcer: Announcer | undefined;
   let twoVoiceDoors: TwoVoiceDoor[] = [];
   if (twoVoicePlaces.length) {
-    twoVoice = new TwoVoiceService(
-      twoVoicePlaces,
-      cfg.door2voiceKeepaliveMs,
-      cfg.door2voicePrewarmHoldMs,
-      cfg.announceOpenAudio ? "4" : "",
-    );
+    twoVoice = new TwoVoiceStation(twoVoicePlaces, callme.realm, {
+      keepaliveMs: cfg.door2voiceKeepaliveMs,
+      prewarmHoldMs: cfg.door2voicePrewarmHoldMs,
+      talkDtmf: cfg.announceOpenAudio ? "4" : "",
+      audioAtStart: cfg.video2voiceAudio,
+    });
     // Announcements out of the door station (a `notify` entity per place), riding the same calls.
     announcer = new Announcer(twoVoice, {
       ttsEngine: cfg.announceTtsEngine,
@@ -200,7 +201,7 @@ async function main() {
         `open-audio digit ${cfg.announceOpenAudio ? "'4'" : "off"}, max ${cfg.announceMaxSeconds}s`,
     );
     twoVoiceDoors = twoVoice.doors();
-    twoVoice.start(); // spawn a persistent, pre-registered opendoor per place (fast opens)
+    twoVoice.start(); // spawn a persistent, pre-registered helper per place (fast opens)
     callme.onStationLearned = (p) => twoVoice?.stationLearned(p.id);
     log.info(
       `2Voice door-open enabled for ${twoVoicePlaces.length} place(s), ${twoVoiceDoors.length} relay(s): ` +
@@ -244,53 +245,28 @@ async function main() {
     }
   }
 
-  // Video (optional): embedded liblinphone receiver + go2rtc. IPERCOM uses the split-account
-  // on-demand camera call (VideoService); 2Voice has no such call, so it taps the auto_insertion
-  // call instead (TwoVoiceVideoService). They share go2rtc/ports, so only ONE runs - IPERCOM wins
-  // when both families are present (a mixed account is rare; 2Voice-only accounts get 2Voice video).
+  // Video (optional): embedded liblinphone + go2rtc. IPERCOM uses the split-account on-demand camera
+  // call (VideoService); 2Voice has no such call, so its station helper taps the call it holds to
+  // the station (TwoVoiceStation.startVideo). They share go2rtc/ports, so only ONE runs - IPERCOM
+  // wins when both families are present (a mixed account is rare; 2Voice-only accounts get 2Voice
+  // video).
   let video: VideoService | undefined;
-  let video2v: TwoVoiceVideoService | undefined;
   if (cfg.video) {
     try {
       if (ipercomPlaces.length) {
-        video = new VideoService(
-          callme,
-          ipercomPlaces.map((p) => p.id),
-          cfg.email,
-          cfg.password,
-          cfg.go2rtcPorts,
-        );
+        video = new VideoService(callme, ipercomPlaces.map((p) => p.id), cfg.email, cfg.go2rtcPorts);
         await video.start();
-      } else if (twoVoicePlaces.length) {
-        video2v = new TwoVoiceVideoService(
-          twoVoicePlaces,
-          callme.realm,
-          cfg.go2rtcPorts,
-          cfg.video2voiceAudio,
-        );
-        await video2v.start();
+      } else if (twoVoice) {
+        await twoVoice.startVideo(cfg.go2rtcPorts);
       }
     } catch (e) {
       log.warn(`video setup failed: ${(e as Error).message}`);
     }
   }
 
-  // 2Voice with video: the camera call IS the door call (one auto_insertion call per station), so
-  // the two services must not each hold one. A door/gate press while the camera is viewed sends its
-  // tone on the camera call; a camera about to call first releases any call the door helper holds
-  // (pre-warm / keep-alive); and "ready" is a no-op while the camera is up.
-  if (twoVoice && video2v) {
-    const tv = twoVoice;
-    const v2 = video2v;
-    tv.videoOpener = (placeId, digit) => v2.sendTone(placeId, digit);
-    tv.videoLive = (placeId) => v2.hasCall(placeId);
-    if (cfg.announceOpenAudio) tv.cameraOpenAudio = (placeId) => v2.openAudio(placeId);
-    v2.onBeforeCall = (placeId) => tv.release(placeId);
-  }
-
-  // "Hang up" button per place with a camera: ends its live camera call now, and on 2Voice also any
-  // call the door helper holds. Published late because it needs the video service's camera list.
-  const served = video?.placesServed() ?? video2v?.placesServed() ?? [];
+  // "Hang up" button per place with a camera: ends its live camera call now (on 2Voice: the station
+  // call, whatever it was placed for). Published late because it needs the camera list.
+  const served = video?.placesServed() ?? twoVoice?.placesServed() ?? [];
   if (bridge && served.length) {
     bridge.publishHangup(
       served.map((placeId) => {
@@ -301,28 +277,24 @@ async function main() {
           model: p?.family === "twovoice" ? "CallMe / 2Voice" : "CallMe / Ipercom",
         };
       }),
-      async (placeId) => {
-        const ended =
-          (await video?.hangup(placeId)) ?? video2v?.hangup(placeId) ?? false;
-        twoVoice?.release(placeId);
-        return ended;
-      },
+      async (placeId) =>
+        (await video?.hangup(placeId)) ?? twoVoice?.hangup(placeId) ?? false,
     );
   }
 
   // "Next camera" button per 2Voice place with video: a station with several entrance panels shows
   // them one at a time on the camera call, switched by an in-call tone (issue #20). Ipercom cameras
   // are separate streams already, so they get none.
-  const v2served = video2v?.placesServed() ?? [];
-  if (bridge && video2v && v2served.length) {
-    const v2 = video2v;
+  const v2served = video ? [] : (twoVoice?.placesServed() ?? []);
+  if (bridge && twoVoice && v2served.length) {
+    const tv = twoVoice;
     bridge.publishNextCamera(
       v2served.map((placeId) => ({
         placeId,
         name: callme.places.find((x) => x.id === placeId)?.name ?? placeId,
         model: "CallMe / 2Voice",
       })),
-      (placeId) => v2.nextCamera(placeId),
+      (placeId) => tv.nextCamera(placeId),
     );
   }
 
@@ -350,11 +322,7 @@ async function main() {
       log.warn("shutdown deadline reached; exiting");
       process.exit(0);
     }, 6000).unref();
-    const results = await Promise.allSettled([
-      video?.stop(),
-      video2v?.stop(),
-      twoVoice?.stop(),
-    ]);
+    const results = await Promise.allSettled([video?.stop(), twoVoice?.stop()]);
     for (const r of results)
       if (r.status === "rejected")
         log.warn(`shutdown: ${(r.reason as Error)?.message ?? r.reason}`);
@@ -378,9 +346,16 @@ async function main() {
     busy = true;
     try {
       if (!callme.sip?.alive()) {
-        await callme.connect();
-      } else if (callme.sip.dueForReregister()) {
-        await callme.sip.register();
+        try {
+          await callme.connect();
+        } finally {
+          // connect() updates the places before it registers: a helper whose account or station
+          // changed is respawned even when the registration then fails (retried next tick).
+          twoVoice?.placesRefreshed();
+        }
+      } else {
+        callme.sip.keepalive();
+        if (callme.sip.dueForReregister()) await callme.sip.register();
       }
       if (cfg.doorbell) await callme.maintainDoorbell();
     } catch (e) {

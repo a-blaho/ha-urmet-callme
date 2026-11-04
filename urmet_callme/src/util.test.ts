@@ -1,26 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseResult, sanitize, sipUri, stableUuid } from "./util.js";
+import { camFifos, sanitize, sipUri, stableUuid } from "./util.js";
 
-// Both helpers' tone replies must parse, whatever surrounds the RESULT token.
-test("parseResult reads opendoor's and recv's RESULT lines", () => {
-  assert.deepEqual(parseResult("[opendoor] RESULT 1 ok"), { digit: "1", ok: true });
-  assert.deepEqual(parseResult("2026-09-23T10:00:00.123Z [recv] RESULT 2 ok"), {
-    digit: "2",
-    ok: true,
-  });
-  assert.deepEqual(parseResult("2026-09-23T10:00:00.123Z [recv] RESULT 1 fail (no call up)"), {
-    digit: "1",
-    ok: false,
-  });
-  // recv's camera switch must match too, or its pending queue shifts onto the next door press
-  assert.deepEqual(parseResult("2026-11-03T10:00:00.123Z [recv] RESULT N fail (hung up)"), {
-    digit: "N",
-    ok: false,
-  });
-  assert.equal(parseResult("RESULT 3 ok"), null); // '3' is sent inside a switch, never answered
-  assert.equal(parseResult("[opendoor] sent DTMF '1' (status 0)"), null);
-  assert.equal(parseResult("RESULT 4 ok"), null); // open-audio is never answered with a RESULT
+test("camFifos names the pair stream.sh is handed for camera i", () => {
+  assert.deepEqual(camFifos(0), { h264: "/tmp/urmet_cam_0.h264", pcm: "/tmp/urmet_cam_0.pcm" });
+  assert.deepEqual(camFifos(3), { h264: "/tmp/urmet_cam_3.h264", pcm: "/tmp/urmet_cam_3.pcm" });
 });
 
 test("sanitize keeps [A-Za-z0-9_] and replaces the rest", () => {
@@ -51,4 +35,8 @@ test("stableUuid seeds used on the wire are pinned", () => {
     stableUuid("urmet-opendoor:user:place1"),
     "06a3a7f5-2773-e405-7224-d551a6e52c24",
   );
+  // The recv seeds (video.ts: the shared account B; the former video2voice.ts: channel account + place) used to
+  // go through a duplicate of this function in video.ts; same recipe, so the same bindings.
+  assert.equal(stableUuid("urmet-recv:userB"), "f86eb632-e31d-57c9-b963-5270befc26cb");
+  assert.equal(stableUuid("urmet-recv:user:place1"), "0bf72356-9f74-9992-222f-807a54ae0dd3");
 });

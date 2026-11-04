@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { familyOf, parseDoors } from "./callme.js";
+import { parseDoors } from "./ipercom.js";
+import { familyOf } from "./place.js";
 
 test("familyOf maps model codes", () => {
   assert.equal(familyOf("1060"), "ipercom");

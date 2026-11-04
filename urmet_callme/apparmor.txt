@@ -2,7 +2,7 @@
 
 # AppArmor profile for the Urmet CallMe add-on. The profile name MUST match the add-on slug.
 # The image is a plain Ubuntu 24.04 base with tini as init (config.yaml init: true). The control plane is
-# Node.js, which spawns ffmpeg, go2rtc and the liblinphone helpers (recv, opendoor). Those children
+# Node.js, which spawns ffmpeg, go2rtc and the liblinphone helpers (recv, station). Those children
 # run under this same profile (ix = inherit), so the confinement applies to the whole process tree.
 # It is intentionally permissive on files/network/capabilities (the add-on needs outbound TLS/SIP,
 # MQTT, and host-network media ports) while still denying mount, pivot_root, ptrace of other profiles
@@ -13,7 +13,8 @@ profile urmet_callme flags=(attach_disconnected,mediate_deleted) {
   file,
   # SIP/TLS to the Urmet cloud, MQTT to the broker, and (video) go2rtc/WebRTC on the host network.
   network,
-  # The control plane signals its recv/opendoor children (SIGUSR1 to switch/close, SIGTERM to stop).
+  # The control plane signals its recv child (SIGUSR1 ends the call, SIGUSR2 asks for a keyframe) and
+  # SIGTERMs recv and the station helpers on stop; the station helpers take commands on stdin.
   signal,
   capability,
 

@@ -168,11 +168,11 @@ helper is holding (a "… ready" pre-warm, or the short keep-alive after an unlo
 nothing while the camera is up - the call is already there. This mirrors the app's behaviour and is
 confirmed on a cloud-listed 2Voice station: the gate opened and the video continued uninterrupted. If
 a press during a preview does not open the door on yours, please open an issue with a
-`log_level: debug` log (the `[recv] DTMF … sent on the camera call` line shows the tone going out).
+`log_level: debug` log (the `[station] sent DTMF …` line shows the tone going out).
 
 **Experimental / what to check:** the call is _meant_ to be silent (it should open the door without
 ringing your indoor monitor). If you test this, watch that your monitor stays quiet. Set
-`log_level: debug` and the add-on log shows each step (`[opendoor] …`) for troubleshooting.
+`log_level: debug` and the add-on log shows each step (`[station] …`) for troubleshooting.
 
 ### Announcements (2Voice, experimental)
 
@@ -207,12 +207,17 @@ replaces one still playing, and clips are cut at `announce_max_seconds`.
 announcement - or a door/gate press - sent during the ring then **answers the ring call** and plays on
 it instead, so an automation can reply to a visitor right away ("Please leave the parcel in the
 lockers"). Answering takes the call, so the CallMe app on your phones stops ringing, just as when
-someone answers it. The "… ready" (pre-warm) button never answers a ring, and the camera is not
-available until the ring ends.
+someone answers it. The "… ready" (pre-warm) button never answers a ring.
+
+**The camera during a ring** shows the ring call itself, the way the official app's "view camera"
+button on its incoming-call screen does: the station streams the picture while the call keeps ringing,
+so your phones keep ringing too (this needs `video: true`). An announcement or door press then answers
+that same call, and the picture stays. When the ring ends, the stream stops; opening the camera again
+places a normal camera call.
 
 Confirmed on a cloud-listed 2Voice station
-([issue #19](https://github.com/a-blaho/ha-urmet-callme/issues/19)); answering a ring is new and not
-yet confirmed. Please report how it behaves on yours there, with the add-on log of one announcement -
+([issue #19](https://github.com/a-blaho/ha-urmet-callme/issues/19)); the camera during a ring is new and
+not yet confirmed. Please report how it behaves on yours there, with the add-on log of one announcement -
 every step is logged at the default `info` level (see [Logging](#logging)).
 
 ## Options
@@ -241,23 +246,23 @@ Everything is logged to the add-on log, timestamped and tagged by component
 (`[main] [cloud] [callme] [sip] [mqtt] [video]`, plus `[recv]` from the video receiver):
 
 - `info` (default): login, SIP registration, gateway resolution, discovered entrances, every open (which door + result), MQTT connect, reconnects, inbound calls.
-- `debug`: full SIP request/response trace, cloud HTTP calls, message bodies - useful for diagnosing. Inbound calls (if the panel ever forwards to this account) log a `[sip] INBOUND CALL: …` line. With video on, the media helper also traces its SIP and logs audio RTP/RTCP counters every 5 s (`[recv] audio rtp: …`); every camera call logs its negotiated directions and ends with an audio packet total, so a silent camera can be told apart as "the panel sent no audio" versus "audio arrived but was not decoded".
+- `debug`: full SIP request/response trace, cloud HTTP calls, message bodies - useful for diagnosing. Inbound calls (if the panel ever forwards to this account) log a `[sip] INBOUND CALL: …` line. With video on, the media helper also logs liblinphone's warnings, the audio level reaching the FIFO once a second (`[atap] audio ~1s: …`) and the audio RTP/RTCP counters every 5 s (`[recv] audio rtp: …`); every camera call logs its negotiated directions and ends with an audio packet total, so a silent camera can be told apart as "the panel sent no audio" versus "audio arrived but was not decoded". liblinphone's full SIP/media trace is not part of `debug` (at a hundred lines a second it pushes everything else out of the log); a developer build gets it with `RECV_TRACE=1` / `STATION_TRACE=1` in the container's environment.
 
 Announcements are logged step by step at `info`, numbered (`[announce] #3 …`) so one can be followed
 through the log:
 
-- `[announce]`: the request, the TTS engine and rendered clip (or the URL), which call carries it
-  (camera call or door helper), what ffmpeg found in the source (`source: Stream #0:0: Audio: …`),
-  when the call started taking the audio, and a closing `done` / `FAILED` line with the reason.
-- `[opendoor] announce: …`: the door helper's side - placing or reusing the call, `audio (media up): PCMU/8000, our direction sendrecv, station offered …`
-  (we can only be heard when our direction allows sending), the open-audio tone, and the audio RTP
-  packets sent after each clip.
-- `[opendoor] ring: …`: a doorbell ring the door helper holds unanswered, and whether an announcement
-  or door press during it answered it.
-- `[opendoor] talk-out: …` / `[atap] talk-out: …` (camera call): when the clip reached the call, a level
-  line per second while it plays, and a summary - audio length, peak level, clipping, and dropouts
-  (gaps where the source was slower than real time) - with a plain-language warning when the clip is
-  very quiet, clips, or stutters.
+- `[announce]`: the request, the TTS engine and rendered clip (or the URL), what ffmpeg found in the
+  source (`source: Stream #0:0: Audio: …`), when the call started taking the audio, and a closing
+  `done` / `FAILED` line with the reason.
+- `[station] announce: …`: the station helper's side - placing or reusing the call, `audio (media up):
+  PCMU/8000, our direction sendrecv, station offered …` (we can only be heard when our direction allows
+  sending), the open-audio tone, and the audio RTP packets sent after each clip.
+- `[station] ring: …`: a doorbell ring the helper holds unanswered, and whether an announcement or door
+  press during it answered it. `[station] camera: …`: the camera showing the ring call, the call
+  already up, or a camera call placed for it.
+- `[atap] talk-out: …`: when the clip reached the call, a level line per second while it plays, and a
+  summary - audio length, peak level, clipping, and dropouts (gaps where the source was slower than
+  real time) - with a plain-language warning when the clip is very quiet, clips, or stutters.
 
 Passwords/tokens are redacted.
 
