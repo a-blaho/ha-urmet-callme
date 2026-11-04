@@ -98,6 +98,8 @@ still up and is reused. So:
   and only one can be live.
 
 The stream includes **one-way audio** (hear the visitor); two-way (talk-back) is not implemented yet.
+On 2Voice the station's sound stays off on a camera call, as in the official app, unless you turn on
+`video_2voice_audio` (which makes "next camera" slower, see below).
 On 2Voice you can speak *to* the visitor with an announcement instead (see
 [Announcements](#announcements-2voice-experimental)).
 
@@ -112,15 +114,16 @@ places a new call a few seconds later, so pressing hang up while keeping the car
 **"… next camera" button (2Voice).** A 2Voice station with more than one entrance panel shows them
 one at a time on the same camera call, and the official app switches between them with an in-call
 tone. With video on, each 2Voice place gets a **"… next camera"** `button`: open the camera first, then
-press it to move to the next panel. The station only switches while the call's sound is still off, and
-the add-on turns the sound on at the start of every call, so a press **calls the station again**,
-switches to the right panel before turning the sound on, and continues there. The picture pauses for a
-few seconds (more for each further panel), the stream itself stays up. While a panel is shown, the
-door/gate buttons open *that* panel's door and gate (the tone goes on the camera call). A door/gate
-press with the camera closed always reaches the first panel, and a new camera call always starts on
-it. The button does nothing when no camera call is up (the log says so). Not yet confirmed on a
-station ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)): please report whether it cycles
-back to the first panel after the last one.
+press it to move to the next panel. Like the app, the add-on sends the station's next-camera tone (`3`)
+on the call you are watching, so the picture changes within a second or two. The station only switches
+while the call's sound is off. When the sound is on (`video_2voice_audio`, or after an announcement on
+the camera call), a press **calls the station again** instead: a few seconds of black, and the
+station's relays click. While a panel is shown, the door/gate buttons open *that* panel's door and gate
+(the tone goes on the camera call). A door/gate press with the camera closed always reaches the first
+panel, and a new camera call always starts on it. The station may cycle through empty positions as
+well (a 1760/16U with two cameras cycles four: two cameras, then a frozen and a black picture), so keep
+pressing to get back to the first panel. The button does nothing when no camera call is up (the log
+says so) ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).
 
 **Door / gate while watching.** On Ipercom the door command is a cloud message, independent of the
 camera call, so unlocking never disturbs the picture. On 2Voice the camera and the door are the *same*
@@ -195,7 +198,8 @@ How it works: when nobody is watching the camera, the add-on places the same sil
 call the door button uses, sends the station the "open audio" tone (`4`, as the app does before you
 talk; `announce_open_audio`), plays the clip into the call, and then holds the call for
 `door_open_2voice_keepalive` seconds, so a door press right after is instant. While the camera is
-being viewed the clip goes out on the camera call instead; if you open the camera while an
+being viewed the clip goes out on the camera call instead, after the same "open audio" tone (from then
+on, "next camera" on that call has to call the station again); if you open the camera while an
 announcement is starting, it is played again from the start on the camera call. A new announcement
 replaces one still playing, and clips are cut at `announce_max_seconds`.
 
@@ -221,6 +225,7 @@ on **Show unused optional configuration options** to set one.
 | `email`, `password`                            | Your Urmet CallMe app login                                                                                                                    |
 | `doorbell`                                     | Expose a doorbell `event` entity per panel (default `true`; requires monitor set to "remote")                                                  |
 | `video`                                        | Stream entrance cameras via embedded liblinphone + go2rtc (default `false`)                                                                    |
+| `video_2voice_audio`                           | 2Voice: open the station's sound on every camera call, for the entrance sound; "next camera" then re-dials (default `false`)                   |
 | `door_open_2voice_keepalive`                   | 2Voice: seconds to keep the call open after an unlock so a follow-up (e.g. door → gate) is instant (default `4`; `0` = a fresh call per press) |
 | `door_open_2voice_prewarm_hold`                | 2Voice: seconds a **"… ready"** (pre-warm) button press keeps the call open, so a following door/gate press is instant (default `15`)          |
 | `announce_tts_engine`                          | 2Voice announcements: TTS entity for spoken messages, e.g. `tts.piper` (default: the first one Home Assistant has)                             |

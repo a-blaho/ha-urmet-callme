@@ -477,8 +477,8 @@ static MSFilterDesc awrite_desc = {
  * recvonly, so there the capture graph never runs.
  *
  * Announcements: with RECV_AUDIO_IN=<fifo>, blocks are filled from that FIFO instead (see
- * talkout.h), so a clip the control plane plays goes out on the live camera call. The open-audio
- * digit this call already sends at StreamsRunning is what the app sends before it talks. */
+ * talkout.h), so a clip the control plane plays goes out on the live camera call. The control plane
+ * first sends 'A' on stdin, so the call sends the open-audio digit the app sends before it talks. */
 typedef struct {
   int rate;
   int nch;
@@ -672,13 +672,17 @@ static char g_tone_q[8];  /* tones waiting for StreamsRunning */
 static int g_tone_qn = 0;
 
 /* Next camera (2Voice, issue #20; stdin command 'N'). The station cycles its entrance panels on the
- * in-call DTMF '3' (UCFCallManager NEXT_CAM_DTMF), but the app only offers that while the audio is
- * still closed: opening it ('4') hides the next-camera button for the rest of the call, and the
- * station ignores a '3' after it. We open the audio at the start of every call, so a switch RE-DIALS:
- * BYE the call, place it again, send '3' once per switch made so far on this view (a new call
- * always starts on the first panel) while the audio is still closed, and only then send '4'. The
- * whole view is one recv process, so the count lives here and resets when the view ends. */
-static int g_cam_steps = 0;        /* '3's to send on each new call (= switches requested so far) */
+ * in-call DTMF '3' (UCFCallManager NEXT_CAM_DTMF), but only while the call's audio is still closed:
+ * the app hides its next-camera button once the audio is opened ('4'), and the station ignores a '3'
+ * after it. So, like the app, the camera call keeps the audio closed (unless RECV_OPEN_AUDIO_AT_START
+ * asks for the entrance sound) and a switch is one '3' on the live call: no new call, no relay clicks
+ * at the station. Once the audio is open (that option, or an announcement on this call: stdin 'A'),
+ * a switch has to RE-DIAL: BYE the call, place it again (a new call starts on the first panel), send
+ * '3' up to the next position while the audio is still closed, then reopen the audio if wanted. */
+static int g_audio_at_start = 0;   /* RECV_OPEN_AUDIO_AT_START: open the audio on every new call */
+static int g_audio_want = 0;       /* open the audio on this call (at start, or asked by 'A') */
+static int g_cam_pos = 0;          /* panel position the station shows: '3's sent since the call began */
+static int g_cam_steps = 0;        /* '3's to send on the re-placed call (re-dial only) */
 static int g_redial_req = 0;       /* a switch asked for the current call to end and be re-placed */
 static int g_redialing = 0;        /* the re-placed call is on its way (not yet StreamsRunning) */
 static int g_switching = 0;        /* on the re-placed call: sending the '3's, audio still closed */
@@ -694,6 +698,14 @@ static int g_redial_tries = 0;        /* re-dial attempts left for this switch *
 static long long switch_gap_ms(void) {
   const char *e = getenv("RECV_SWITCH_GAP_MS");
   return (e && *e) ? atoll(e) : 1500;
+}
+/* Positions the station's '3' cycles through before it is back on the first panel. A 1760/16U with
+ * two cameras cycled four (two of them empty; issue #20), so a re-dial wraps there instead of adding
+ * a '3' per press forever. */
+static int cam_cycle(void) {
+  const char *e = getenv("RECV_CAM_CYCLE");
+  int n = (e && *e) ? atoi(e) : 4;
+  return n > 0 ? n : 4;
 }
 
 /* Pause between the BYE's answer and the re-dial. The station declines a call placed ~100 ms
@@ -766,11 +778,11 @@ static void send_tone(LinphoneCall *call, char digit) {
 /* 2Voice (outgoing) camera call: the station keeps the audio closed until the viewer "opens" it.
  * The app does that with an in-call DTMF '4' (UCFCallManager.OPEN_AUDIO_DTMF, sent from
  * executeOpenAutoinsertionAudio once StreamsRunning) -- '1'/'2' being door/gate and '3' the next
- * camera. Sent once per call at StreamsRunning (after the '3's on a camera switch's call), like
- * opendoor sends the door digit. RECV_OPEN_AUDIO_DTMF overrides the digit; empty disables. Door/gate
+ * camera. Sent at most once per call, only when wanted (g_audio_want): at StreamsRunning (after the
+ * '3's on a re-dialled call), or when an announcement asks for it ('A'). RECV_OPEN_AUDIO_DTMF overrides the digit; empty disables. Door/gate
  * tones that arrived while the call was being set up go out right after. */
 static void open_audio_and_tones(LinphoneCall *call) {
-  if (g_call_uri[0] && !g_audio_opened) {
+  if (g_call_uri[0] && g_audio_want && !g_audio_opened) {
     const char *d = getenv("RECV_OPEN_AUDIO_DTMF");
     char digit = d ? d[0] : '4';
     g_audio_opened = 1;
@@ -798,21 +810,47 @@ static void read_tone_commands(void) {
     ssize_t n = read(STDIN_FILENO, &c, 1);
     if (n == 0) { g_cmds = 0; break; } /* the control plane closed our stdin: stop polling */
     if (n < 0) break;                  /* EAGAIN: nothing more right now */
-    if (c == 'N') { /* next camera: re-dial (see g_cam_steps) */
+    if (c == 'A') { /* open the audio now (an announcement is about to play on this call) */
+      g_audio_want = 1;
+      if (g_call && g_streams && !g_switching) open_audio_and_tones(g_call);
+      else rlog("[recv] open audio requested -> once the call's media is up\n");
+      continue;
+    }
+    if (c == 'N') { /* next camera (see g_cam_pos) */
       if (!g_call_uri[0] || (!g_call && !g_redial_req && !g_redialing)) {
         rlog("[recv] RESULT N fail (no call up)\n");
         continue;
       }
-      g_cam_steps++;
       g_n_waiting++;
-      rlog("[recv] next camera requested -> re-dialing to send '3' x%d before opening the audio\n",
-           g_cam_steps);
-      if (!g_redial_req && !g_redialing) {
-        g_redial_req = 1;
-        g_switching = 0;
-        hold_fifos(1);
-        if (g_call) linphone_call_terminate(g_call);
+      if (g_redial_req || g_redialing || g_switching) {
+        /* A switch is already under way: one more position on top of it. */
+        if (g_switching) g_switch_left++;
+        else g_cam_steps = (g_cam_steps + 1) % cam_cycle();
+        rlog("[recv] next camera requested during a switch -> one more '3'\n");
+        continue;
       }
+      if (!g_audio_opened) {
+        if (g_streams) {
+          LinphoneStatus st = linphone_call_send_dtmf(g_call, '3');
+          g_cam_pos = (g_cam_pos + 1) % cam_cycle();
+          rlog("[recv] next-camera DTMF '3' sent on the live call (SIP INFO) -> %s\n",
+               st == 0 ? "ok" : "FAILED");
+          answer_switches(st == 0 ? "ok" : "fail", st == 0 ? NULL : "DTMF not sent");
+          g_switch_vfu_until = time(NULL) + 5;
+        } else {
+          /* The call is still being set up: its '3' goes out once the media runs (main loop). */
+          g_cam_steps = (g_cam_steps + 1) % cam_cycle();
+          rlog("[recv] next camera requested while the call is set up -> '3' once the media runs\n");
+        }
+        continue;
+      }
+      g_cam_steps = (g_cam_pos + 1) % cam_cycle();
+      g_audio_want = g_audio_at_start; /* an announcement's open audio ends with its call */
+      rlog("[recv] next camera requested with the audio open -> re-dialing to send '3' x%d first\n",
+           g_cam_steps);
+      g_redial_req = 1;
+      hold_fifos(1);
+      linphone_call_terminate(g_call);
       continue;
     }
     if (c != '1' && c != '2') continue; /* newlines, anything else */
@@ -906,12 +944,14 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
              rp ? dir_name(linphone_call_params_get_audio_direction(rp)) : "?",
              cp ? dir_name(linphone_call_params_get_video_direction(cp)) : "?");
     }
-    if (g_redialing) {
-      /* The re-placed call of a camera switch: the '3's go out first, from the main loop, with
-       * the audio still closed; open_audio_and_tones() follows the last one. */
+    g_cam_pos = 0; /* every call starts on the first panel */
+    if (g_redialing || g_n_waiting) {
+      /* A re-placed call, or a switch asked for during setup: the '3's go out first, from the main
+       * loop, with the audio still closed; open_audio_and_tones() follows the last one. */
       g_redialing = 0;
       g_switching = 1;
       g_switch_left = g_cam_steps;
+      g_cam_steps = 0;
       g_switch_next_ms = now_ms() + switch_gap_ms();
     } else {
       open_audio_and_tones(call);
@@ -976,10 +1016,8 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
       fflush(stdout);
       break;
     }
-    if (g_redialing || g_switching) {
-      g_redialing = g_switching = 0;
-      answer_switches("fail", "the re-placed call ended before the switch");
-    }
+    g_redialing = g_switching = 0;
+    answer_switches("fail", "the call ended before the switch");
     hold_fifos(0);
     fail_queued_tones("call ended before media"); /* the control plane falls back to opendoor */
     g_last_drain = 0;
@@ -1029,6 +1067,7 @@ int main(int argc, char **argv) {
             "RECV_CONNECTED_URL=<url> (pinged at StreamsRunning), "
             "RECV_OPEN_AUDIO_DTMF=<digit> (2Voice: in-call digit that opens the station's audio, "
             "default 4; empty = none), "
+            "RECV_OPEN_AUDIO_AT_START=1 (2Voice: open it on every call; next camera then re-dials), "
             "RECV_ENDED_URL=<url> (pinged when the call is over), "
             "RECV_IDLE_SECONDS=<n> (default 10), "
             "RECV_COMMANDS=1 (read door/gate tones '1'/'2' from stdin, one per line, and send them "
@@ -1045,6 +1084,7 @@ int main(int argc, char **argv) {
     const char *cu = getenv("RECV_CALL_URI");
     if (cu && *cu) snprintf(g_call_uri, sizeof g_call_uri, "%s", cu);
   }
+  g_audio_at_start = g_audio_want = getenv("RECV_OPEN_AUDIO_AT_START") != NULL;
   if (getenv("RECV_COMMANDS")) {
     /* Only when the control plane pipes our stdin: O_NONBLOCK on an INHERITED stdin would change the
      * shared file description, and an inherited /dev/null would read as a permanent EOF. */
@@ -1291,6 +1331,7 @@ int main(int argc, char **argv) {
         rlog("[recv] next-camera DTMF '3' sent (SIP INFO) -> %s (%d left)\n",
              st == 0 ? "ok" : "FAILED", g_switch_left - 1);
         g_switch_left--;
+        g_cam_pos = (g_cam_pos + 1) % cam_cycle();
         g_switch_next_ms = now_ms() + switch_gap_ms();
       } else {
         g_switching = 0;

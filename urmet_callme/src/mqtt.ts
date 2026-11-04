@@ -488,7 +488,7 @@ export class MqttBridge {
       try {
         const switched = await this.onNextCamera(next.placeId);
         log.info(
-          `next camera ${next.name}: ${switched ? "switched (the call was placed again)" : "not switched (no camera call up, or the new call did not come up)"}`,
+          `next camera ${next.name}: ${switched ? "switched" : "not switched (no camera call up, or the switch did not go out)"}`,
         );
       } catch (e) {
         log.error(`next camera ${next.name} FAILED:`, (e as Error).message);

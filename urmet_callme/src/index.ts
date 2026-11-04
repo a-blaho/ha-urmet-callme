@@ -22,6 +22,7 @@ interface Config {
   logLevel: string;
   doorbell: boolean;
   video: boolean;
+  video2voiceAudio: boolean; // 2Voice camera: open the station's audio on every call (switch re-dials)
   door2voiceKeepaliveMs: number; // 2Voice: hold the call open this long for instant door-then-gate (0 = off)
   door2voicePrewarmHoldMs: number; // 2Voice: how long a "ready" (pre-warm) press keeps the call open
   announceOpenAudio: boolean; // 2Voice announcements: send the open-audio digit ('4') before the clip
@@ -86,6 +87,7 @@ async function loadConfig(): Promise<Config> {
     logLevel: o.log_level || process.env.LOG_LEVEL || "info",
     doorbell: o.doorbell ?? process.env.CALLME_DOORBELL !== "false",
     video: o.video ?? process.env.CALLME_VIDEO === "true",
+    video2voiceAudio: o.video_2voice_audio ?? process.env.VIDEO_2VOICE_AUDIO === "true",
     door2voiceKeepaliveMs: Number(o.door_open_2voice_keepalive ?? 4) * 1000,
     door2voicePrewarmHoldMs:
       Number(o.door_open_2voice_prewarm_hold ?? 15) * 1000,
@@ -264,6 +266,7 @@ async function main() {
           twoVoicePlaces,
           callme.realm,
           cfg.go2rtcPorts,
+          cfg.video2voiceAudio,
         );
         await video2v.start();
       }
@@ -281,6 +284,7 @@ async function main() {
     const v2 = video2v;
     tv.videoOpener = (placeId, digit) => v2.sendTone(placeId, digit);
     tv.videoLive = (placeId) => v2.hasCall(placeId);
+    if (cfg.announceOpenAudio) tv.cameraOpenAudio = (placeId) => v2.openAudio(placeId);
     v2.onBeforeCall = (placeId) => tv.release(placeId);
   }
 

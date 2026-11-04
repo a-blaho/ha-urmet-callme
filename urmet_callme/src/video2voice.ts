@@ -9,7 +9,8 @@
 // sent as a DTMF tone on recv's live call (sendTone; recv reads '1'/'2' on its stdin and answers
 // `RESULT <d> ok|fail`), exactly as the app unlocks while viewing. A second call from opendoor would
 // collide with ours at the station. TwoVoiceService routes presses here via its videoOpener hook.
-// The same channel carries 'N', a camera switch that recv performs by re-dialing (nextCamera).
+// The same channel carries 'N', a camera switch (nextCamera), and 'A', which opens the station's
+// audio before an announcement plays on the camera call (openAudio).
 //
 // This is a slimmed video.ts: no shared account B (2Voice uses the channel account it already has), no
 // call_device_req/gateway, no slot-switching (each place is independent, one recv per place, spawned
@@ -31,8 +32,8 @@ const RECV_IDLE_SECONDS = 10; // recv hangs up (and exits) after no FIFO reader 
 // How long a tone sent on the camera call may take to be confirmed. A tone on a running call is
 // answered at once; one queued during call setup waits for the station's media (a few seconds).
 const TONE_TIMEOUT_MS = 20000;
-// A camera switch is a BYE, a new call, then one '3' per switch ~1.5 s apart before the audio
-// opens, so its confirmation can take well past a door tone's.
+// A camera switch is one '3' on the live call, but with the audio open it is a BYE, a new call,
+// then up to three '3's ~1.5 s apart, so its confirmation can take well past a door tone's.
 const SWITCH_TIMEOUT_MS = 45000;
 
 interface Cam {
@@ -65,6 +66,7 @@ export class TwoVoiceVideoService {
     private places: Place[],
     private realm: string,
     private ports: Go2rtcPorts,
+    private audioAtStart = false, // `video_2voice_audio`: open the station's audio on every call
   ) {}
 
   async start(): Promise<boolean> {
@@ -149,12 +151,12 @@ export class TwoVoiceVideoService {
 
   /** Switch the place's live camera call to the station's next entrance panel (issue #20). The
    *  station cycles panels on the in-call DTMF '3', but only while the call's audio is still closed
-   *  (the app hides its next-camera button once the audio is opened), and recv opens it at the start
-   *  of every call. So recv re-dials ('N' on its stdin): BYE, the same call again, '3' once per
-   *  switch made on this view, then the audio. The stream stays up meanwhile (recv holds the FIFOs);
-   *  the picture pauses for a few seconds. Door/gate presses on that call then open the panel being
-   *  shown. False when no camera call is up (a new call starts on the first panel anyway), or when
-   *  the re-placed call did not come up. */
+   *  (the app hides its next-camera button once the audio is opened). recv ('N' on its stdin) sends
+   *  the '3' on the live call, like the app; with the audio open (`video_2voice_audio`, or after an
+   *  announcement) it re-dials instead: BYE, the same call again, '3' up to the next panel, then the
+   *  audio, with the stream kept up meanwhile. Door/gate presses on that call then open the panel
+   *  being shown. False when no camera call is up (a new call starts on the first panel anyway), or
+   *  when the switch did not go out. */
   async nextCamera(placeId: string): Promise<boolean> {
     const sent = this.sendTone(placeId, "N", SWITCH_TIMEOUT_MS);
     if (!sent) return false;
@@ -165,6 +167,13 @@ export class TwoVoiceVideoService {
       throw e;
     }
     return true;
+  }
+
+  /** Open the station's audio on the place's live camera call, before an announcement plays on it
+   *  (recv sends the open-audio digit; once its media runs if the call is still coming up). */
+  openAudio(placeId: string): void {
+    const recv = this.recvs.get(this.camIndex(placeId));
+    if (recv?.stdin?.writable) recv.stdin.write("A\n");
   }
 
   private failPendingTones(i: number, why: string) {
@@ -240,6 +249,9 @@ export class TwoVoiceVideoService {
         RECV_CONNECTED_URL: `http://127.0.0.1:${this.callPort}/connected?cam=${i}`,
         RECV_COMMANDS: "1", // take door/gate tones and camera switches on stdin (see sendTone)
         RECV_AUDIO_IN: talkFifoOf(cam.place.id), // announcements ride the camera call (announce.ts)
+        // The entrance sound on the stream; without it the audio stays closed like the app's, so
+        // next camera is a live '3' instead of a new call.
+        ...(this.audioAtStart ? { RECV_OPEN_AUDIO_AT_START: "1" } : {}),
         // No RECV_HANGUP_URL: there's no gateway cancel for 2Voice; recv just BYEs and exits.
         // log_level debug -> recv's own trace (SIP trace + per-5s audio RTP counters).
         ...(isDebug() ? { RECV_DEBUG: "1" } : {}),

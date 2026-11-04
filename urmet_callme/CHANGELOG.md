@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.0
+
+- **2Voice: "next camera" now switches on the live call, like the app
+  ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).** The station only takes its
+  next-camera tone `3` while the call's sound is off, and the add-on used to open the sound (`4`) on
+  every camera call, so each switch had to call the station again: several seconds of black, the
+  station's relays clicking, a card that sometimes needed a reconnect, and one more `3` (and 1.5 s)
+  for every press. The camera call now keeps the sound off, as the official app does, and a press
+  sends one `3` on the call you are watching. An announcement on the camera call opens the sound
+  first (`announce_open_audio`). After that, or with the new `video_2voice_audio` option, a switch
+  still re-dials, but it now stops after the station's four positions instead of adding a `3` per
+  press.
+- **Behaviour change: the 2Voice camera stream no longer carries the entrance sound by default.**
+  Turn on `video_2voice_audio` to keep it; "next camera" then works by calling the station again.
+
 ## 1.0.21
 
 - **2Voice: the picture no longer freezes after "next camera"

@@ -15,6 +15,12 @@ configuration:
     description: >-
       Stream the entrance cameras into Home Assistant (viewed with the WebRTC Camera card). Uses a
       heavier image and more resources; leave off if you only want door-open and doorbell.
+  video_2voice_audio:
+    name: 2Voice camera sound
+    description: >-
+      2Voice: open the station's sound when the camera opens, so the stream carries the entrance
+      sound. Off by default, as in the official app. When on, "next camera" has to call the station
+      again (a few seconds of black, and the station's relays click).
   go2rtc_api_port:
     name: go2rtc API port
     description: >-

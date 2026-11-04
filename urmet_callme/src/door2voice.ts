@@ -89,6 +89,8 @@ export class TwoVoiceService {
   videoOpener?: (placeId: string, digit: string) => Promise<void> | undefined;
   /** True while a camera call for the place is up (pre-warming is then pointless). */
   videoLive?: (placeId: string) => boolean;
+  /** Set by index.ts: opens the station's audio on the live camera call before an announcement. */
+  cameraOpenAudio?: (placeId: string) => void;
 
   constructor(
     private places: Place[],
@@ -334,8 +336,8 @@ export class TwoVoiceService {
   }
 
   /** Get a call ready to carry an announcement (announce.ts) and say which one: the live camera
-   *  call when the camera is being viewed (its recv reads the talk FIFO and already sent the
-   *  open-audio digit), otherwise a call the door helper places or keeps ('T': it sends the
+   *  call when the camera is being viewed (its recv reads the talk FIFO; cameraOpenAudio has it send
+   *  the open-audio digit), otherwise a call the door helper places or keeps ('T': it sends the
    *  open-audio digit and holds the call while the clip plays). Undefined when neither is possible. */
   /** True while the place's camera call is up (it can carry an announcement). */
   cameraLive(placeId: string): boolean {
@@ -343,7 +345,10 @@ export class TwoVoiceService {
   }
 
   startTalk(placeId: string): "camera" | "door" | undefined {
-    if (this.videoLive?.(placeId)) return "camera";
+    if (this.videoLive?.(placeId)) {
+      this.cameraOpenAudio?.(placeId);
+      return "camera";
+    }
     const h = this.helpers.get(placeId);
     if (!h?.child?.stdin?.writable) return undefined;
     h.child.stdin.write("T\n");
