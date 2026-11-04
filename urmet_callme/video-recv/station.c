@@ -381,7 +381,7 @@ static LinphoneCall *place_call(LinphoneCore *lc, const char *out_uri, const cha
   g_streams = 0;
   g_ended = 0;
   g_audio_opened = 0;
-  g_audio_want = camera ? g_audio_at_start : g_audio_want;
+  g_audio_want = camera ? g_audio_at_start : 0; /* per call: 'T'/'A' set it again for theirs */
   const char *mac = phase_b_mac();
   LinphoneAddress *to = linphone_factory_create_address(linphone_factory_get(), out_uri);
   if (!to) { slog("[station] bad OUT uri %s\n", out_uri); return NULL; }
@@ -444,7 +444,10 @@ static void bye_call(LinphoneCore *lc) {
   g_streams = 0;
   g_ended = 0; /* consume: place_call sets it fresh for the next call */
   g_audio_opened = 0;
-  if (g_cam_on && !g_redial_req && !g_redialing) camera_off("the call carrying the picture ended");
+  /* A camera switch re-dial and a camera call pending after an audio-only one keep the camera on and
+   * its targets: the next call carries the picture. */
+  if (g_cam_on && !g_redial_req && !g_redialing && !g_cam_pending)
+    camera_off("the call carrying the picture ended");
 }
 
 /* Keep the camera's FIFOs open across a re-dial. The per-call taps close theirs when the call ends,
@@ -603,6 +606,8 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
         expect_picture();
         nudge_keyframe(g_call, "for the camera joining a live call");
       }
+      /* The entrance sound option applies to the camera's call whether placed for it or adopted. */
+      if (g_audio_at_start) g_audio_want = 1;
       slog("CAMERA ok\n");
       return;
     }
@@ -618,14 +623,8 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
       return;
     }
     slog("[station] camera: the call up is audio only -> ending it and placing a camera call\n");
-    g_cam_pending = 1;
+    g_cam_pending = 1; /* keeps the camera on and its targets through bye_call */
     bye_call(lc);
-    g_cam_on = 1; /* bye_call turned the camera off; the pending camera call turns it back on */
-    tap_targets_lock();
-    snprintf(g_tap_target, sizeof g_tap_target, "%s", h264);
-    snprintf(g_cam_audio, sizeof g_cam_audio, "%s", pcm);
-    g_tap_gen++;
-    tap_targets_unlock();
     g_redial_at_ms = now + redial_delay_ms();
     slog("CAMERA ok\n");
     return;

@@ -42,6 +42,15 @@
   discovery, the Ipercom video service tracks its one call as one explicit state instead of nine
   fields, and the camera account is minted through the session already logged in instead of a second
   cloud login.
+- **Hardening of the camera stream producer.** `stream.sh` now accepts only the arguments the add-on
+  itself generates (a camera index, the control port, go2rtc's RTSP output and that camera's two
+  FIFOs). go2rtc's API is reachable on the LAN without authentication and lets a client add a stream
+  that runs the script; before, such a stream could point ffmpeg at any file or URL in the container.
+- **2Voice fixes found in review** (unverified on a station): a door or pre-warm call placed after an
+  announcement no longer opens the station's sound (`4`) on its own; "next camera" without a camera
+  picture is a no-op again instead of hanging up and re-dialing whatever call the helper holds; the
+  camera sound option also applies when the camera joins a call that is already up; a camera asked
+  for during an announcement keeps its targets until its own call comes up.
 - **Readable logs with video on.** The media helper's per-second audio level line (`[atap] audio
   ~1s: …`) now prints only at `log_level: debug`; it used to run at every level for the whole call.
   `debug` no longer dumps liblinphone's full trace, which at ~100 lines a second pushed the add-on's

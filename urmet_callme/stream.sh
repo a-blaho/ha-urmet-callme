@@ -23,6 +23,19 @@ CALL_PORT="${3:?control port}"
 FIFO="${4:?h264 fifo}"
 AFIFO="${5:?pcm fifo}"
 
+# SECURITY: go2rtc's API is reachable on the LAN without authentication (see src/go2rtc.ts) and
+# /api/streams accepts new exec streams; exec.allow_paths pins only argv[0] to this script, so a LAN
+# client picks the arguments. Accept nothing but the shape the add-on itself generates: a camera index,
+# a port, go2rtc's own RTSP output, and THAT camera's FIFO pair (src/util.ts camFifos) - otherwise
+# ffmpeg would read any container path or network URL into a stream for the caller.
+case "$CAM" in ''|*[!0-9]*) echo "urmet: refusing camera index '$CAM'" >&2; exit 1;; esac
+case "$CALL_PORT" in ''|*[!0-9]*) echo "urmet: refusing control port '$CALL_PORT'" >&2; exit 1;; esac
+case "$OUTPUT" in rtsp://*) ;; *) echo "urmet: refusing output '$OUTPUT'" >&2; exit 1;; esac
+if [ "$FIFO" != "/tmp/urmet_cam_${CAM}.h264" ] || [ "$AFIFO" != "/tmp/urmet_cam_${CAM}.pcm" ]; then
+  echo "urmet: refusing inputs '$FIFO' '$AFIFO' for camera ${CAM}" >&2
+  exit 1
+fi
+
 # Place the call; recv (already registered) answers and starts tapping. Synchronous so that if the
 # control plane rejects the request (`curl -f` fails) we exit BEFORE ffmpeg instead of waiting
 # forever on an empty FIFO. The control plane serves ONE camera at a time: a /call while another

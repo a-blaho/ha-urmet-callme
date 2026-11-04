@@ -29,7 +29,8 @@ export const SIP_USER_AGENT = "UrmetCallForwarding-Android";
 
 /** The per-camera FIFO pair the media helper writes and stream.sh's ffmpeg reads: raw Annex-B H.264 and
  *  raw PCM (s16le 8 kHz mono, G.711 forced). Camera `i` is the go2rtc stream `urmet_cam_<i>`; the paths
- *  are passed to stream.sh as arguments, so this is the only place that spells them. */
+ *  are passed to stream.sh as arguments. stream.sh re-checks them against this exact shape before
+ *  handing them to ffmpeg (go2rtc's LAN API lets anyone choose the arguments), so keep the two in step. */
 export function camFifos(i: number): { h264: string; pcm: string } {
   return { h264: `/tmp/urmet_cam_${i}.h264`, pcm: `/tmp/urmet_cam_${i}.pcm` };
 }

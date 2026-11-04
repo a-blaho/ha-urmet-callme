@@ -16,7 +16,8 @@ export interface DoorbellRing {
 }
 
 export class DoorbellListeners {
-  private clients: { sip: SipClient; place: Place }[] = [];
+  // user/pw: the credentials the client was built with, to notice a change on a live connection.
+  private clients: { sip: SipClient; place: Place; user: string; pw: string }[] = [];
   private onRing: (r: DoorbellRing) => void = () => {};
 
   constructor(private realm: string) {}
@@ -49,7 +50,7 @@ export class DoorbellListeners {
         continue;
       }
       const sip = this.makeClient(place);
-      this.clients.push({ sip, place });
+      this.clients.push({ sip, place, user: place.incomingUser, pw: place.incomingPw });
       try {
         await sip.connect();
         const st = await sip.register();
@@ -76,20 +77,36 @@ export class DoorbellListeners {
     for (const c of this.clients) {
       const { place } = c;
       try {
-        if (!c.sip.alive()) {
+        const changed = c.user !== place.incomingUser || c.pw !== place.incomingPw;
+        if (!c.sip.alive() || changed) {
           // Rebuilt, not reconnected: the place's credentials may have changed since (a reconnect
-          // re-reads get_my_devices), and the old client would re-register the stale password forever.
+          // re-reads get_my_devices), and the old client would re-register the stale password forever,
+          // whether its connection dropped or stayed up.
+          if (changed) log.info(`doorbell listener for place ${place.id}: channel credentials changed; rebuilding it`);
           c.sip.close();
           c.sip = this.makeClient(place);
+          c.user = place.incomingUser;
+          c.pw = place.incomingPw;
           const sip = c.sip;
           await sip.connect();
           const st = await sip.register();
           if (st === 200)
             log.info(`doorbell listener re-registered as ${place.incomingUser} (place ${place.id})`);
-          else log.warn(`doorbell listener register failed for ${place.incomingUser} (${st})`);
+          else {
+            log.warn(`doorbell listener register failed for ${place.incomingUser} (${st}); rebuilt next tick`);
+            sip.close();
+          }
         } else {
           c.sip.keepalive();
-          if (c.sip.dueForReregister()) await c.sip.register();
+          if (c.sip.dueForReregister()) {
+            const st = await c.sip.register();
+            if (st !== 200) {
+              // A refused refresh on a live connection: drop it so the next tick rebuilds the client
+              // from the place's current credentials instead of retrying these forever.
+              log.warn(`doorbell listener refresh failed for ${place.incomingUser} (${st}); rebuilt next tick`);
+              c.sip.close();
+            }
+          }
         }
       } catch (e) {
         log.debug(`doorbell listener ${place.id}: ${(e as Error).message}; retry next tick`);

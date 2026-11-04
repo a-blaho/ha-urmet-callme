@@ -346,8 +346,13 @@ async function main() {
     busy = true;
     try {
       if (!callme.sip?.alive()) {
-        await callme.connect();
-        twoVoice?.placesRefreshed(); // a helper whose account or station changed is respawned
+        try {
+          await callme.connect();
+        } finally {
+          // connect() updates the places before it registers: a helper whose account or station
+          // changed is respawned even when the registration then fails (retried next tick).
+          twoVoice?.placesRefreshed();
+        }
       } else {
         callme.sip.keepalive();
         if (callme.sip.dueForReregister()) await callme.sip.register();

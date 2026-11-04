@@ -220,6 +220,9 @@ export class TwoVoiceStation {
     if (this.stopping) return;
     const h = this.helpers.get(placeId);
     if (!h) return;
+    // One process per place: a delayed respawn after an exit must not add a second helper when a
+    // restart (station learned, account changed) already replaced it or is about to.
+    if (h.child || h.restarting) return;
     const p = h.place;
     if (!p.outgoingUser) return; // station still unknown; stationLearned() spawns us later
     const outUri = this.stationUri(p);
@@ -311,6 +314,9 @@ export class TwoVoiceStation {
           h.camOn = true;
           for (const w of h.camWaiters.splice(0)) w(undefined);
         } else if (ev.status === "fail") {
+          // Also after an earlier ok: a camera-switch re-dial that could not be placed fails this way
+          // (no CAMERA end follows), and the next request must send a fresh V.
+          h.camOn = false;
           for (const w of h.camWaiters.splice(0)) w(ev.why || "failed");
         } else if (ev.status === "live") {
           log.info(`2Voice camera ${h.place.name}: video established`);
@@ -528,6 +534,12 @@ export class TwoVoiceStation {
   async nextCamera(placeId: string): Promise<boolean> {
     const h = this.helpers.get(placeId);
     if (!h?.child?.stdin?.writable) return false;
+    if (!h.camOn) {
+      // The helper may hold a door, pre-warm or announcement call; the switch would re-dial that one
+      // (cutting an announcement) for a picture nobody watches. Documented: no-op without a camera.
+      log.info(`next camera on ${h.place.name}: no camera picture is up; nothing to switch`);
+      return false;
+    }
     try {
       await this.command(h, h.switches, HelperCommand.NEXT_CAMERA, SWITCH_TIMEOUT_MS);
       return true;
