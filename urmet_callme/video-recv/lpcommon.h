@@ -116,6 +116,7 @@ typedef struct {
   double win_sumabs; /* sum of |sample| this window (avg level; no sqrt/-lm needed) */
   int win_peak;     /* peak |sample| this window */
   int stalled;      /* last window: every write dropped (nothing draining the FIFO) */
+  int gen;          /* the g_tap_gen this tap's path belongs to (h264tap.h) */
 } AudioTap;
 
 static void awrite_init(MSFilter *f) {
@@ -123,6 +124,7 @@ static void awrite_init(MSFilter *f) {
   s->fd = -1;
   s->rate = 48000; /* defaults; overwritten by whatever liblinphone SETs on the card */
   s->nch = 1;
+  s->gen = g_tap_gen;
   lp_atap_target(s->path, sizeof s->path);
   f->data = s;
 }
@@ -138,6 +140,12 @@ static void awrite_announce(AudioTap *s) {
 static void awrite_process(MSFilter *f) {
   AudioTap *s = (AudioTap *)f->data;
   awrite_announce(s);
+  if (s->gen != g_tap_gen) {
+    /* The camera targets changed on this live call (see g_tap_gen): reopen by path. */
+    s->gen = g_tap_gen;
+    if (s->fd >= 0) { close(s->fd); s->fd = -1; }
+    lp_atap_target(s->path, sizeof s->path);
+  }
   if (!s->path[0] && lp_atap_adopt) lp_atap_target(s->path, sizeof s->path);
   if (s->fd < 0 && s->path[0]) {
     /* Same O_RDWR|O_NONBLOCK trick as the H264 tap: we hold the FIFO open so writes never

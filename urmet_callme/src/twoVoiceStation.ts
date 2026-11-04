@@ -67,6 +67,8 @@ interface Helper {
   place: Place;
   child?: ChildProcess;
   outUri?: string; // station URI the live child was spawned with (it takes it as argv)
+  inUser?: string; // channel account the live child registers (argv too): a change needs a respawn
+  inPw?: string;
   buf: string; // stdout line-assembly buffer
   // FIFOs of in-flight commands awaiting their reply, in order (the helper answers each class in the
   // order received): door/gate tones (RESULT 1|2), camera switches (RESULT N), camera requests (CAMERA
@@ -149,12 +151,37 @@ export class TwoVoiceStation {
     if (this.stopping) return;
     const h = this.helpers.get(placeId);
     if (!h || !h.place.outgoingUser) return;
+    if (h.child && h.outUri === this.stationUri(h.place)) return;
+    this.restart(placeId, "its station changed");
+  }
+
+  /** After a reconnect re-read the places (callme.connect updates them in place): a helper took its
+   *  channel account and station URI as argv at spawn, so one whose values changed is restarted with
+   *  the current ones; the rest keep running. */
+  placesRefreshed(): void {
+    if (this.stopping) return;
+    for (const [placeId, h] of this.helpers) {
+      if (!h.child) continue;
+      if (
+        h.inUser !== h.place.incomingUser ||
+        h.inPw !== h.place.incomingPw ||
+        h.outUri !== this.stationUri(h.place)
+      )
+        this.restart(placeId, "its account or station changed");
+    }
+  }
+
+  /** Replace the place's helper (if one runs) with one spawned from the place's current values. */
+  private restart(placeId: string, why: string): void {
+    const h = this.helpers.get(placeId);
+    if (!h) return;
     if (h.child) {
-      if (h.outUri === this.stationUri(h.place)) return;
-      log.info(`2Voice station for ${placeId} changed; restarting its helper`);
+      log.info(`2Voice helper for ${placeId}: ${why}; restarting it`);
       h.child.removeAllListeners("exit");
       h.child.kill("SIGTERM");
       h.child = undefined;
+      h.ringing = false;
+      h.camOn = false;
     }
     this.spawn(placeId);
   }
@@ -209,6 +236,8 @@ export class TwoVoiceStation {
     });
     h.child = child;
     h.outUri = outUri;
+    h.inUser = p.incomingUser;
+    h.inPw = p.incomingPw;
     h.buf = "";
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (d: string) => this.onStdout(placeId, d));

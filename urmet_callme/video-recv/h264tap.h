@@ -29,6 +29,11 @@
 /* Runtime target for the NEXT tap instance (takes precedence over RECV_TARGET_FILE/env). Set by an
  * includer that learns the camera FIFO per call (opendoor's 'V' command). Empty = not used. */
 static char g_tap_target[256] = "";
+/* Bumped by the includer after it changes the camera targets (g_tap_target and its audio FIFO) on a
+ * call whose media graph is already running: the taps then drop their descriptor, take the new path
+ * (the control plane may have re-made the FIFO, so the old descriptor points at an unlinked inode)
+ * and gate their output on a fresh keyframe. Read by the ticker thread, written by the main one. */
+static volatile int g_tap_gen = 0;
 
 /* ---- H.264 tap: a custom mediastreamer "decoder" that does NOT decode. Registered as the
  * H264 decoder so liblinphone negotiates H264 recvonly and routes the received RTP to it.
@@ -81,6 +86,7 @@ typedef struct {
   long nalus;
   int started;           /* have we hit the first SPS/IDR yet? gate output to a clean GOP boundary */
   long long last_black_ms; /* last time we wrote a priming black keyframe (0 = never) */
+  int gen;               /* the g_tap_gen this tap's path/gate belong to */
 } TapState;
 
 /* Monotonic milliseconds, for pacing the priming black frames at ~25 fps. */
@@ -151,6 +157,7 @@ static void read_target_line(char *out, size_t outsz, int lineno) {
 static void tap_init(MSFilter *f) {
   TapState *s = ms_new0(TapState, 1);
   s->fd = -1;
+  s->gen = g_tap_gen;
   if (g_tap_target[0]) snprintf(s->path, sizeof s->path, "%s", g_tap_target);
   else read_target_line(s->path, sizeof s->path, 0);
   s->unpacker = rfc3984_new_with_factory(f->factory);
@@ -162,12 +169,20 @@ static void tap_init(MSFilter *f) {
 
 static void tap_process(MSFilter *f) {
   TapState *s = (TapState *)f->data;
-  if (!s->path[0] && g_tap_target[0]) {
-    /* The camera asked for this call's video after its graph started (opendoor: a ring answered for
-     * an announcement, then the camera opened). Adopt the target now; output starts at the next
-     * SPS/IDR like any call. */
+  if (s->gen != g_tap_gen) {
+    /* The camera target changed on this live call: the camera asked for the call's video after its
+     * graph started (a door call, an answered ring), or the picture ended and a viewer came back on
+     * the same held call. Drop the old descriptor (the control plane re-makes the FIFO per request:
+     * a fresh inode), take the new path, and start over as at the start of a call: the black
+     * priming stream, then output from the next SPS/IDR. The call's GOP so far went by unseen, so a
+     * reader joining mid-GOP would only get undecodable P-frames; the main loop nudges for an IDR. */
+    s->gen = g_tap_gen;
+    if (s->fd >= 0) { close(s->fd); s->fd = -1; }
     snprintf(s->path, sizeof s->path, "%s", g_tap_target);
-    TAP_LOG("[tap] camera target set -> %s\n", s->path);
+    s->started = 0;
+    s->last_black_ms = 0;
+    if (s->path[0]) TAP_LOG("[tap] camera target set -> %s (output from the next SPS/IDR)\n", s->path);
+    else TAP_LOG("[tap] camera target cleared\n");
   }
   if (s->fd < 0 && s->path[0]) {
     /* Open O_RDWR|O_NONBLOCK: O_RDWR means the FIFO always has a "reader" (us), so writes

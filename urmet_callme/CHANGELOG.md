@@ -15,8 +15,9 @@
 - **Reconnects now refresh the places' credentials.** After a SIP reconnect the add-on re-read
   `get_my_devices` but handed the new data to a fresh set of places, while the 2Voice door helper, the
   camera and announcements kept the old ones; rotated channel credentials or a changed station only
-  took effect after a restart. The existing places are updated in place now, and a doorbell listener
-  that has to reconnect re-reads them instead of re-registering its old password.
+  took effect after a restart. The existing places are updated in place now, a doorbell listener
+  that has to reconnect re-reads them instead of re-registering its old password, and a 2Voice
+  helper whose channel account or station changed is restarted with the new values.
 - **A doorbell listener whose first registration fails is retried** on the maintenance tick instead
   of being dropped until the next restart.
 - The connection probe no longer writes to a dead socket, so a dropped SIP connection is reconnected

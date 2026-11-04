@@ -70,6 +70,7 @@ static int g_call_is_camera = 0; /* g_call was placed with the camera offer/head
 static LinphoneCall *g_ring = NULL;
 static int g_cam_on = 0;        /* taps targeted at the camera FIFOs (CAMERA ok sent, no end yet) */
 static int g_cam_live = 0;      /* CAMERA live sent for this picture (first keyframe) */
+static int g_talk_waiting = 0; /* a 'T' arrived and its clip has not started yet (talkout.h: g_talk_active) */
 static int g_cam_pending = 0;   /* camera asked for while an audio-only call was up: place one after it */
 static int g_audio_opened = 0;  /* the open-audio DTMF went out on this call */
 static int g_audio_want = 0;    /* open the audio on this call (at start, or asked by 'A'/'T') */
@@ -190,6 +191,7 @@ static void camera_off(const char *why) {
   g_cam_live = 0;
   g_tap_target[0] = '\0';
   g_cam_audio[0] = '\0';
+  g_tap_gen++; /* the taps on a call that stays up close their FIFOs */
   g_video_deadline = 0;
   g_switch_vfu_until = 0;
   g_last_drain = 0;
@@ -200,6 +202,7 @@ static void camera_fail(const char *why) {
   g_cam_on = 0;
   g_tap_target[0] = '\0';
   g_cam_audio[0] = '\0';
+  g_tap_gen++;
   slog("[station] camera: %s\nCAMERA fail %s\n", why, why);
 }
 
@@ -558,6 +561,7 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
   }
   snprintf(g_tap_target, sizeof g_tap_target, "%s", h264);
   snprintf(g_cam_audio, sizeof g_cam_audio, "%s", pcm);
+  g_tap_gen++; /* the taps of a call already up reopen on these paths and gate on a fresh keyframe */
   g_cam_on = 1;
   g_cam_live = 0;
   g_cam_pending = 0;
@@ -597,12 +601,23 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
       return;
     }
     /* An audio-only call (phase-B door call): no picture on it. End it and place a camera call. */
+    if (g_talk_active || g_talk_waiting) {
+      /* ...unless an announcement rides it: that finishes first (ending the call now would cut the
+       * clip and break its ffmpeg). The keep-alive releases the call after the clip and the pending
+       * camera call follows; the viewer's stream.sh waits for it. */
+      slog("[station] camera: the call up is audio only and carries an announcement -> the camera call follows it\n");
+      g_cam_pending = 1;
+      g_redial_at_ms = now; /* no gap needed beyond the call's own end */
+      slog("CAMERA ok\n");
+      return;
+    }
     slog("[station] camera: the call up is audio only -> ending it and placing a camera call\n");
     g_cam_pending = 1;
     bye_call(lc);
     g_cam_on = 1; /* bye_call turned the camera off; the pending camera call turns it back on */
     snprintf(g_tap_target, sizeof g_tap_target, "%s", h264);
     snprintf(g_cam_audio, sizeof g_cam_audio, "%s", pcm);
+    g_tap_gen++;
     g_redial_at_ms = now + redial_delay_ms();
     slog("CAMERA ok\n");
     return;
@@ -623,7 +638,6 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
   /* Announcement: hold the call for a clip until talk_deadline (it must START by then); while it
    * plays the call is busy; after it ends, the keep-alive idle counts from the clip's end. */
   long long talk_deadline = 0, talk_requested_at = 0;
-  int talk_waiting = 0;   /* a 'T' is waiting for its clip to start */
   int talk_media_logged = 0;
   long talk_clips = g_talk_clips;
   const long long talk_start = talk_start_ms();
@@ -661,7 +675,7 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
         }
         g_audio_want = 1;
         talk_requested_at = now;
-        talk_waiting = 1;
+        g_talk_waiting = 1;
         talk_media_logged = 0;
         talk_deadline = now + STREAMS_TIMEOUT_MS + talk_start;
         continue;
@@ -682,7 +696,7 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
         release_req = 1;
         warm_deadline = 0;
         if (g_talk_active) slog("[station] announce: hang-up requested while a clip plays -> cutting it short\n");
-        talk_waiting = 0;
+        g_talk_waiting = 0;
         talk_deadline = 0;
         if (g_redial_req || g_redialing || g_switching) {
           g_redial_req = g_redialing = g_switching = 0;
@@ -778,14 +792,14 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
       }
     }
     if (g_call && g_streams && !g_switching) {
-      if (g_audio_want && !g_audio_opened) open_audio_now(g_call, talk_waiting || g_talk_active);
+      if (g_audio_want && !g_audio_opened) open_audio_now(g_call, g_talk_waiting || g_talk_active);
       if (qn > 0) {
         for (int i = 0; i < qn; i++) send_tone(queue[i], &last_activity, now);
         qn = 0;
       }
     }
     /* Announcement bookkeeping. */
-    if (talk_waiting && g_call && g_streams) {
+    if (g_talk_waiting && g_call && g_streams) {
       if (!talk_media_logged) {
         talk_media_logged = 1;
         slog("[station] announce: call ready %lld ms after the request; waiting for the clip\n",
@@ -794,7 +808,7 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
       }
     }
     if (g_talk_active) {
-      talk_waiting = 0;
+      g_talk_waiting = 0;
       talk_deadline = 0;
       last_activity = now; /* busy while it plays; the idle hang-up counts from the clip's end */
     }
@@ -804,10 +818,10 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
       if (g_call) log_audio_rtp(g_call, "after the clip");
       slog("[station] announce: done; holding the call %llds for a follow-up\n", keepalive_ms / 1000);
     }
-    if (talk_waiting && talk_deadline && now > talk_deadline) {
+    if (g_talk_waiting && talk_deadline && now > talk_deadline) {
       slog("[station] announce: no audio arrived within %llds of the call coming up; releasing the hold\n",
            talk_start / 1000);
-      talk_waiting = 0;
+      g_talk_waiting = 0;
       talk_deadline = 0;
     }
     /* Release requested and no tone is waiting on this call any more -> BYE now (not on idle). */
@@ -823,8 +837,8 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
       slog("[station] no media within %ds (station busy / rejected?)\n", STREAMS_TIMEOUT_MS / 1000);
       for (int i = 0; i < qn; i++) slog("RESULT %c fail\n", queue[i]);
       qn = 0;
-      if (talk_waiting) slog("[station] announce: FAILED -- the call never came up\n");
-      talk_waiting = 0;
+      if (g_talk_waiting) slog("[station] announce: FAILED -- the call never came up\n");
+      g_talk_waiting = 0;
       talk_deadline = 0;
       if (g_redialing || g_switching) { g_redialing = g_switching = 0; answer_switches("fail", "no media"); hold_fifos(0); }
       bye_call(lc);
@@ -851,10 +865,10 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
       } else {
         for (int i = 0; i < qn; i++) slog("RESULT %c fail\n", queue[i]);
         qn = 0;
-        if (talk_waiting || g_talk_active)
+        if (g_talk_waiting || g_talk_active)
           slog("[station] announce: the station ended the call%s\n",
                g_talk_active ? " mid-clip" : " before the clip started");
-        talk_waiting = 0;
+        g_talk_waiting = 0;
         talk_deadline = 0;
         if (g_redialing || g_switching) {
           g_redialing = g_switching = 0;

@@ -347,6 +347,7 @@ async function main() {
     try {
       if (!callme.sip?.alive()) {
         await callme.connect();
+        twoVoice?.placesRefreshed(); // a helper whose account or station changed is respawned
       } else {
         callme.sip.keepalive();
         if (callme.sip.dueForReregister()) await callme.sip.register();
