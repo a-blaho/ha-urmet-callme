@@ -29,6 +29,7 @@ interface Config {
   announceTtsEngine?: string; // TTS entity for spoken announcements (empty = the first one HA has)
   announceTtsLanguage?: string;
   announceMaxSeconds: number; // announcements are cut at this length
+  announceIpercomDelayMs: number; // Ipercom announcements: silence before the clip (the panel's speaker comes on late)
   go2rtcPorts: Go2rtcPorts; // embedded go2rtc bind ports (from the add-on Network config via run.sh)
 }
 
@@ -95,6 +96,7 @@ async function loadConfig(): Promise<Config> {
     announceTtsEngine: (o.announce_tts_engine || process.env.ANNOUNCE_TTS_ENGINE || "").trim() || undefined,
     announceTtsLanguage: (o.announce_tts_language || process.env.ANNOUNCE_TTS_LANGUAGE || "").trim() || undefined,
     announceMaxSeconds: Number(o.announce_max_seconds ?? process.env.ANNOUNCE_MAX_SECONDS ?? 30),
+    announceIpercomDelayMs: Number(o.announce_ipercom_delay ?? process.env.ANNOUNCE_IPERCOM_DELAY ?? 5) * 1000,
     // go2rtc bind ports. Under host networking these bind directly on the host; make them options
     // (not the Network tab, which can't remap ports under host networking) so they can be changed to
     // coexist with a user's own go2rtc add-on. candidateIp is an undocumented env escape hatch.
@@ -176,11 +178,18 @@ async function main() {
     station: p.outgoingUser,
   }));
 
+  // Announcements (a `notify` entity per 2Voice place, and per Ipercom camera once video is up): TTS or
+  // an audio URL played out of the entrance panel on a call the family's helper holds.
+  const announcer = new Announcer({
+    ttsEngine: cfg.announceTtsEngine,
+    ttsLanguage: cfg.announceTtsLanguage,
+    maxSeconds: cfg.announceMaxSeconds,
+  });
+
   // 2Voice: one persistent `station` helper per detected 2Voice place owns the single call to its
   // station and does door/gate, pre-warm, announcements, the held ring and (with video) the camera on
   // it. Auto-enabled like IPERCOM doors: each place gets a door + gate button.
   let twoVoice: TwoVoiceStation | undefined;
-  let announcer: Announcer | undefined;
   let twoVoiceDoors: TwoVoiceDoor[] = [];
   if (twoVoicePlaces.length) {
     twoVoice = new TwoVoiceStation(twoVoicePlaces, callme.realm, {
@@ -188,12 +197,6 @@ async function main() {
       prewarmHoldMs: cfg.door2voicePrewarmHoldMs,
       talkDtmf: cfg.announceOpenAudio ? "4" : "",
       audioAtStart: cfg.video2voiceAudio,
-    });
-    // Announcements out of the door station (a `notify` entity per place), riding the same calls.
-    announcer = new Announcer(twoVoice, {
-      ttsEngine: cfg.announceTtsEngine,
-      ttsLanguage: cfg.announceTtsLanguage,
-      maxSeconds: cfg.announceMaxSeconds,
     });
     log.info(
       `2Voice announcements enabled: TTS engine ${cfg.announceTtsEngine ?? "(first found)"}` +
@@ -254,8 +257,32 @@ async function main() {
   if (cfg.video) {
     try {
       if (ipercomPlaces.length) {
-        video = new VideoService(callme, ipercomPlaces.map((p) => p.id), cfg.email, cfg.go2rtcPorts);
-        await video.start();
+        video = new VideoService(
+          callme,
+          ipercomPlaces.map((p) => p.id),
+          cfg.email,
+          cfg.go2rtcPorts,
+          cfg.announceMaxSeconds,
+          cfg.announceIpercomDelayMs,
+        );
+        if (await video.start()) {
+          log.info(
+            `Ipercom announcements enabled (one per camera, on its camera call): TTS engine ` +
+              `${cfg.announceTtsEngine ?? "(first found)"}` +
+              `${cfg.announceTtsLanguage ? `, language ${cfg.announceTtsLanguage}` : ""}, ` +
+              `delay ${cfg.announceIpercomDelayMs / 1000}s, max ${cfg.announceMaxSeconds}s`,
+          );
+          const v = video;
+          bridge?.publishIpercomAnnounce(
+            v.cameras().map((c) => ({
+              placeId: c.placeId,
+              topologicalCode: c.topologicalCode,
+              name: c.name,
+              placeName: callme.places.find((x) => x.id === c.placeId)?.name ?? c.placeId,
+              target: v.talkTarget(c.index),
+            })),
+          );
+        }
       } else if (twoVoice) {
         await twoVoice.startVideo(cfg.go2rtcPorts);
       }

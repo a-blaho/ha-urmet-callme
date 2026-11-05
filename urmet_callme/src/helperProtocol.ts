@@ -17,8 +17,11 @@
 //   CAMERA ok | CAMERA fail <why>       reply to V
 //   CAMERA live | CAMERA end            the picture's first keyframe arrived / the picture stopped
 // Everything else on stdout is a log line to forward.
-// The 2Voice helper is video-recv/station.c (every command); the Ipercom receiver recv.c takes none
-// (it is driven by signals from video.ts).
+// The 2Voice helper is video-recv/station.c (every command); the Ipercom receiver recv.c takes only
+// `T` (open the camera call's audio for a clip) and `R` (the same, answering the held doorbell ring),
+// which it answers on RECV_TALK_DONE_URL, not stdout, and `E` (show the held ring on the camera without
+// answering it: early media; no reply). It is otherwise driven by signals from video.ts.
+// Its stdout has one machine line of its own: RECV RING held <panel> | RECV RING gone.
 
 export const HelperCommand = {
   DOOR: "1",
@@ -28,8 +31,17 @@ export const HelperCommand = {
   PREWARM: "W",
   RELEASE: "H",
   TALK: "T",
+  TALK_ON_RING: "R", // recv only
+  RING_PICTURE: "E", // recv only
   CAMERA: "V",
 } as const;
+
+/** recv's ring lines: the doorbell ring it holds (and from which panel) or that none is held. */
+export function parseRecvRing(line: string): { held: boolean; panel: string } | null {
+  if (line === "RECV RING gone") return { held: false, panel: "" };
+  const m = /^RECV RING held (\S+)$/.exec(line);
+  return m ? { held: true, panel: m[1] } : null;
+}
 
 export type ToneDigit = "1" | "2" | "N";
 

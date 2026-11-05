@@ -13,6 +13,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import type { Server } from "node:http";
 import { macHeaderOf, Place } from "./place.js";
+import type { TalkTarget } from "./announce.js";
 import { listenControl, makeFifos, type ControlHandler } from "./cameraPipeline.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { cameraCommand, HelperCommand, parseHelperLine } from "./helperProtocol.js";
@@ -466,6 +467,15 @@ export class TwoVoiceStation {
     if (!h?.child?.stdin?.writable) return false;
     h.child.stdin.write(HelperCommand.TALK + "\n");
     return true;
+  }
+
+  /** The place as an announcement target (announce.ts). */
+  talkTarget(placeId: string): TalkTarget {
+    return {
+      name: this.placeName(placeId) ?? placeId,
+      fifo: talkFifoOf(placeId),
+      start: () => this.startTalk(placeId),
+    };
   }
 
   // ---- video (opt-in) ----

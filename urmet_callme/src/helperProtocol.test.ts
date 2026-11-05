@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cameraCommand, HelperCommand, parseHelperLine, parseResult } from "./helperProtocol.js";
+import { cameraCommand, HelperCommand, parseHelperLine, parseRecvRing, parseResult } from "./helperProtocol.js";
 
 // Both helpers' tone replies must parse, whatever surrounds the RESULT token.
 test("parseResult reads the station's and recv's RESULT lines", () => {
@@ -53,7 +53,16 @@ test("the stdin command alphabet is pinned", () => {
     PREWARM: "W",
     RELEASE: "H",
     TALK: "T",
+    TALK_ON_RING: "R",
+    RING_PICTURE: "E",
     CAMERA: "V",
   });
   assert.equal(cameraCommand("/tmp/a.h264", "/tmp/a.pcm"), "V /tmp/a.h264 /tmp/a.pcm");
+});
+
+test("parseRecvRing reads recv's ring lines and nothing else", () => {
+  assert.deepEqual(parseRecvRing("RECV RING held 01010104__00"), { held: true, panel: "01010104__00" });
+  assert.deepEqual(parseRecvRing("RECV RING gone"), { held: false, panel: "" });
+  assert.equal(parseRecvRing("RING held"), null);
+  assert.equal(parseRecvRing("2026-11-05T19:53:14.977Z [recv] ring: ended ()"), null);
 });

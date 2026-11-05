@@ -100,8 +100,8 @@ still up and is reused. So:
 The stream includes **one-way audio** (hear the visitor); two-way (talk-back) is not implemented yet.
 On 2Voice the station's sound stays off on a camera call, as in the official app, unless you turn on
 `video_2voice_audio` (which makes "next camera" slower, see below).
-On 2Voice you can speak *to* the visitor with an announcement instead (see
-[Announcements](#announcements-2voice-experimental)).
+You can speak *to* the visitor with an announcement instead (see
+[Announcements](#announcements-experimental)): on 2Voice and, with video on, on Ipercom.
 
 **"… hang up" button.** With video on, each place with a camera gets a **"… hang up"** `button` that
 ends its live camera call immediately (on 2Voice it also releases a call the door helper is holding).
@@ -174,11 +174,11 @@ a press during a preview does not open the door on yours, please open an issue w
 ringing your indoor monitor). If you test this, watch that your monitor stays quiet. Set
 `log_level: debug` and the add-on log shows each step (`[station] …`) for troubleshooting.
 
-### Announcements (2Voice, experimental)
+### Announcements (experimental)
 
-Each 2Voice place gets a **"… announce"** `notify` entity that plays a short message out of the door
-station's speaker - one-way, no microphone: "Leave the parcel at the door", "Be right down". Call it
-with `notify.send_message`:
+Each 2Voice place, and with `video: true` each Ipercom camera (entrance panel), gets a
+**"… announce"** `notify` entity that plays a short message out of the panel's speaker - one-way, no
+microphone: "Leave the parcel at the door", "Be right down". Call it with `notify.send_message`:
 
 ```yaml
 action: notify.send_message
@@ -190,11 +190,12 @@ data:
 
 - **Text** is spoken by one of Home Assistant's TTS engines (Piper, Google Translate, Home Assistant
   Cloud, ...). Set `announce_tts_engine` to choose one, otherwise the first one found is used (the
-  log says which). `announce_tts_language` picks the language.
+  log says which). `announce_tts_language` picks the language; without it the engine speaks Home
+  Assistant's default language, so an English sentence on a Slovak system comes out in a Slovak voice.
 - **An `http://` or `https://` URL** of an audio file (mp3, wav, ogg, ...) is played as-is, e.g. a
   pre-recorded chime or message.
 
-How it works: when nobody is watching the camera, the add-on places the same silent `auto_insertion`
+**On 2Voice:** when nobody is watching the camera, the add-on places the same silent `auto_insertion`
 call the door button uses, sends the station the "open audio" tone (`4`, as the app does before you
 talk; `announce_open_audio`), plays the clip into the call, and then holds the call for
 `door_open_2voice_keepalive` seconds, so a door press right after is instant. While the camera is
@@ -220,6 +221,30 @@ Confirmed on a cloud-listed 2Voice station
 not yet confirmed. Please report how it behaves on yours there, with the add-on log of one announcement -
 every step is logged at the default `info` level (see [Logging](#logging)).
 
+**On Ipercom** ([issue #24](https://github.com/a-blaho/ha-urmet-callme/issues/24)) an announcement plays
+on that panel's **camera call**, so it needs `video: true`; the entity is named after the camera. If
+the camera is not being viewed, the add-on calls it for the clip (exactly as opening the camera does).
+It then opens the call's audio the way the official app's "open audio" button does (the call is
+renegotiated with two-way audio), waits `announce_ipercom_delay` seconds (default 5: the panel switches
+its speaker on only a few seconds after the audio opens, and anything played before that is lost),
+plays the clip, and hangs up about 10 s after the clip ends if nobody is watching. So an Ipercom
+announcement is heard about 8-10 s after it is sent. If the start of your messages is cut off, raise
+the delay; if your panel speaks sooner, lower it. If you are watching that camera, the clip goes out on the call you are watching. If you
+are watching *another* camera, that view is switched to the announcing panel (there is one camera call
+at a time), and other cameras cannot be opened until the clip has played. `announce_open_audio` does
+not apply to Ipercom. **During a doorbell ring** a panel ignores camera calls, so an announcement to the ringing panel
+**answers the ring call** and plays on it instead, so an automation can reply to a visitor right away.
+Answering takes the call, so the CallMe app on your phones stops ringing, just as when someone answers
+it. An announcement to another panel does not disturb the ring.
+
+**The camera during a ring** shows the ring call itself, the way the official app's "view camera" button
+on its incoming-call screen does: the panel streams the picture while the call keeps ringing, so your
+phones keep ringing too, and an automation can take a snapshot on the doorbell event without a separate
+call. Like any camera call it starts black: the picture appeared about 10 s after the camera was opened
+on a tested panel, so a snapshot automation should keep the stream open and wait that long (a ring lasted
+about 30 s there). An announcement then answers that same call. When the ring ends, the stream stops; opening the
+camera again places a normal camera call.
+
 ## Options
 
 The Configuration page shows the everyday options. The rest are optional, with sensible defaults; turn
@@ -233,10 +258,11 @@ on **Show unused optional configuration options** to set one.
 | `video_2voice_audio`                           | 2Voice: open the station's sound on every camera call, for the entrance sound; "next camera" then re-dials (default `false`)                   |
 | `door_open_2voice_keepalive`                   | 2Voice: seconds to keep the call open after an unlock so a follow-up (e.g. door → gate) is instant (default `4`; `0` = a fresh call per press) |
 | `door_open_2voice_prewarm_hold`                | 2Voice: seconds a **"… ready"** (pre-warm) button press keeps the call open, so a following door/gate press is instant (default `15`)          |
-| `announce_tts_engine`                          | 2Voice announcements: TTS entity for spoken messages, e.g. `tts.piper` (default: the first one Home Assistant has)                             |
-| `announce_tts_language`                        | 2Voice announcements: language code for spoken messages (default: the engine's)                                                                |
+| `announce_tts_engine`                          | Announcements: TTS entity for spoken messages, e.g. `tts.piper` (default: the first one Home Assistant has)                                    |
+| `announce_tts_language`                        | Announcements: language code for spoken messages (default: the engine's)                                                                       |
 | `announce_open_audio`                          | 2Voice announcements: send the "open audio" tone (`4`) before the clip, as the app does (default `true`)                                       |
-| `announce_max_seconds`                         | 2Voice announcements: cut clips at this length (default `30`, max `120`)                                                                       |
+| `announce_max_seconds`                         | Announcements: cut clips at this length (default `30`, max `120`)                                                                              |
+| `announce_ipercom_delay`                       | Ipercom announcements: seconds of silence before the clip, while the panel's speaker switches on (default `5`, `0`-`15`)                      |
 | `mqtt_url` / `mqtt_username` / `mqtt_password` | Optional; omit to use the HA MQTT service automatically                                                                                        |
 | `log_level`                                    | `debug` / `info` (default) / `warn` / `error`                                                                                                  |
 
@@ -257,6 +283,10 @@ through the log:
 - `[station] announce: …`: the station helper's side - placing or reusing the call, `audio (media up):
   PCMU/8000, our direction sendrecv, station offered …` (we can only be heard when our direction allows
   sending), the open-audio tone, and the audio RTP packets sent after each clip.
+- `[recv] announce …` (Ipercom): the camera receiver's side - waiting for the panel's call or riding
+  the one up, `opening the call's audio (re-INVITE, audio sendrecv)`, the `negotiated audio direction`
+  after it (`sendrecv` = the panel accepted to hear us), `holding the clip … ms` (the delay), and how
+  the announcement ended.
 - `[station] ring: …`: a doorbell ring the helper holds unanswered, and whether an announcement or door
   press during it answered it. `[station] camera: …`: the camera showing the ring call, the call
   already up, or a camera call placed for it.

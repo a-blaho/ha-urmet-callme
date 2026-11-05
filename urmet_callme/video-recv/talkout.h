@@ -38,6 +38,12 @@
 
 typedef void (*talk_log_fn)(const char *fmt, ...);
 
+/* Warm-up: after the call's audio graph starts, send silence this long before reading the FIFO
+ * (the writer waits meanwhile, nothing is lost). Some panels switch their speaker on only seconds
+ * after the audio is opened: an Ipercom 4NP plays nothing for ~4-5 s (issue #24). 0 = read at once
+ * (the 2Voice station). Set by the includer before the call. */
+static long long g_talk_warmup_ms = 0;
+
 /* For the helper's main loop: a clip is playing / monotonic ms of its last audio block. */
 static volatile int g_talk_active = 0;
 static volatile long long g_talk_last_ms = 0;
@@ -57,6 +63,7 @@ typedef struct {
   talk_log_fn log;
   char path[256];
   long long opened_at; /* graph start (FIFO opened) */
+  long long hold_until; /* warm-up: no reading before this (monotonic ms; 0 = none) */
   /* current clip */
   int active;
   long long clip_start, last_audio, last_report;
@@ -88,8 +95,14 @@ static void talkin_open(TalkIn *t, const char *env, int rate, int nch) {
   if (!p || !*p) return;
   snprintf(t->path, sizeof t->path, "%s", p);
   t->fd = open(t->path, O_RDWR | O_NONBLOCK);
-  if (t->fd >= 0)
+  if (t->fd >= 0) {
     t->log("[%s] talk-out: listening on %s (%d Hz, %d ch, s16le)\n", t->tag, t->path, rate, nch);
+    if (g_talk_warmup_ms > 0) {
+      t->hold_until = t->opened_at + g_talk_warmup_ms;
+      t->log("[%s] talk-out: holding the clip %lld ms for the panel's speaker to switch on\n", t->tag,
+             g_talk_warmup_ms);
+    }
+  }
   else
     t->log("[%s] talk-out: cannot open %s (%s) -- announcements will not play on this call\n",
            t->tag, t->path, strerror(errno));
@@ -127,6 +140,7 @@ static void talkin_end_clip(TalkIn *t, int rate, int nch, const char *why) {
 static size_t talkin_fill(TalkIn *t, uint8_t *buf, size_t bytes, int rate, int nch) {
   memset(buf, 0, bytes);
   if (t->fd < 0) return 0;
+  if (t->hold_until && talk_now_ms() < t->hold_until) return 0; /* warm-up: silence, FIFO untouched */
   size_t got = 0;
   if (t->has_carry) { buf[got++] = t->carry; t->has_carry = 0; }
   ssize_t n = read(t->fd, buf + got, bytes - got);

@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.3.0
+
+- **Ipercom: announcements ([#24](https://github.com/a-blaho/ha-urmet-callme/issues/24)).** With
+  `video: true`, each Ipercom camera gets a **"… announce"** `notify` entity that speaks a TTS message
+  or plays an audio URL out of that entrance panel, like the 2Voice ones. The clip plays on the
+  panel's camera call (placed for it if nobody is watching), after opening the call's audio the way
+  the official app's "open audio" does (a re-INVITE with two-way audio). The camera receiver holds the
+  call until the clip has played; other cameras cannot be opened meanwhile. The panel switches its
+  speaker on a few seconds after the audio opens, so the clip waits `announce_ipercom_delay` seconds
+  (new option, default 5) first. Tested on an Ipercom panel.
+- **Ipercom: an announcement during a doorbell ring answers the ring.** A ringing panel ignores camera
+  calls, so the camera receiver now also registers the doorbell account, holds the ring and, when an
+  announcement goes to that panel, answers it like the app does and plays the clip on it. Answering
+  stops the phones ringing. This makes an automatic reply to a ring possible (needs `video: true`).
+- **Ipercom: the camera works during a ring.** Opening the camera of a ringing panel used to wait for a
+  call the panel never places. It now shows the ring itself, like the app's "view camera": the picture
+  streams while the call keeps ringing, so the phones keep ringing too, and a snapshot on the doorbell
+  event needs no separate call.
+- The `announce_tts_engine`, `announce_tts_language` and `announce_max_seconds` options now apply to
+  Ipercom announcements too.
+
 ## 1.2.0
 
 - **2Voice: the camera works during a ring, like the app's "view camera"

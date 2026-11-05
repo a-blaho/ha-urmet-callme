@@ -1,15 +1,17 @@
-// 2Voice announcements ("talk-out", issue #19): play a short clip out of the door station's speaker,
-// one-way - "Leave the parcel at the door", "Be right down". Exposed as an MQTT `notify` entity per
-// 2Voice place (mqtt.ts); the message is either text, spoken through one of Home Assistant's TTS
-// engines, or an http(s) URL of an audio file, played as-is.
+// Announcements ("talk-out"; 2Voice issue #19, Ipercom issue #24): play a short clip out of an
+// entrance panel's speaker, one-way - "Leave the parcel at the door", "Be right down". Exposed as an
+// MQTT `notify` entity per 2Voice place and per Ipercom camera (mqtt.ts); the message is either text,
+// spoken through one of Home Assistant's TTS engines, or an http(s) URL of an audio file, played as-is.
 //
-// How the audio gets there: every 2Voice place has a talk FIFO (talkFifoOf). ffmpeg decodes the
-// source to raw s16le 8 kHz mono (G.711 is forced on the call) and writes it into the FIFO, and the
-// place's station helper reads it in real time in place of the silence it sends on the call to the
-// station (video-recv/talkout.h) -- the call being viewed on the camera, one it holds, or one it
-// places for the clip (TwoVoiceStation.startTalk). ffmpeg's open of the FIFO blocks until the call's
-// audio graph opens it, so the first progress report from ffmpeg is also the moment the call started
-// taking the clip.
+// How the audio gets there: each target has a talk FIFO (TalkTarget.fifo). ffmpeg decodes the source
+// to raw s16le 8 kHz mono (G.711 is forced on the calls) and writes it into the FIFO, and the helper
+// holding the call reads it in real time in place of the silence it sends (video-recv/talkout.h):
+//   - 2Voice: the place's station helper, on the call being viewed, one it holds, or one it places
+//     for the clip (TwoVoiceStation.startTalk);
+//   - Ipercom: the camera receiver, on that camera's call (placed for the clip if none is up), after
+//     opening its audio with a re-INVITE like the app (VideoService.startTalk).
+// ffmpeg's open of the FIFO blocks until the call's audio graph opens it, so the first progress report
+// from ffmpeg is also the moment the call started taking the clip.
 //
 // Logging: every announcement gets a number (#n) and logs each step with its time since the
 // request: source resolved (TTS engine/URL), which call carries it, when the call took the audio,
@@ -18,7 +20,6 @@
 // "talk-out" wording, so one announcement can be followed through the whole log.
 import { ChildProcess, spawn } from "node:child_process";
 import { isDebug, logger } from "./logger.js";
-import { talkFifoOf, TwoVoiceStation } from "./twoVoiceStation.js";
 
 const log = logger("announce");
 
@@ -29,6 +30,15 @@ const LEAD_IN_MS = 400;
 // to get media + 25 s for the clip to start; this is the backstop above both).
 const START_TIMEOUT_MS = 50000;
 const HA_TIMEOUT_MS = 20000; // a TTS engine renders the whole clip before answering
+
+/** Where an announcement plays: one entrance panel and the helper that can put a call to it. */
+export interface TalkTarget {
+  name: string; // for the logs
+  fifo: string; // the talk FIFO the helper reads the clip from (one clip at a time per FIFO)
+  /** Get a call ready to carry the clip (placed, or the one that is up). Resolves false when no call
+   *  is possible; the clip is written only after this resolves true. */
+  start(): boolean | Promise<boolean>;
+}
 
 export interface AnnounceOptions {
   ttsEngine?: string; // TTS entity (tts.piper, tts.google_translate_en_com, ...); empty = first found
@@ -118,24 +128,23 @@ interface Playing {
 
 export class Announcer {
   private seq = 0;
-  private playing = new Map<string, Playing>(); // placeId -> clip being written
+  private playing = new Map<string, Playing>(); // talk FIFO -> clip being written
   private engine?: string; // resolved TTS engine, cached after the first lookup
   private stopping = false;
 
   constructor(
-    private tv: TwoVoiceStation,
     private opts: AnnounceOptions,
     private haBase = process.env.HA_URL || "http://supervisor/core",
     private haToken = process.env.HA_TOKEN || process.env.SUPERVISOR_TOKEN || "",
   ) {}
 
-  /** Play `message` (text for TTS, or an http(s) audio URL) out of the place's door station.
+  /** Play `message` (text for TTS, or an http(s) audio URL) out of the target's entrance panel.
    *  Resolves when the clip has been handed to the call (or failed); never throws. */
-  async announce(placeId: string, message: string): Promise<boolean> {
+  async announce(target: TalkTarget, message: string): Promise<boolean> {
     const id = ++this.seq;
     const t0 = Date.now();
     const at = () => `+${((Date.now() - t0) / 1000).toFixed(1)}s`;
-    const name = this.tv.placeName(placeId) ?? placeId;
+    const name = target.name;
     const src = classifyMessage(message);
     if (!src.value) {
       log.warn(`#${id} ${name}: empty message, nothing to announce`);
@@ -161,38 +170,46 @@ export class Announcer {
       }
     }
 
-    // 2. A call to carry it: the station helper places one, or rides the one it has (the camera being
-    //    viewed, a pre-warm, the keep-alive after a press, the held ring it answers).
-    if (!this.tv.startTalk(placeId)) {
-      log.error(`#${id} ${at()} FAILED: no call possible for ${name} (station helper not ready)`);
+    // 2. A call to carry it: the helper places one, or rides the one it has (2Voice: the camera being
+    //    viewed, a pre-warm, the keep-alive after a press, the held ring it answers; Ipercom: the
+    //    camera call, switched to this camera if another one holds it).
+    let ready = false;
+    try {
+      ready = await target.start();
+    } catch (e) {
+      log.error(`#${id} ${at()} FAILED: no call for ${name}: ${(e as Error).message}`);
       return false;
     }
-    log.info(`#${id} ${at()} asked the station helper for a call`);
+    if (!ready) {
+      log.error(`#${id} ${at()} FAILED: no call possible for ${name} (helper not ready)`);
+      return false;
+    }
+    log.info(`#${id} ${at()} asked the helper for a call`);
 
-    // 3. Decode into the place's talk FIFO. One clip per place: a newer one replaces it.
-    return this.play(placeId, id, at, input, auth);
+    // 3. Decode into the target's talk FIFO. One clip per FIFO: a newer one replaces it.
+    return this.play(target.fifo, id, at, input, auth);
   }
 
-  /** Write one clip into the place's talk FIFO with ffmpeg. */
+  /** Write one clip into a talk FIFO with ffmpeg. */
   private play(
-    placeId: string,
+    fifo: string,
     id: number,
     at: () => string,
     input: string,
     auth: string | undefined,
   ): Promise<boolean> {
     const t0 = Date.now();
-    const prev = this.playing.get(placeId);
+    const prev = this.playing.get(fifo);
     if (prev) {
       log.info(`#${id} replacing announcement #${prev.id}, which is still playing`);
       prev.replaced = true;
       prev.ff.kill("SIGTERM");
     }
-    const args = ffmpegArgs(input, talkFifoOf(placeId), this.opts.maxSeconds, auth);
+    const args = ffmpegArgs(input, fifo, this.opts.maxSeconds, auth);
     log.debug(`#${id} ffmpeg ${redactArgs(args)}`);
     const ff = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
     const cur: Playing = { id, ff, replaced: false };
-    this.playing.set(placeId, cur);
+    this.playing.set(fifo, cur);
 
     return new Promise((resolve) => {
       let took = 0; // ms since this clip was started when the call took the audio
@@ -206,7 +223,7 @@ export class Announcer {
         if (took) return;
         log.error(
           `#${id} ${at()} FAILED: no call took the clip within ${START_TIMEOUT_MS / 1000}s ` +
-            "(see the [station] lines above for why the call did not come up)",
+            "(see the [station] / [recv] lines above for why the call did not come up)",
         );
         timedOut = true;
         ff.kill("SIGTERM");
@@ -250,13 +267,13 @@ export class Announcer {
       ff.on("error", (e) => {
         // Spawn failure: no "exit" follows, so settle here.
         clearTimeout(startTimer);
-        if (this.playing.get(placeId) === cur) this.playing.delete(placeId);
+        if (this.playing.get(fifo) === cur) this.playing.delete(fifo);
         log.error(`#${id} FAILED: cannot run ffmpeg: ${e.message}`);
         resolve(false);
       });
       ff.on("exit", (code, signal) => {
         clearTimeout(startTimer);
-        if (this.playing.get(placeId) === cur) this.playing.delete(placeId);
+        if (this.playing.get(fifo) === cur) this.playing.delete(fifo);
         const audio = `${(last.outTimeMs / 1000).toFixed(1)}s of audio (${last.totalSize} B, incl. ${LEAD_IN_MS} ms lead-in)`;
         if (cur.replaced) {
           log.info(`#${id} ${at()} stopped after ${audio}: replaced by a newer announcement`);
@@ -264,10 +281,10 @@ export class Announcer {
         }
         if (code === 0) {
           // ffmpeg is done once the clip is in the FIFO, which buffers up to ~4 s: the call plays the
-          // tail after this (the helper's "talk-out: clip ended" line marks the real end).
-          const left = Math.max(0, last.outTimeMs - (Date.now() - t0 - took)) / 1000;
+          // tail after this, and on Ipercom only after the speaker delay (the helper's "talk-out: clip
+          // ended" line marks the real end).
           log.info(
-            `#${id} ${at()} done: ${audio} written; the call plays the rest over ~${left.toFixed(1)}s` +
+            `#${id} ${at()} done: ${audio} written; the call plays it out (see "talk-out: clip ended")` +
               (last.outTimeMs >= this.opts.maxSeconds * 1000 ? ` (cut at the ${this.opts.maxSeconds}s limit)` : ""),
           );
           return resolve(true);

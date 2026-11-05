@@ -1,5 +1,5 @@
 name: Urmet CallMe (Unofficial)
-version: "1.2.0"
+version: "1.3.0"
 slug: urmet_callme
 description: Control your Urmet intercom from Home Assistant
 url: "https://github.com/a-blaho/ha-urmet-callme"
@@ -54,6 +54,7 @@ schema:
   announce_tts_language: "str?"
   announce_open_audio: "bool?"
   announce_max_seconds: "int(5,120)?"
+  announce_ipercom_delay: "int(0,15)?"
   log_level: "list(debug|info|warn|error)?"
   mqtt_url: "str?"
   mqtt_username: "str?"
