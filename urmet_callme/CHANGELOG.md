@@ -20,6 +20,10 @@
   event needs no separate call.
 - The `announce_tts_engine`, `announce_tts_language` and `announce_max_seconds` options now apply to
   Ipercom announcements too.
+- **2Voice: fixed the check behind the camera during a ring.** 1.2.0 looked at the call's own parameters,
+  which are empty before an answer, so it probably always reported "no video on the ring call". It now
+  reads the station's offer, as the official app does. The same fix made this work on an Ipercom panel;
+  not yet confirmed on a 2Voice station.
 
 ## 1.2.0
 

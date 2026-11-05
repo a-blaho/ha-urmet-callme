@@ -577,12 +577,14 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
   g_cam_live = 0;
   g_cam_pending = 0;
   if (g_ring) {
-    const LinphoneCallParams *cp = linphone_call_get_current_params(g_ring);
+    /* The station's own offer, as the app's remoteSendVideo: our current params are empty before an
+     * answer (on an Ipercom panel they read "inactive" on a ring offering sendonly video). */
+    const LinphoneCallParams *rp = linphone_call_get_remote_params(g_ring);
     LinphoneMediaDirection vd =
-        cp && linphone_call_params_video_enabled(cp) ? linphone_call_params_get_video_direction(cp)
+        rp && linphone_call_params_video_enabled(rp) ? linphone_call_params_get_video_direction(rp)
                                                      : LinphoneMediaDirectionInactive;
-    if (vd != LinphoneMediaDirectionRecvOnly && vd != LinphoneMediaDirectionSendRecv) {
-      slog("[station] camera: the ring call offers no video for us (%s)\n", dir_name(vd));
+    if (vd != LinphoneMediaDirectionSendOnly && vd != LinphoneMediaDirectionSendRecv) {
+      slog("[station] camera: the ring call offers no video for us (station sends: %s)\n", dir_name(vd));
       camera_fail("no video on the ring call");
       return;
     }
