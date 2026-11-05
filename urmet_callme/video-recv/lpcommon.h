@@ -280,7 +280,8 @@ static MSFilterDesc awrite_desc = {
  *
  * Announcements: with lp_talk_env naming a FIFO, blocks are filled from it instead (talkout.h; a
  * short read is zero-filled, so the steady RTP is unchanged), so a clip the control plane plays goes
- * out on the live call. The Ipercom answer is recvonly, so there the capture graph never runs. */
+ * out on the live call. The Ipercom answer is recvonly, so there the capture graph only runs once an
+ * announcement has opened the call's audio (recv.c open_audio: re-INVITE with audio sendrecv). */
 typedef struct {
   int rate;
   int nch;
@@ -402,6 +403,37 @@ typedef struct {
   int trace;              /* liblinphone's full trace: a hundred lines a second, drowns the add-on log */
 } LpSetup;
 
+/* Auth + registration of one SIP account on the core (the modern LinphoneAccount API; the deprecated
+ * proxy_config path silently never registered). `is_default`: the account outgoing calls use. recv.c
+ * adds the places' doorbell (channel) accounts next to its own this way. */
+static void lp_add_account(LinphoneCore *lc, const char *tag, const char *user, const char *pass,
+                           int is_default) {
+  LinphoneFactory *factory = linphone_factory_get();
+  const char *domain = lp_realm();
+  char server[300];
+  snprintf(server, sizeof server, "sip:%s:5061;transport=tls", domain);
+  LinphoneAuthInfo *ai = linphone_factory_create_auth_info(
+      factory, user, NULL /*userid*/, pass, NULL /*ha1*/, NULL /*realm*/, domain);
+  linphone_core_add_auth_info(lc, ai);
+  linphone_auth_info_unref(ai);
+
+  char identity[300];
+  snprintf(identity, sizeof identity, "sip:%s@%s", user, domain);
+  LinphoneAccountParams *ap = linphone_core_create_account_params(lc);
+  LinphoneAddress *id_addr = linphone_factory_create_address(factory, identity);
+  linphone_account_params_set_identity_address(ap, id_addr);
+  linphone_account_params_set_server_addr(ap, server);
+  linphone_account_params_set_register_enabled(ap, TRUE);
+  LinphoneAccount *account = linphone_core_create_account(lc, ap);
+  linphone_core_add_account(lc, account);
+  if (is_default) linphone_core_set_default_account(lc, account);
+  linphone_address_unref(id_addr);
+  linphone_account_params_unref(ap);
+  linphone_account_unref(account);
+
+  TAP_LOG("%s registering %s over %s ...\n", tag, identity, server);
+}
+
 static LinphoneCore *lp_create_core(const LpSetup *s, LinphoneCoreCbs *cbs) {
   LinphoneFactory *factory = linphone_factory_get();
   g_lp_debug = s->debug;
@@ -505,31 +537,7 @@ static LinphoneCore *lp_create_core(const LpSetup *s, LinphoneCoreCbs *cbs) {
     bctbx_list_free(pts); /* free the list nodes only (safe across liblinphone ownership quirks) */
   }
 
-  /* Auth + registration (the modern LinphoneAccount API; the deprecated proxy_config path silently
-   * never registered). */
-  const char *domain = lp_realm();
-  char server[300];
-  snprintf(server, sizeof server, "sip:%s:5061;transport=tls", domain);
-  LinphoneAuthInfo *ai = linphone_factory_create_auth_info(
-      factory, s->user, NULL /*userid*/, s->pass, NULL /*ha1*/, NULL /*realm*/, domain);
-  linphone_core_add_auth_info(lc, ai);
-  linphone_auth_info_unref(ai);
-
-  char identity[300];
-  snprintf(identity, sizeof identity, "sip:%s@%s", s->user, domain);
-  LinphoneAccountParams *ap = linphone_core_create_account_params(lc);
-  LinphoneAddress *id_addr = linphone_factory_create_address(factory, identity);
-  linphone_account_params_set_identity_address(ap, id_addr);
-  linphone_account_params_set_server_addr(ap, server);
-  linphone_account_params_set_register_enabled(ap, TRUE);
-  LinphoneAccount *account = linphone_core_create_account(lc, ap);
-  linphone_core_add_account(lc, account);
-  linphone_core_set_default_account(lc, account);
-  linphone_address_unref(id_addr);
-  linphone_account_params_unref(ap);
-  linphone_account_unref(account);
-
-  TAP_LOG("%s registering %s over %s ...\n", s->tag, identity, server);
+  lp_add_account(lc, s->tag, s->user, s->pass, 1);
   return lc;
 }
 

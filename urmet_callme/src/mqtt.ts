@@ -2,23 +2,19 @@
 //   button  one per openable relay (door/gate of each IPERCOM entrance; door + gate per 2Voice place),
 //           plus per place "ready" (2Voice pre-warm), "hang up" and "next camera" when video is on
 //   event   one doorbell per entrance/panel (device_class doorbell), firing `ring`
-//   notify  one per 2Voice place (announcements)
+//   notify  announcements: one per 2Voice place, and one per Ipercom camera when video is on
 // The strike is momentary with no state feedback, so a stateless button models it (no lock state).
 import mqtt, { IClientOptions, MqttClient } from "mqtt";
-import { Announcer } from "./announce.js";
+import { Announcer, type TalkTarget } from "./announce.js";
 import { CallMe } from "./callme.js";
 import { DoorbellRing } from "./doorbell.js";
 import { Door } from "./ipercom.js";
 import { logger } from "./logger.js";
 import { uriUser } from "./sipClient.js";
 import { TwoVoiceDoor, TwoVoiceStation } from "./twoVoiceStation.js";
-import { sanitize } from "./util.js";
+import { canonTopo, sanitize } from "./util.js";
 
 const log = logger("mqtt");
-
-// Topological codes use `#` wildcards in the device list but arrive as `_` in the same
-// positions in the panel's SIP From. Canonicalize (# and _ → #) so they compare equal.
-const canonTopo = (s: string) => (s || "").replace(/[_#]/g, "#");
 
 const MODEL_IPERCOM = "CallMe / Ipercom";
 const MODEL_TWOVOICE = "CallMe / 2Voice";
@@ -37,6 +33,15 @@ export interface TwoVoiceDoorbell {
   placeId: string;
   name: string;
   station: string; // the calling-station (OUT) username the ring's From carries
+}
+
+/** An Ipercom camera's announcement entity (published once video is up). */
+export interface IpercomAnnounceCam {
+  placeId: string;
+  topologicalCode: string; // with placeId, the entity's stable id
+  name: string; // the camera (entrance panel)
+  placeName: string; // the HA device it belongs to
+  target: TalkTarget;
 }
 
 /** A place whose camera call the "hang up" / "next camera" buttons act on (published once video is up). */
@@ -79,7 +84,7 @@ export class MqttBridge {
     },
     private callme: CallMe,
     private twoVoice?: TwoVoiceStation, // present when 2Voice places are detected
-    private announcer?: Announcer, // 2Voice announcements (the `notify` entities)
+    private announcer?: Announcer, // announcements (the `notify` entities)
   ) {
     this.prefix = options.discoveryPrefix || "homeassistant";
   }
@@ -284,9 +289,28 @@ export class MqttBridge {
             icon: "mdi:bullhorn",
             device: this.deviceFor(placeId, name, MODEL_TWOVOICE),
           },
-          (payload) => void announcer.announce(placeId, payload),
+          (payload) => void announcer.announce(tv.talkTarget(placeId), payload),
         );
     }
+  }
+
+  /** One announcement `notify` entity per Ipercom camera (entrance panel), published once the video
+   *  service is up: the clip plays on that camera's call (VideoService.startTalk). */
+  publishIpercomAnnounce(cams: IpercomAnnounceCam[]) {
+    const announcer = this.announcer;
+    if (!announcer) return;
+    for (const c of cams)
+      this.publishEntity(
+        "notify",
+        sanitize(`urmet_${c.placeId}_${c.topologicalCode}_announce`),
+        {
+          name: `${c.name} announce`,
+          icon: "mdi:bullhorn",
+          device: this.deviceFor(c.placeId, c.placeName),
+        },
+        (payload) => void announcer.announce(c.target, payload),
+      );
+    log.info(`published ${cams.length} Ipercom announcement entit${cams.length === 1 ? "y" : "ies"}`);
   }
 
   /** One "hang up" `button` per place with a camera, published once the video service is up (it

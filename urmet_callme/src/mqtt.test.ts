@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import type { Announcer, TalkTarget } from "./announce.js";
 import type { CallMe } from "./callme.js";
 import type { Door } from "./ipercom.js";
 import { MqttBridge, MqttLike } from "./mqtt.js";
@@ -121,6 +122,29 @@ test("2Voice places get door, gate, ready buttons and a doorbell keyed on the st
   fake.message("urmet/callme/urmet_p2_2voice_prewarm/set", "WARM");
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(calls, ["open p2 gate", "warm p2"]);
+});
+
+test("Ipercom cameras get an announce notify entity each, routed to that camera's target", async () => {
+  const fake = new FakeMqtt();
+  const said: string[] = [];
+  const announcer = {
+    announce: async (t: TalkTarget, msg: string) => (said.push(`${t.name}: ${msg}`), true),
+  } as unknown as Announcer;
+  const callme = { places: [{ id: "dev-1" }] } as unknown as CallMe;
+  const b = new MqttBridge("mqtt://fake", { connect: () => fake }, callme, undefined, announcer);
+  await b.start(doors);
+  const target = (name: string): TalkTarget => ({ name, fifo: "/tmp/x", start: () => true });
+  b.publishIpercomAnnounce([
+    { placeId: "dev-1", topologicalCode: "1.2#", name: "Main panel", placeName: "Home", target: target("[0]") },
+    { placeId: "dev-1", topologicalCode: "1.3#", name: "Gate panel", placeName: "Home", target: target("[1]") },
+  ]);
+  const n = fake.config("notify", "urmet_dev_1_1_2__announce")!;
+  assert.equal(n.name, "Main panel announce");
+  assert.equal((n.device as any).model, "CallMe / Ipercom");
+  assert.ok(fake.config("notify", "urmet_dev_1_1_3__announce"));
+  fake.message("urmet/callme/urmet_dev_1_1_3__announce/set", "Be right down");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(said, ["[1]: Be right down"]);
 });
 
 test("ringDoorbell fires the matching entrance, else every doorbell of the place", async () => {

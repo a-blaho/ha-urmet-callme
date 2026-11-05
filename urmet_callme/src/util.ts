@@ -34,3 +34,7 @@ export const SIP_USER_AGENT = "UrmetCallForwarding-Android";
 export function camFifos(i: number): { h264: string; pcm: string } {
   return { h264: `/tmp/urmet_cam_${i}.h264`, pcm: `/tmp/urmet_cam_${i}.pcm` };
 }
+
+/** Topological codes use `#` wildcards in the device list but arrive as `_` in the same positions in
+ *  the panel's SIP From. Canonicalize (# and _ -> #) so they compare equal. */
+export const canonTopo = (s: string) => (s || "").replace(/[_#]/g, "#");

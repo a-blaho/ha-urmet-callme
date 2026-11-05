@@ -45,12 +45,12 @@ configuration:
   announce_tts_engine:
     name: Announcement TTS engine (optional)
     description: >-
-      2Voice: the text-to-speech entity that speaks announcements, e.g. tts.piper or
+      The text-to-speech entity that speaks announcements, e.g. tts.piper or
       tts.google_translate_en_com. Leave empty to use the first one Home Assistant has.
   announce_tts_language:
     name: Announcement language (optional)
     description: >-
-      2Voice: language code for spoken announcements (e.g. en, it, de-DE). Leave empty for the
+      Language code for spoken announcements (e.g. en, it, de-DE). Leave empty for the
       engine's default.
   announce_open_audio:
     name: Open the station's audio before announcing
@@ -60,8 +60,13 @@ configuration:
   announce_max_seconds:
     name: Announcement length limit (seconds)
     description: >-
-      2Voice: announcements are cut at this length, so a long file cannot keep the 2Voice line
-      engaged.
+      Announcements are cut at this length, so a long file cannot keep the line (2Voice) or the
+      camera call (Ipercom) engaged.
+  announce_ipercom_delay:
+    name: Ipercom announcement delay (seconds)
+    description: >-
+      Ipercom: silence sent before an announcement once the call's audio is open. The panel switches
+      its speaker on only a few seconds later, and anything played before that is lost. Default 5.
   log_level:
     name: Log level
     description: How much detail to log (debug, info, warn, error).

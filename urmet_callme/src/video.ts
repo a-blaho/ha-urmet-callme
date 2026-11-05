@@ -7,12 +7,21 @@
 //   - GET /call?cam=<i> places the call (shared account A -> camera i, routed to account B via the
 //     split-account trick), actively switching if another camera holds the single slot;
 //     /hangup?cam=<i> ends it (in-dialog SIP BYE from recv)
+//   - announcements (issue #24): startTalk(i) gets camera i's call up (switching if another camera
+//     holds the slot), then a 'T' on recv's stdin opens its audio with a re-INVITE like the app's
+//     Ipercom "open audio" and recv plays the clip from TALK_FIFO; the slot is held until recv pings
+//     /talkdone
+//   - a panel that is ringing ignores camera calls (tested), so recv also registers the places'
+//     doorbell accounts and holds a ring ("RECV RING held <panel>"); an announcement to that panel
+//     goes out on the ring itself: 'R' answers it like the app does. Opening the camera of the ringing
+//     panel shows the ring without answering it ('E', early media), so the phones keep ringing
 //
 // The door station serves ~one video call at a time, so switching cameras BYEs the current call then
 // re-calls on the same account. With a SEPARATE account per camera, switching cost ~30-40s because the
 // panel kept the other camera "busy" until the abandoned session timed out; on ONE account the panel
 // frees instantly. The panel also can't reliably serve two concurrent streams anyway.
 import { ChildProcess, spawn } from "node:child_process";
+import type { TalkTarget } from "./announce.js";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { CallMe } from "./callme.js";
@@ -20,8 +29,9 @@ import { listenControl, makeFifos, type ControlHandler } from "./cameraPipeline.
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
 import { AvailableDevice } from "./ipercom.js";
 import { isDebug, logger } from "./logger.js";
+import { HelperCommand, parseRecvRing } from "./helperProtocol.js";
 import { isAlive, waitForExit } from "./proc.js";
-import { camFifos, stableUuid } from "./util.js";
+import { camFifos, canonTopo, stableUuid } from "./util.js";
 
 const log = logger("video");
 
@@ -51,6 +61,11 @@ const END_WAIT_MS = 2500;
 const BUSY_WAIT_MS = 8000;
 // At shutdown: how long to let recv finish its in-dialog BYE (recv.c pumps it for ~1 s on SIGTERM).
 const STOP_WAIT_MS = 2500;
+// The one announcement FIFO: recv serves one call at a time, so one clip at a time (announce.ts).
+export const TALK_FIFO = "/tmp/urmet_ipercom_talk.pcm";
+// Backstop for the announcement's hold on the slot if recv's /talkdone ping never comes: recv's own
+// limits (20 s for the call + 25 s for the clip to start) plus the longest clip, with room to spare.
+const TALK_HOLD_MARGIN_MS = 60000;
 
 /** A persisted SIP account B (shared across cameras - one video call at a time). */
 interface StoredAccount {
@@ -78,6 +93,8 @@ interface Call {
   state: "requested" | "live" | "ended";
   placedAt: number; // epoch ms the call_device_req went out (timing in the logs)
   retried: boolean; // the no-INVITE watchdog already re-requested this call once
+  ringView?: boolean; // not a call of ours: the held doorbell ring, shown with early media. No dialog
+  // to BYE and no gateway request to cancel; it ends with the ring ("RECV RING gone").
   busyTimer?: ReturnType<typeof setTimeout>; // the no-INVITE watchdog
 }
 
@@ -94,6 +111,12 @@ export class VideoService {
   private holder: number | null = null;
   private call: Call | null = null;
   private displacedAt = new Map<number, number>(); // camera -> epoch ms it was last switched away (debounce)
+  // An announcement holds the slot for this camera until recv reports it over (/talkdone?seq=<seq>,
+  // seq = the count of 'T's this recv was sent), so a viewer of another camera can't switch the call
+  // away mid-clip. `timer` is the backstop.
+  private talking: { cam: number; seq: number; timer: ReturnType<typeof setTimeout> } | null = null;
+  private talkSeq = 0;
+  private ringPanel: string | null = null; // the panel whose doorbell ring recv holds (its SIP user)
   private endWaiters: Array<() => void> = []; // cancel()s waiting for recv's /ended ping
   private opChain: Promise<unknown> = Promise.resolve(); // serializes call/cancel (see serialize)
   private stopping = false;
@@ -105,6 +128,8 @@ export class VideoService {
     private placeIds: string[], // the IPERCOM places whose cameras to serve (never a 2Voice place)
     private email: string, // the cache key for the persisted account (see StoredAccount.email)
     private ports: Go2rtcPorts,
+    private talkMaxSeconds = 30, // announce_max_seconds: sizes the announcement's hold backstop
+    private talkWarmupMs = 0, // announce_ipercom_delay: silence before the clip (the speaker comes on late)
   ) {}
 
   async start(): Promise<boolean> {
@@ -203,6 +228,14 @@ export class VideoService {
     if (this.stopping) return; // don't resurrect while shutting down
     // (Re)create every camera's FIFO pair; only the currently-targeted pair is written to.
     for (const cam of this.cams) makeFifos(cam.fifo, cam.afifo);
+    try {
+      makeFifos(TALK_FIFO);
+    } catch (e) {
+      log.warn(`announcement FIFO not created: ${(e as Error).message}`);
+    }
+    this.talkSeq = 0; // a fresh recv counts its 'T's from zero
+    this.onRecvRing(null); // a fresh recv holds no ring
+    this.clearTalk();
     this.writeTarget(0); // default target before the first placeCall
     const dataDir = `/tmp/lp_shared/`; // trailing slash: liblinphone appends the db filename
     mkdirSync(dataDir, { recursive: true });
@@ -220,16 +253,69 @@ export class VideoService {
         RECV_CONNECTED_URL: `http://127.0.0.1:${this.callPort}/connected`,
         RECV_ENDED_URL: `http://127.0.0.1:${this.callPort}/ended`, // dialog over -> a switch may re-call
         RECV_IDLE_SECONDS: String(RECV_IDLE_SECONDS),
+        RECV_AUDIO_IN: TALK_FIFO, // announcements: the clip recv plays into the call
+        RECV_TALK_WARMUP_MS: String(this.talkWarmupMs),
+        RECV_RING_ACCOUNTS: this.ringAccounts(),
+        RECV_TALK_DONE_URL: `http://127.0.0.1:${this.callPort}/talkdone`,
         // log_level debug -> recv's own trace (SIP trace + per-5s audio RTP counters).
         ...(isDebug() ? { RECV_DEBUG: "1" } : {}),
       },
-      stdio: "inherit",
+      stdio: ["pipe", "pipe", "inherit"], // stdin: announcement commands; stdout: logs + RECV RING lines
     });
+    let out = "";
+    this.recv.stdout?.setEncoding("utf8");
+    this.recv.stdout?.on("data", (d: string) => {
+      out += d;
+      let nl: number;
+      while ((nl = out.indexOf("\n")) >= 0) {
+        const line = out.slice(0, nl);
+        out = out.slice(nl + 1);
+        const ring = parseRecvRing(line);
+        if (ring) this.onRecvRing(ring.held ? ring.panel : null);
+        else process.stdout.write(line + "\n");
+      }
+    });
+    this.recv.stdin?.on("error", () => {}); // EPIPE when recv dies; its exit handler respawns it
     this.recv.on("exit", (code) => {
       if (this.stopping) return;
       log.warn(`recv exited (code ${code}); respawning in 3s`);
       setTimeout(() => this.spawnRecv(pass), 3000);
     });
+  }
+
+  /** Does the ring recv holds come from camera i's panel? */
+  private ringFrom(i: number): boolean {
+    return !!this.ringPanel && canonTopo(this.ringPanel) === canonTopo(this.cams[i].dev.topologicalCode);
+  }
+
+  private onRecvRing(panel: string | null) {
+    this.ringPanel = panel;
+    const call = this.call;
+    if (panel === null) {
+      if (!call?.ringView) return;
+      // The picture ended with the ring. A viewer still there reconnects to a normal camera call.
+      log.info(`camera ${this.camName(call.cam)}: the ring is over, and its picture with it`);
+      this.call = null;
+      if (this.holder === call.cam) this.holder = null;
+      return;
+    }
+    // The doorbell event can reach a camera request ahead of this line: such a request went to a panel
+    // that ignores it. Show the ring instead (placeCall cancels the request first).
+    if (call?.state === "requested" && !call.ringView && this.ringFrom(call.cam) && this.holder === call.cam)
+      this.serialize(() => this.placeCall(call.cam)).catch((e) =>
+        log.error(`video call ${this.camName(call.cam)} failed: ${(e as Error).message}`),
+      );
+  }
+
+  // The places' doorbell (channel) accounts, for recv to hold their rings: "user pass", a line each.
+  // Read at each spawn. A rotated password reaches recv at its next respawn; until then the Node
+  // listener still fires the doorbell event, only answering the ring is off.
+  private ringAccounts(): string {
+    return this.placeIds
+      .map((id) => this.callme.places.find((p) => p.id === id))
+      .filter((p) => p?.incomingUser && p.incomingPw)
+      .map((p) => `${p!.incomingUser} ${p!.incomingPw}`)
+      .join("\n");
   }
 
   // Point recv at camera i's FIFOs for its NEXT answered call. recv re-reads this when it builds the
@@ -312,6 +398,12 @@ export class VideoService {
     const call = this.call;
     if (!this.cams[i] || !call || call.cam !== i) return; // stale hangup for a camera that isn't current
     this.clearBusyTimer(call);
+    if (call.ringView) {
+      // The ring keeps ringing: only our interest in its picture ends.
+      this.call = null;
+      if (this.holder === i && !keepSlot) this.holder = null;
+      return;
+    }
     // Poke the shared recv: if it holds a call it sends the in-dialog BYE (the teardown); if not,
     // SIGUSR1 is a no-op. Send it EVERY time the process is alive. (Do NOT gate on
     // ChildProcess.killed: Node sets that after ANY successful kill(), so it went true on the first
@@ -348,6 +440,7 @@ export class VideoService {
     }
     if (this.call === call) this.call = null;
     if (this.holder === i && !keepSlot) this.holder = null; // free the single video slot
+    if (this.talking?.cam === i && !keepSlot) this.clearTalk(); // the call carrying the clip is gone
   }
 
   // Resolve true when recv pings /ended, false after END_WAIT_MS.
@@ -363,6 +456,83 @@ export class VideoService {
       };
       this.endWaiters.push(done);
     });
+  }
+
+  /** The cameras, for the announcement entities (one per entrance panel). */
+  cameras(): { index: number; placeId: string; name: string; topologicalCode: string }[] {
+    return this.cams.map((c, index) => ({
+      index,
+      placeId: c.placeId,
+      name: c.dev.name,
+      topologicalCode: c.dev.topologicalCode,
+    }));
+  }
+
+  /** Camera i as an announcement target (announce.ts). */
+  talkTarget(i: number): TalkTarget {
+    return { name: this.camName(i), fifo: TALK_FIFO, start: () => this.startTalk(i) };
+  }
+
+  /** Get camera i's call up for an announcement and tell recv to open its audio for the clip.
+   *  Resolves once the call is placed (or already up) -- after any other camera's call is down, so
+   *  the clip cannot land on it. False when recv is not running. */
+  async startTalk(i: number): Promise<boolean> {
+    if (!this.cams[i] || !isAlive(this.recv) || !this.recv?.stdin?.writable) return false;
+    // Claim the slot now (like /call does), so a concurrent /call for another camera is refused.
+    const prev = this.holder;
+    this.holder = i;
+    this.holdTalk(i, 0);
+    await this.serialize(async () => {
+      if (prev !== null && prev !== i) {
+        log.info(`announcement: switching video ${this.camName(prev)} -> ${this.camName(i)}`);
+        this.displacedAt.set(prev, Date.now());
+        await this.cancel(prev);
+        await new Promise((r) => setTimeout(r, SWITCH_SETTLE_MS));
+      }
+      const c = this.call;
+      if (this.ringFrom(i) && c?.state !== "live") return; // answered below
+      if (c?.cam === i && (c.state === "requested" || c.state === "live")) {
+        log.info(`announcement: riding the ${c.state} call to ${this.camName(i)}`);
+        return;
+      }
+      await this.placeCall(i);
+    });
+    if (this.holder !== i) return false; // the call was refused or replaced meanwhile
+    // This panel is ringing, so it would ignore a camera call: answer the ring and play on that. It
+    // becomes THE call: a viewer of this camera gets it, and /connected and the hang-up treat it as one.
+    if (this.ringFrom(i) && this.call?.state !== "live") {
+      log.info(`announcement: ${this.camName(i)} is ringing -> answering the doorbell call`);
+      const old = this.call;
+      this.clearBusyTimer(old);
+      if (old && !old.ringView && old.state === "requested")
+        void this.callme.cancelCall(this.optsFor(old.cam), this.cams[old.cam].placeId).catch(() => {});
+      this.ringPanel = null; // recv answers it now ("RECV RING gone" follows)
+      if (!old?.ringView) this.writeTarget(i); // the ring's FIFOs are set already when it is on view
+      this.call = { cam: i, state: "requested", placedAt: Date.now(), retried: false };
+      this.recv!.stdin!.write(HelperCommand.TALK_ON_RING + "\n");
+      this.holdTalk(i, ++this.talkSeq);
+      return true;
+    }
+    // recv takes the 'T' for the call that is up or the next one it answers.
+    this.recv!.stdin!.write(HelperCommand.TALK + "\n");
+    this.holdTalk(i, ++this.talkSeq);
+    return true;
+  }
+
+  /** Hold the slot for camera i while its announcement plays (seq 0 = not sent to recv yet). */
+  private holdTalk(cam: number, seq: number) {
+    this.clearTalk();
+    const timer = setTimeout(() => {
+      if (this.talking?.timer !== timer) return;
+      log.warn(`announcement on ${this.camName(cam)}: no end reported by recv; releasing the slot`);
+      this.talking = null;
+    }, this.talkMaxSeconds * 1000 + this.talkWarmupMs + TALK_HOLD_MARGIN_MS);
+    this.talking = { cam, seq, timer };
+  }
+
+  private clearTalk() {
+    if (this.talking) clearTimeout(this.talking.timer);
+    this.talking = null;
   }
 
   /** The places with at least one camera stream. */
@@ -401,6 +571,10 @@ export class VideoService {
     // recv still holds the call -- within recv's reader-idle window. Nothing to BYE, nothing to
     // re-call: the new ffmpeg just reads the FIFO. Nudge one keyframe so it decodes at once instead of
     // at the panel's next periodic IDR. This is the instant flip-back.
+    if (current?.cam === idx && current.ringView) {
+      log.info(`camera ${this.camName(idx)}: already showing its ring`);
+      return;
+    }
     if (current?.cam === idx && current.state === "live") {
       log.info(`reusing live video call to ${this.camName(idx)} (keyframe nudge)`);
       try {
@@ -417,6 +591,13 @@ export class VideoService {
     const retried = current?.cam === idx ? current.retried : false;
     if (current) await this.cancel(current.cam, true);
     this.writeTarget(idx); // point the shared recv at THIS camera's FIFOs before it answers
+    // This panel is ringing: it would ignore a camera request, but the ring itself has the picture.
+    if (this.ringFrom(idx) && this.recv?.stdin?.writable) {
+      log.info(`camera ${this.camName(idx)}: ringing -> showing the ring (the phones keep ringing)`);
+      this.call = { cam: idx, state: "requested", placedAt: Date.now(), retried: false, ringView: true };
+      this.recv.stdin.write(HelperCommand.RING_PICTURE + "\n");
+      return;
+    }
     const call: Call = { cam: idx, state: "requested", placedAt: Date.now(), retried };
     this.call = call;
     await this.callme.callDevice(this.optsFor(idx), this.cams[idx].placeId);
@@ -437,6 +618,16 @@ export class VideoService {
       const idx = camParam !== null ? parseInt(camParam, 10) || 0 : (this.holder ?? this.call?.cam ?? 0);
       if (!this.cams[idx]) return void res.writeHead(400).end("no such camera");
 
+      if (u.pathname === "/talkdone") {
+        // recv: the announcement is over (played, given up, or its call ended). Only the latest one
+        // releases the slot; an older one's late ping must not.
+        const seq = Number(u.searchParams.get("seq"));
+        if (this.talking && this.talking.seq === seq) {
+          log.info(`announcement on ${this.camName(this.talking.cam)} over; the camera slot is free again`);
+          this.clearTalk();
+        }
+        return void res.writeHead(200).end("ok");
+      }
       if (u.pathname === "/hangup") {
         await this.serialize(() => this.cancel(idx));
         return void res.writeHead(200).end("ok");
@@ -477,6 +668,11 @@ export class VideoService {
       // forth (only relevant if both cards are visible at once; with cameras on separate views this
       // never triggers). Claim the slot synchronously so concurrent /call requests serialize correctly.
       const now = Date.now();
+      // An announcement is playing on another camera's call: don't switch it away mid-clip.
+      if (this.talking && this.talking.cam !== idx) {
+        log.info(`camera ${this.camName(idx)}: refused while an announcement plays on ${this.camName(this.talking.cam)}`);
+        return void res.writeHead(503).end("announcement playing");
+      }
       if (this.holder !== null && this.holder !== idx) {
         if (now - (this.displacedAt.get(idx) ?? 0) < SWITCH_DEBOUNCE_MS) {
           return void res.writeHead(503).end("switch debounced"); // avoid ping-pong
@@ -511,6 +707,7 @@ export class VideoService {
   async stop(): Promise<void> {
     this.stopping = true;
     this.clearBusyTimer(this.call);
+    this.clearTalk();
     this.server?.close();
     this.go2rtc?.stop();
     const recv = this.recv;
