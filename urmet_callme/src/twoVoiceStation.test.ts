@@ -10,7 +10,9 @@ import {
   HelperTiming,
   talkFifoOf,
   TwoVoiceStation,
+  TwoVoiceStationOptions,
 } from "./twoVoiceStation.js";
+import { camFifos } from "./util.js";
 
 /** A stand-in for the station helper process: records what the service writes to its stdin and
  *  which signals it gets; the test feeds its stdout lines and decides when it exits. */
@@ -84,15 +86,17 @@ function place(over: Partial<PlaceData> = {}): Place {
   );
 }
 
-function service(p: Place, timing: Partial<HelperTiming> = {}) {
+function service(p: Place, timing: Partial<HelperTiming> = {}, opts: Partial<TwoVoiceStationOptions> = {}) {
   const procs = new FakeProcs();
   const svc = new TwoVoiceStation([p], REALM, {
     keepaliveMs: 4000,
     prewarmHoldMs: 15000,
     talkDtmf: "4",
     audioAtStart: false,
+    cameraHoldSeconds: 30,
     timing: { respawnMs: 10, restartExitMs: 20, cameraReplyMs: 50, openTimeoutMs: 200, switchTimeoutMs: 200, ...timing },
     procs,
+    ...opts,
   });
   return { svc, procs };
 }
@@ -113,6 +117,23 @@ test("start() spawns one helper per place with the channel account, the station 
   assert.equal(c.env.STATION_MAC, "00:1E:E0:03:38:F8");
   assert.equal(c.env.STATION_AUDIO_IN, talkFifoOf(p.id));
   assert.ok(procs.fifos.includes(talkFifoOf(p.id)), "the announcement FIFO is (re)created");
+});
+
+test("the camera cycle and the switch confirm ride the spawn env only when configured", () => {
+  const p = place();
+  // Defaults: neither env goes out, so the helper keeps its own defaults (a 4-position cycle, no
+  // confirm) and a multi-camera station behaves exactly as it always has.
+  const off = service(p);
+  off.svc.start();
+  assert.equal(off.procs.spawns[0].env.STATION_CAM_CYCLE, undefined);
+  assert.equal(off.procs.spawns[0].env.STATION_SWITCH_CONFIRM_MS, undefined);
+  assert.equal(off.procs.spawns[0].env.STATION_VIDEO, undefined);
+
+  const on = service(p, {}, { camCycle: 2, switchConfirmMs: 6000, video: true });
+  on.svc.start();
+  assert.equal(on.procs.spawns[0].env.STATION_CAM_CYCLE, "2");
+  assert.equal(on.procs.spawns[0].env.STATION_SWITCH_CONFIRM_MS, "6000");
+  assert.equal(on.procs.spawns[0].env.STATION_VIDEO, "1");
 });
 
 test("a place without a station gets no helper until placesRefreshed() or stationLearned() sees one", () => {
@@ -270,6 +291,97 @@ test("CAMERA lines drive the camera flag; next camera is a no-op without a pictu
   c.say("CAMERA end");
   await flush();
   assert.equal(svc.hasCall(p.id), false);
+});
+
+test("cameraHold holds the picture without a viewer; next camera switches on the held call", async () => {
+  const p = place();
+  const { svc, procs } = service(p);
+  svc.start();
+  const c = procs.spawns[0];
+
+  assert.equal(await svc.cameraHold(p.id), false, "no camera stream yet (startVideo not called)");
+  assert.equal(c.cmds, "", "nothing went out for a place without a camera");
+
+  // startVideo (real go2rtc) is not unit-testable; seed the camera list the way it would.
+  const f = camFifos(0);
+  (svc as unknown as { cams: { place: Place; h264: string; pcm: string }[] }).cams.push({
+    place: p,
+    h264: f.h264,
+    pcm: f.pcm,
+  });
+
+  const held = svc.cameraHold(p.id);
+  await flush();
+  assert.ok(c.cmds.endsWith(`V ${f.h264} ${f.pcm} 30\n`), "the hold seconds ride the request");
+  c.say("CAMERA ok");
+  c.say("CAMERA live");
+  await flush();
+  assert.equal(await held, true);
+  assert.equal(svc.hasCall(p.id), true, "the picture is up although nobody drains the FIFOs");
+
+  // While held, an automation can switch panels and act on the one shown.
+  const switched = svc.nextCamera(p.id);
+  await flush();
+  assert.ok(c.cmds.includes("30\nN\n"), "the switch goes out on the held picture");
+  c.say("RESULT N ok");
+  assert.equal(await switched, true);
+
+  c.say("CAMERA end");
+  await flush();
+  assert.equal(svc.hasCall(p.id), false);
+  assert.equal(await svc.nextCamera(p.id), false, "hold over: the switch is a no-op again");
+  assert.equal(c.cmds.endsWith("30\nN\n"), true, "the no-op wrote nothing");
+});
+
+test("openEntrance: picture, then the panel, then its tone - each step failing stops the press", async () => {
+  const p = place();
+  const { svc, procs } = service(p);
+  svc.start();
+  const f = camFifos(0);
+  (svc as unknown as { cams: { place: Place; h264: string; pcm: string }[] }).cams.push({
+    place: p,
+    h264: f.h264,
+    pcm: f.pcm,
+  });
+  const c = procs.spawns[0];
+
+  const opened = svc.openEntrance(p.id, 1, "2"); // entrance 2 = panel 1, gate tone
+  await flush();
+  assert.ok(c.cmds.endsWith(`V ${f.h264} ${f.pcm} 30\n`), "the picture goes up first, with the hold");
+  c.say("CAMERA ok");
+  await flush();
+  assert.ok(c.cmds.endsWith("30\nN 1\n"), "then the absolute switch to panel 1");
+  c.say("RESULT N ok"); // settles once the new panel's picture is up
+  await flush();
+  assert.ok(c.cmds.endsWith("N 1\n2\n"), "the tone goes out only after the panel answered");
+  c.say("RESULT 2 ok");
+  await flush();
+  assert.equal(await opened, true, "the press completes after the tone is delivered");
+});
+
+test("openEntrance: no camera stream, or an unanswered switch, fails the press without the tone", async () => {
+  const p = place();
+  const { svc, procs } = service(p, { switchTimeoutMs: 20 });
+  svc.start();
+  const c = procs.spawns[0];
+
+  assert.equal(await svc.openEntrance(p.id, 0, "1"), false, "no camera stream: nothing to build on");
+  assert.equal(c.cmds, "", "nothing was written");
+
+  const f = camFifos(0);
+  (svc as unknown as { cams: { place: Place; h264: string; pcm: string }[] }).cams.push({
+    place: p,
+    h264: f.h264,
+    pcm: f.pcm,
+  });
+  const opened = svc.openEntrance(p.id, 0, "1");
+  await flush();
+  c.say("CAMERA ok");
+  await flush();
+  assert.ok(c.cmds.endsWith("30\nN 0\n"));
+  await sleep(40); // past switchTimeoutMs: the panel never answered
+  assert.equal(await opened, false);
+  assert.equal(c.cmds.includes("\n1\n"), false, "no tone went out on an unverified panel");
 });
 
 test("RING lines track the held doorbell ring; a tone's failure is reported", async () => {

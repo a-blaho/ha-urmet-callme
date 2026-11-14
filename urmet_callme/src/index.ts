@@ -23,6 +23,11 @@ interface Config {
   doorbell: boolean;
   video: boolean;
   video2voiceAudio: boolean; // 2Voice camera: open the station's audio on every call (switch re-dials)
+  openCamera2voice: boolean; // opt-in "open camera" button: the picture held with no viewer
+  openCamera2voiceHoldSeconds: number; // how long that button holds it
+  openCamera2voiceEntrances: string[]; // relay codes in panel order -> "open entrance N" buttons
+  openCamera2voicePositions: number; // how many panels the station's '3' cycles (helper default 4)
+  openCamera2voiceConfirm: boolean; // prove each absolute switch via the SPS cadence (camera-less positions)
   door2voiceKeepaliveMs: number; // 2Voice: hold the call open this long for instant door-then-gate (0 = off)
   door2voicePrewarmHoldMs: number; // 2Voice: how long a "ready" (pre-warm) press keeps the call open
   announceOpenAudio: boolean; // 2Voice announcements: send the open-audio digit ('4') before the clip
@@ -57,6 +62,39 @@ async function supervisorMqtt(): Promise<{
   }
 }
 
+/** "open_camera_2voice_entrances": comma-separated relay codes in panel order (panel 0 is what a
+ *  fresh call shows first), e.g. "1,2" = two entrances, door then gate. Anything malformed turns the
+ *  feature off with a warning, so a typo can never publish a button that opens the wrong relay. */
+function parseEntrances(raw: string | undefined): string[] {
+  const list = (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (!list.length) return [];
+  if (list.length > 4 || !list.every((s) => s === "1" || s === "2")) {
+    log.warn(
+      `open_camera_2voice_entrances: expecting up to 4 comma-separated '1'/'2' codes in panel order, got "${raw}" - no open-entrance buttons published`,
+    );
+    return [];
+  }
+  return list;
+}
+
+/** "open_camera_2voice_positions": how many panels the station cycles through with its in-call '3'
+ *  before it is back on the first (a fresh call always starts on panel 0). Default 4: a 1760/16U with
+ *  two cameras cycles four (issue #20). A station whose mux has, say, one camera and one camera-less
+ *  position (the panel's "snow") cycles 2. Out of range turns back to the default with a warning. */
+function parsePositions(raw: string | number | undefined): number {
+  const n = Number(raw ?? 4);
+  if (!Number.isInteger(n) || n < 2 || n > 8) {
+    log.warn(
+      `open_camera_2voice_positions: expecting an integer 2..8, got "${raw}" - using the default 4`,
+    );
+    return 4;
+  }
+  return n;
+}
+
 async function loadConfig(): Promise<Config> {
   let o: any = {};
   try {
@@ -89,6 +127,16 @@ async function loadConfig(): Promise<Config> {
     doorbell: o.doorbell ?? process.env.CALLME_DOORBELL !== "false",
     video: o.video ?? process.env.CALLME_VIDEO === "true",
     video2voiceAudio: o.video_2voice_audio ?? process.env.VIDEO_2VOICE_AUDIO === "true",
+    openCamera2voice: o.open_camera_2voice ?? process.env.CALLME_OPEN_CAMERA_2VOICE === "true",
+    openCamera2voiceHoldSeconds: Number(o.open_camera_2voice_hold ?? process.env.CALLME_OPEN_CAMERA_2VOICE_HOLD ?? 30),
+    openCamera2voiceEntrances: parseEntrances(
+      o.open_camera_2voice_entrances ?? process.env.CALLME_OPEN_CAMERA_2VOICE_ENTRANCES,
+    ),
+    openCamera2voicePositions: parsePositions(
+      o.open_camera_2voice_positions ?? process.env.CALLME_OPEN_CAMERA_2VOICE_POSITIONS,
+    ),
+    openCamera2voiceConfirm:
+      o.open_camera_2voice_confirm ?? process.env.CALLME_OPEN_CAMERA_2VOICE_CONFIRM === "true",
     door2voiceKeepaliveMs: Number(o.door_open_2voice_keepalive ?? 4) * 1000,
     door2voicePrewarmHoldMs:
       Number(o.door_open_2voice_prewarm_hold ?? 15) * 1000,
@@ -197,6 +245,14 @@ async function main() {
       prewarmHoldMs: cfg.door2voicePrewarmHoldMs,
       talkDtmf: cfg.announceOpenAudio ? "4" : "",
       audioAtStart: cfg.video2voiceAudio,
+      cameraHoldSeconds: cfg.openCamera2voiceHoldSeconds,
+      camCycle: cfg.openCamera2voicePositions,
+      // The switch confirm only makes sense on stations with camera-less positions (there the SPS
+      // cadence is the proof); 6 s per attempt is the helper's default deadline.
+      switchConfirmMs: cfg.openCamera2voiceConfirm ? 6000 : 0,
+      // Video on: the pre-warm offers the camera (the app's auto_insertion), so an "open entrance"
+      // pressed during its hold rides the live call instead of re-dialing.
+      video: cfg.video,
     });
     log.info(
       `2Voice announcements enabled: TTS engine ${cfg.announceTtsEngine ?? "(first found)"}` +
@@ -323,6 +379,32 @@ async function main() {
       })),
       (placeId) => tv.nextCamera(placeId),
     );
+    // "Open camera" button (opt-in `open_camera_2voice`): the camera held with no viewer, so an
+    // automation can switch panels and open without anyone watching the stream. Default: not
+    // published at all - nothing changes for setups that don't ask for it.
+    if (cfg.openCamera2voice)
+      bridge.publishOpenCamera(
+        v2served.map((placeId) => ({
+          placeId,
+          name: callme.places.find((x) => x.id === placeId)?.name ?? placeId,
+          model: "CallMe / 2Voice",
+        })),
+        (placeId) => tv.cameraHold(placeId),
+      );
+    // "Open entrance N" buttons (opt-in `open_camera_2voice_entrances`, codes in panel order): the
+    // whole open in one press - picture, panel, tone - without any automation on the HA side.
+    if (cfg.openCamera2voiceEntrances.length) {
+      const tones = cfg.openCamera2voiceEntrances;
+      bridge.publishOpenEntrances(
+        v2served.map((placeId) => ({
+          placeId,
+          name: callme.places.find((x) => x.id === placeId)?.name ?? placeId,
+          model: "CallMe / 2Voice",
+        })),
+        tones,
+        (placeId, idx) => tv.openEntrance(placeId, idx, tones[idx]),
+      );
+    }
   }
 
   // Ingress panel (served through HA's authenticated proxy): the go2rtc camera UI when video is on,

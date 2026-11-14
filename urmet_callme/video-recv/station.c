@@ -35,7 +35,9 @@
  *        STATION_KEEPALIVE_MS, STATION_PREWARM_HOLD_MS, STATION_IDLE_SECONDS, STATION_MAC,
  *        STATION_AUDIO_IN, STATION_TALK_DTMF, STATION_TALK_START_MS, STATION_ANSWER_RING,
  *        STATION_OPEN_AUDIO_AT_START, STATION_SWITCH_GAP_MS, STATION_CAM_CYCLE,
- *        STATION_REDIAL_DELAY_MS, STATION_DEBUG, STATION_TRACE, SIP_REALM, RECV_BLACK_FRAME (h264tap.h)
+ *        STATION_REDIAL_DELAY_MS, STATION_SWITCH_CONFIRM_MS (+ _ALIVE_MS/_GAP_MS/_STEADY_MS/
+ *        _WAIT_PICTURE_MS/_RETRIES), STATION_VIDEO, STATION_DEBUG, STATION_TRACE, SIP_REALM,
+ *        RECV_BLACK_FRAME, STATION_TAP_VERBOSE (both h264tap.h)
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -78,6 +80,10 @@ static int g_audio_at_start = 0; /* STATION_OPEN_AUDIO_AT_START: open it on ever
 static time_t g_video_deadline = 0; /* nudge for a keyframe until this time; give up if none (0=off) */
 static time_t g_last_vfu = 0;       /* last keyframe nudge, to rate-limit to ~1/s */
 static int g_idle_seconds = 10;     /* STATION_IDLE_SECONDS: camera off when no reader drains this long */
+/* Reader-less hold (the 'V' hold argument, the "open camera" button): keep the picture up until this
+ * wall-clock ms even though nobody drains the FIFOs (the tap just drops frames into the full pipe).
+ * Lets an automation switch panels and open without a viewer. 0 = off (the normal reader-idle rules). */
+static long long g_cam_hold_until = 0;
 
 /* Next camera (issue #20). The station cycles its entrance panels on the in-call DTMF '3', but only
  * while the call's audio is still closed: the app hides its next-camera button once the audio is
@@ -91,15 +97,71 @@ static int g_cam_pos = 0;          /* panel position the station shows: '3's sen
 static int g_cam_steps = 0;        /* '3's to send on the re-placed call (re-dial only) */
 static int g_redial_req = 0;       /* a switch asked for the current call to end and be re-placed */
 static int g_redialing = 0;        /* the re-placed call is on its way (not yet StreamsRunning) */
-static int g_switching = 0;        /* on the re-placed call: sending the '3's, audio still closed */
+static int g_switching = 0;        /* sending the '3's (live call or re-placed), audio still closed */
 static int g_switch_left = 0;      /* '3's still to send on this call */
 static long long g_switch_next_ms = 0; /* when the next '3' (or the closing '4') may go out */
 static int g_n_waiting = 0;        /* 'N' commands awaiting their RESULT line */
+static int g_switch_settle = 0;    /* last '3' out: answer the 'N's when the new panel's IDR lands */
 static time_t g_switch_vfu_until = 0; /* keyframe nudges for the new panel's picture until then */
 static int g_hold_fd[2] = {-1, -1};   /* our own writer on the FIFOs across a re-dial */
 static long long g_redial_at_ms = 0;  /* don't place the re-dial before this */
 static int g_redial_tries = 0;        /* re-dial attempts left for this switch */
 #define REDIAL_TRIES 3
+
+/* Switch CONFIRM (opt-in, STATION_SWITCH_CONFIRM_MS > 0): after each '3' of an ABSOLUTE switch
+ * ('N <panel>'), wait for the mux to prove the swap happened instead of assuming it. On stations
+ * where a position has NO camera (the panel shows "snow"), the proof is in the H.264 tap's SPS
+ * cadence (g_sps_seen) -- MEASURED on a real 2Voice station: a wired camera re-keys every
+ * ~0.8-1.2 s (never more than ~1.6 s apart), while the snow is ENCODED STATIC (real video, ~5 fps
+ * with 30-55 kB frames): it still keys, but only every ~5-7 s. Silence never comes -- the GAP is
+ * the proof. LEAVING a camera position, the gap stretching past g_sps_gap_ms means the mux
+ * moved to the camera-less one; LEAVING a camera-less one, two SPS less than g_sps_alive_ms
+ * apart prove a camera's cadence is back (a single SPS proves nothing: a snow re-key looks the
+ * same). The station IGNORES a '3' ~30% of the time with no in-stream acknowledgement, so a
+ * switch sent blind risks acting on the wrong panel; with confirm on, an ignored '3' is resent
+ * (the position only advances on proof) and a never-confirmed switch FAILS, so the caller's tone
+ * never goes out on the wrong panel. The first '3' also waits for the picture to have been steady
+ * for g_steady_ms: the panel drops tones sent during its stream's first moments (measured: a
+ * '3' ~200 ms after the first frame was swallowed every time, one seconds later always worked).
+ * Off by default: on stations where EVERY position has a
+ * camera all gaps stay short, the confirm never fires and every absolute switch fails (safe, but
+ * useless) -- only enable it for stations with camera-less positions. NEVER applied to the bare
+ * 'N' (classic next camera): that keeps today's behaviour. */
+static int g_switch_confirm = 0;      /* this switch runs confirmed (an absolute 'N' started it) */
+static int g_switch_pending = 0;      /* a confirmed '3' is out, waiting for the gap to stretch */
+static int g_switch_tries = 0;        /* resends already spent on the step in flight */
+static long g_switch_last_sps = 0;    /* g_sps_seen snapshot: last value the tick loop has seen */
+static long long g_switch_sps_ms = 0; /* when that value last changed (i.e. last SPS, at tick pace) */
+static long long g_switch_sent_ms = 0;    /* when the step in flight was sent (its deadline) */
+static long g_switch_sent_sps = 0;        /* g_sps_seen at send: the confirm reads the delta */
+static int g_switch_expect_sps = 0;       /* the position we left keys fast (camera): the gap proves it */
+static int g_pos_silent = 0;              /* the CURRENT position is proven camera-less (slow cadence) */
+static long long g_switch_wait_ms = 0;    /* when the step began waiting for the picture's cadence */
+static long long g_switch_cadence_ms = 0; /* when THIS call's SPS cadence first appeared (0 = none yet) */
+#define SWITCH_SPS_ALIVE_MS 2200 /* SPS within this = the mux is on a camera now (camera keyframes) */
+#define SWITCH_SPS_GAP_MS 3000   /* the gap stretching past this proves we left a camera (snow keys ~5-7 s) */
+#define SWITCH_STEADY_MS 4000    /* the panel swallows tones during its stream's first moments: wait for a
+                                  * picture that has been steady this long before sending a '3' (the app
+                                  * watches, then cycles; a '3' ~200 ms after the first frame is lost) */
+#define SWITCH_WAIT_PICTURE_MS 20000 /* max wait for a steady picture before failing the step */
+#define SWITCH_CONFIRM_RETRIES 2
+/* The thresholds above are the measured defaults; each is overridable for tuning on a live station
+ * (STATION_SWITCH_CONFIRM_ALIVE_MS/GAP_MS/STEADY_MS/WAIT_PICTURE_MS/_RETRIES). Set once at startup:
+ * ALIVE must stay well below GAP -- ALIVE says "a camera's cadence is back", GAP says "this silence
+ * can only be the camera-less position" -- crossed, every proof is garbage, so a nonsensical set
+ * falls back to the defaults. The per-attempt deadline (STATION_SWITCH_CONFIRM_MS) must stay above
+ * GAP plus the mux's own switch lag (~2.5 s measured), or the retry fires before the gap could. */
+static long long g_sps_alive_ms = SWITCH_SPS_ALIVE_MS;
+static long long g_sps_gap_ms = SWITCH_SPS_GAP_MS;
+static long long g_steady_ms = SWITCH_STEADY_MS;
+static long long g_wait_picture_ms = SWITCH_WAIT_PICTURE_MS;
+static int g_confirm_retries = SWITCH_CONFIRM_RETRIES;
+
+/* A camera call the station declines (placed during its release cooldown, ~2.5 s) used to end the
+ * picture with no retry. These attempts re-place it with the same pacing as a switch's re-dial
+ * before CAMERA fail is reported. */
+static int g_cam_dial_tries = 0;
+#define CAM_DIAL_TRIES 3
 
 static long long env_ms(const char *name, long long dflt) {
   const char *e = getenv(name);
@@ -119,6 +181,12 @@ static int cam_cycle(void) {
  * the previous one ended (it hasn't released the line yet; issue #20, 1.0.18), and declines again if
  * we retry too soon, so each retry waits one more pause. */
 static long long redial_delay_ms(void) { return env_ms("STATION_REDIAL_DELAY_MS", 2500); }
+/* Per-'3' deadline of a confirmed switch (0 = confirm off; see the g_switch_confirm block). */
+static long long switch_confirm_ms(void) { return env_ms("STATION_SWITCH_CONFIRM_MS", 0); }
+/* Video is on (STATION_VIDEO=1, set only when this place has a camera): the pre-warm then offers
+ * the camera, as the app's auto_insertion, so a press during its hold rides the live call instead
+ * of BYE+re-dialing it (the V on an audio-only call ends it and places a camera call, ~5 s). */
+static int prewarm_camera(void) { return getenv("STATION_VIDEO") != NULL; }
 
 /* Phase-B (1083/58A family) is identified by STATION_MAC. Those stations accept an audio-only INVITE
  * with a `mac` header; cloud-listed 2Voice panels 403 an audio-only offer (observed on a 1760/16) and
@@ -189,6 +257,7 @@ static void camera_off(const char *why) {
   if (!g_cam_on) return;
   g_cam_on = 0;
   g_cam_live = 0;
+  g_cam_dial_tries = 0;
   tap_targets_lock();
   g_tap_target[0] = '\0';
   g_cam_audio[0] = '\0';
@@ -197,11 +266,15 @@ static void camera_off(const char *why) {
   g_video_deadline = 0;
   g_switch_vfu_until = 0;
   g_last_drain = 0;
+  g_cam_hold_until = 0;
   slog("[station] camera: %s\nCAMERA end\n", why);
 }
 
 static void camera_fail(const char *why) {
   g_cam_on = 0;
+  g_cam_live = 0;
+  g_cam_dial_tries = 0;
+  g_cam_hold_until = 0;
   tap_targets_lock();
   g_tap_target[0] = '\0';
   g_cam_audio[0] = '\0';
@@ -251,6 +324,8 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
     log_audio_media(call, "media up");
     g_streams = 1;
     g_cam_pos = 0; /* every call starts on the first panel */
+    g_pos_silent = 0; /* ...and the first panel is a camera's: the SPS cadence will prove it */
+    g_switch_cadence_ms = 0; /* this call's cadence starts from zero (the steady gate re-arms) */
     if (g_redialing || g_n_waiting) {
       /* A re-placed call, or a switch asked for during setup: the '3's go out first, from the main
        * loop, with the audio still closed; the audio and the queued tones follow the last one. */
@@ -258,6 +333,12 @@ static void on_call_state(LinphoneCore *lc, LinphoneCall *call,
       g_switching = 1;
       g_switch_left = g_cam_steps;
       g_cam_steps = 0;
+      /* The '3' of a confirmed step, if one was in flight, belonged to the ended call: the new one
+       * starts from panel 0, so the step restarts (the confirm flag itself carries over), with a
+       * fresh picture-wait window of its own. */
+      g_switch_pending = 0;
+      g_switch_tries = 0;
+      g_switch_wait_ms = 0;
       g_switch_next_ms = g_switch_left ? now_ms() + switch_gap_ms() : now_ms();
     }
     if (g_cam_on) expect_picture();
@@ -498,6 +579,14 @@ static void feed_switch_gap(void) {
 }
 
 static void answer_switches(const char *result, const char *why) {
+  g_switch_settle = 0; /* whatever answers them, nothing is pending a keyframe any more */
+  /* The switch machine is done either way; its pending-confirm state must not leak into the
+   * NEXT call. (g_switch_vfu_until deliberately survives a SUCCESS: its nudges keep recovering
+   * the picture until the window ends; teardown sites close it, see the g_ended / 'H' paths.) */
+  g_switch_confirm = 0;
+  g_switch_pending = 0;
+  g_switch_tries = 0;
+  g_switch_wait_ms = 0; /* no picture wait is in flight any more either */
   for (; g_n_waiting > 0; g_n_waiting--)
     slog("RESULT N %s%s%s%s\n", result, why ? " (" : "", why ? why : "", why ? ")" : "");
 }
@@ -563,8 +652,9 @@ static void read_rest_of_line(char *out, size_t outsz) {
  * follows. With no call: place the camera call. Replies CAMERA ok, or CAMERA fail <why>. */
 static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long long *call_placed_at) {
   char line[600], h264[256] = "", pcm[256] = "";
+  int hold = 0; /* optional third token: reader-less hold seconds (the "open camera" button) */
   read_rest_of_line(line, sizeof line);
-  if (sscanf(line, " %255s %255s", h264, pcm) < 2) {
+  if (sscanf(line, " %255s %255s %d", h264, pcm, &hold) < 2) {
     camera_fail("no FIFO paths given");
     return;
   }
@@ -576,6 +666,10 @@ static void camera_on(LinphoneCore *lc, const char *out_uri, long long now, long
   g_cam_on = 1;
   g_cam_live = 0;
   g_cam_pending = 0;
+  g_cam_dial_tries = CAM_DIAL_TRIES; /* a declined camera call is re-placed (see the g_ended path) */
+  g_cam_hold_until = hold > 0 ? now + (long long)hold * 1000 : 0;
+  if (g_cam_hold_until)
+    slog("[station] camera: holding the picture without a reader for %d s\n", hold);
   if (g_ring) {
     /* The station's own offer, as the app's remoteSendVideo: our current params are empty before an
      * answer (on an Ipercom panel they read "inactive" on a ring offering sendonly video). */
@@ -663,14 +757,17 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
       if (n == 0) { g_running = 0; break; } /* stdin closed -> exit */
       if (n < 0) break;                     /* EAGAIN: nothing more right now */
       if (c == 'W') {
-        /* Pre-warm (doorbell ring): open the call NOW, no tone, so the unlock press moments later
-         * rides an already-established call (instant). Hold it for prewarm_hold; if no tone comes,
-         * the idle check below releases the bus. */
+        /* Pre-warm: open the call NOW, no tone, so the unlock press moments later rides an
+         * already-established call (instant). With video the offer carries the camera (as the
+         * app's auto_insertion), so a later V shows that call in place instead of BYE+re-dial.
+         * Hold it for prewarm_hold; if no tone comes, the idle check below releases the bus. */
         warm_deadline = now + prewarm_hold;
         if (!g_call && !g_redial_req && !g_redialing) {
-          if (place_call(lc, out_uri, NULL, 0)) {
+          if (place_call(lc, out_uri, NULL, prewarm_camera())) {
             call_placed_at = now;
-            slog("[station] pre-warm: opening call (hold %llds)\n", prewarm_hold / 1000);
+            g_audio_want = 0; /* the pre-warm stays audio-closed, like the app's camera view */
+            slog("[station] pre-warm: opening call%s (hold %llds)\n",
+                 prewarm_camera() ? " with the camera offer" : "", prewarm_hold / 1000);
           }
         } else slog("[station] pre-warm: a call is already up\n");
         continue;
@@ -707,9 +804,10 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
         if (g_talk_active) slog("[station] announce: hang-up requested while a clip plays -> cutting it short\n");
         g_talk_waiting = 0;
         talk_deadline = 0;
-        if (g_redial_req || g_redialing || g_switching) {
+        if (g_redial_req || g_redialing || g_switching || g_switch_settle || g_n_waiting) {
           g_redial_req = g_redialing = g_switching = 0;
           g_cam_steps = 0;
+          g_switch_vfu_until = 0; /* the picture this window was recovering goes away with the call */
           answer_switches("fail", "hung up");
           hold_fifos(0);
         }
@@ -717,36 +815,64 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
         camera_off("hung up");
         continue;
       }
-      if (c == 'N') { /* next camera (see g_cam_pos) */
+      if (c == 'N') { /* next camera (see g_cam_pos): bare = one on; 'N <panel>' = absolute */
+        int target = -1;
+        {
+          char arg[24] = "";
+          read_rest_of_line(arg, sizeof arg);
+          if (sscanf(arg, " %d", &target) != 1 || target < 0) target = -1;
+        }
         if (!g_call && !g_redial_req && !g_redialing) {
           slog("RESULT N fail (no call up)\n");
           continue;
         }
         g_n_waiting++;
+        /* An absolute positioning opts THIS switch into the confirm machinery (when compiled-in via
+         * the env); the bare 'N' never confirms. See the g_switch_confirm block for why. */
+        if (target >= 0 && switch_confirm_ms() > 0) g_switch_confirm = 1;
+        const int cycle = cam_cycle();
+        /* Steps to the target from the position that counts for this switch: the live call's own,
+         * or 0 on a call that is still to come (a re-dial, or one being set up: it starts on panel 0). */
+        const int from = g_switching ? g_cam_pos : 0;
+        const int steps = target >= 0 ? (((target - from) % cycle) + cycle) % cycle : 1;
         if (g_redial_req || g_redialing || g_switching) {
-          /* A switch is already under way: one more position on top of it. */
-          if (g_switching) g_switch_left++;
-          else g_cam_steps = (g_cam_steps + 1) % cam_cycle();
-          slog("[station] next camera requested during a switch -> one more '3'\n");
+          /* A switch is already under way: aim it at the target (or one more '3' when bare). */
+          if (g_switching) {
+            if (target >= 0) g_switch_left = steps;
+            else g_switch_left++;
+            slog("[station] switch re-aimed at panel %d: %d '3' left\n",
+                 target >= 0 ? target : (g_cam_pos + g_switch_left) % cycle, g_switch_left);
+          } else {
+            g_cam_steps = target >= 0 ? steps : (g_cam_steps + 1) % cam_cycle();
+            slog("[station] switch re-aimed at panel %d: %d '3' on the new call\n",
+                 target >= 0 ? target : (g_cam_steps + cycle - 1) % cycle, g_cam_steps);
+          }
           continue;
         }
         if (!g_audio_opened) {
           if (g_streams) {
-            LinphoneStatus st = linphone_call_send_dtmf(g_call, '3');
-            g_cam_pos = (g_cam_pos + 1) % cam_cycle();
-            slog("[station] next-camera DTMF '3' sent on the live call (SIP INFO) -> %s\n",
-                 st == 0 ? "ok" : "FAILED");
-            answer_switches(st == 0 ? "ok" : "fail", st == 0 ? NULL : "DTMF not sent");
-            g_switch_vfu_until = time(NULL) + 5;
+            if (steps == 0) { /* already showing the target panel: the picture is the answer */
+              answer_switches("ok", NULL);
+              continue;
+            }
+            /* Live call: pace the '3's from the main loop (one per switch_gap, the app's pace) and
+             * answer when the target panel's picture is up (or the window below ends). */
+            g_switching = 1;
+            g_switch_left = steps;
+            g_switch_next_ms = now;
             last_activity = now;
+            slog("[station] switch to panel %d: %d '3' due; RESULT N when its picture is up\n",
+                 target >= 0 ? target : (g_cam_pos + 1) % cycle, steps);
           } else {
-            /* The call is still being set up: its '3' goes out once the media runs (main loop). */
-            g_cam_steps = (g_cam_steps + 1) % cam_cycle();
-            slog("[station] next camera requested while the call is set up -> '3' once the media runs\n");
+            /* The call is still being set up: its '3's go out once the media runs (main loop).
+             * Absolute wins over whatever was queued; bare adds one more position on top. */
+            g_cam_steps = target >= 0 ? steps : (g_cam_steps + 1) % cam_cycle();
+            slog("[station] switch to panel %d while the call is set up -> %d '3' once the media runs\n",
+                 target >= 0 ? target : 1, g_cam_steps);
           }
           continue;
         }
-        g_cam_steps = (g_cam_pos + 1) % cam_cycle();
+        g_cam_steps = target >= 0 ? steps : (g_cam_pos + 1) % cam_cycle(); /* the re-placed call restarts on panel 0 */
         g_audio_want = g_audio_at_start; /* an announcement's open audio ends with its call */
         slog("[station] next camera requested with the audio open -> re-dialing to send '3' x%d first\n",
              g_cam_steps);
@@ -796,18 +922,133 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
       }
     }
 
+    /* Track the SPS cadence once per tick (the confirm reads it; a compare costs nothing when off).
+     * Only a FAST re-key (two SPS inside the alive window) clears the proven-camera-less flag: the
+     * snow keys too, just 5-7 s apart, and that must not un-prove a silence-confirm. */
+    if (g_sps_seen != g_switch_last_sps) {
+      const int fast = g_switch_sps_ms != 0 && now - g_switch_sps_ms <= g_sps_alive_ms;
+      g_switch_last_sps = g_sps_seen;
+      if (!g_switch_cadence_ms) g_switch_cadence_ms = now; /* this call's cadence just started */
+      g_switch_sps_ms = now;
+      if (fast) g_pos_silent = 0; /* camera-fast cadence: a camera IS what the mux shows now */
+    }
+    /* Confirmed switch (see g_switch_confirm): a step in flight is evaluated EVERY tick, not on the
+     * pacing gate -- the proof can land before the deadline, and the deadline ends the attempt. */
+    if (g_call && g_streams && g_switching && g_switch_confirm && g_switch_pending) {
+      if (g_switch_expect_sps && now - g_switch_sps_ms >= g_sps_gap_ms) {
+        /* The camera's re-key gap stretched out: the mux moved to a camera-less position. */
+        g_switch_pending = 0;
+        g_switch_tries = 0;
+        g_pos_silent = 1; /* where we landed keys slowly: a later step may start at once */
+        g_cam_pos = (g_cam_pos + 1) % cam_cycle();
+        g_switch_left--;
+        slog("[station] switch: SPS gap %lld ms -> panel %d confirmed\n",
+             now - g_switch_sps_ms, g_cam_pos);
+        if (g_switch_left > 0) {
+          g_switch_next_ms = now; /* the next step goes out on the next tick */
+        } else {
+          g_switching = 0;
+          /* Proven by silence, not by a keyframe (a camera-less position sends no IDR): answer now;
+           * the nudge window below still runs, to recover the picture itself. */
+          hold_fifos(0); /* the new call's taps have long had their own writers */
+          g_switch_vfu_until = time(NULL) + 5;
+          last_activity = now;
+          answer_switches("ok", NULL);
+        }
+      } else if (!g_switch_expect_sps && g_sps_seen - g_switch_sent_sps >= 2 &&
+                 now - g_switch_sps_ms <= g_sps_alive_ms) {
+        /* Left a camera-less position and two SPS landed close together: a camera's cadence is
+         * back, the mux moved. (One SPS is not proof -- the snow re-keys too, every ~5-7 s.) */
+        g_switch_pending = 0;
+        g_switch_tries = 0;
+        g_pos_silent = 0; /* a camera is showing again */
+        g_cam_pos = (g_cam_pos + 1) % cam_cycle();
+        g_switch_left--;
+        slog("[station] switch: the camera came up -> panel %d confirmed\n", g_cam_pos);
+        if (g_switch_left > 0) {
+          g_switch_next_ms = now;
+        } else {
+          g_switching = 0;
+          /* The target is a REAL camera: its first IDR is the honest "the picture is up", so the
+           * plain settle machinery answers (like an unconfirmed switch's would). */
+          hold_fifos(0); /* the new call's taps have long had their own writers */
+          g_switch_settle = 1;
+          g_keyframe_seen = 0; /* only a fresh IDR from the new panel settles it */
+          g_switch_vfu_until = time(NULL) + 5;
+          last_activity = now;
+        }
+      } else if (now - g_switch_sent_ms >= switch_confirm_ms()) {
+        /* Deadline without proof: the station ignored the '3'. Resend the SAME step (the position
+         * was never advanced) or give up -- the press then fails without its tone. */
+        if (g_switch_tries < g_confirm_retries) {
+          g_switch_tries++;
+          LinphoneStatus st = linphone_call_send_dtmf(g_call, '3');
+          g_switch_expect_sps = now - g_switch_sps_ms <= g_sps_alive_ms;
+          g_switch_sent_sps = g_sps_seen;
+          g_switch_sent_ms = now;
+          slog("[station] next-camera DTMF '3' sent (SIP INFO) -> %s (the station ignored it, retry %d)\n",
+               st == 0 ? "ok" : "FAILED", g_switch_tries);
+        } else {
+          g_switching = 0;
+          slog("[station] switch: the station never confirmed the '3' (%d attempts)\n",
+               g_switch_tries + 1);
+          answer_switches("fail", "the station ignored the switch");
+        }
+      }
+    }
     /* Call reached media -> the '3's of a switch, then the audio and the queued tones. */
     if (g_call && g_streams && g_switching && now >= g_switch_next_ms) {
-      if (g_switch_left > 0) {
+      if (g_switch_confirm && !g_switch_pending && g_switch_left > 0) {
+        /* Send the next confirmed step's '3'. The position does NOT advance until proven above.
+         * But never send it before THIS call's picture cadence is alive: the station drops a '3'
+         * that arrives before its first SPS, and a confirm then computed on no cadence mis-reads
+         * the camera's first routine SPS as proof -- exactly the "entrance 2 opens entrance 1"
+         * bug. Like the official app: watch the picture first, cycle afterwards. A position
+         * already PROVEN camera-less (g_pos_silent) needs no picture and skips the wait. */
+        if (!g_pos_silent &&
+            (!g_switch_cadence_ms || now - g_switch_cadence_ms < g_steady_ms)) {
+          /* No picture yet, or one that just started: the panel swallows tones during its stream's
+           * first moments (a '3' ~200 ms after the first frame is lost, like the app we watch
+           * first). Hold, then hold longer only once (the wait budget covers picture + steady). */
+          if (!g_switch_wait_ms) {
+            g_switch_wait_ms = now;
+            slog("[station] switch: waiting for a steady picture (%d ms) before the '3'\n",
+                 (int)g_steady_ms);
+          }
+          if (now - g_switch_wait_ms > g_wait_picture_ms) {
+            g_switching = 0;
+            slog("[station] switch: no steady picture within %d ms; not switching blind\n",
+                 (int)g_wait_picture_ms);
+            answer_switches("fail", "no picture to switch from");
+          } else {
+            g_switch_next_ms = now + 250; /* the picture still has time: re-check soon */
+          }
+        } else {
+          g_switch_wait_ms = 0;
+          LinphoneStatus st = linphone_call_send_dtmf(g_call, '3');
+          g_switch_expect_sps = now - g_switch_sps_ms <= g_sps_alive_ms;
+          g_switch_sent_sps = g_sps_seen;
+          g_switch_sent_ms = now;
+          g_switch_pending = 1;
+          g_switch_next_ms = now + switch_confirm_ms();
+          slog("[station] next-camera DTMF '3' sent (SIP INFO) -> %s (panel %d, %s, %d left)\n",
+               st == 0 ? "ok" : "FAILED", (g_cam_pos + 1) % cam_cycle(),
+               g_switch_expect_sps ? "expecting quiet" : "expecting the camera", g_switch_left - 1);
+        }
+      } else if (!(g_switch_confirm && g_switch_pending) && g_switch_left > 0) {
         LinphoneStatus st = linphone_call_send_dtmf(g_call, '3');
         slog("[station] next-camera DTMF '3' sent (SIP INFO) -> %s (%d left)\n",
              st == 0 ? "ok" : "FAILED", g_switch_left - 1);
         g_switch_left--;
         g_cam_pos = (g_cam_pos + 1) % cam_cycle();
         g_switch_next_ms = now + switch_gap_ms();
-      } else {
+      } else if (!(g_switch_confirm && g_switch_pending)) {
         g_switching = 0;
-        answer_switches("ok", NULL);
+        /* The '3's are out: the station is (or will be) showing the target panel. Answer the 'N's
+         * when its IDR lands (or the window below ends), not before: an "open entrance" press's tone
+         * must wait for the picture, or it risks acting on the wrong panel. */
+        g_switch_settle = 1;
+        g_keyframe_seen = 0; /* only a fresh IDR from the new panel settles it */
         hold_fifos(0); /* the new call's taps have long had their own writers */
         g_switch_vfu_until = time(NULL) + 5;
         last_activity = now;
@@ -862,7 +1103,20 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
       if (g_talk_waiting) slog("[station] announce: FAILED -- the call never came up\n");
       g_talk_waiting = 0;
       talk_deadline = 0;
-      if (g_redialing || g_switching) { g_redialing = g_switching = 0; answer_switches("fail", "no media"); hold_fifos(0); }
+      if (g_redialing || g_switching || g_switch_settle || g_n_waiting) {
+        g_redialing = g_switching = 0;
+        g_cam_steps = 0;
+        g_switch_vfu_until = 0; /* the picture this window was recovering goes away with the call */
+        answer_switches("fail", "no media");
+        hold_fifos(0);
+      } else if (g_call_is_camera && g_cam_on && !g_cam_live && g_cam_dial_tries > 0) {
+        g_cam_dial_tries--;
+        g_cam_pending = 1; /* bye_call keeps the camera and its targets; the re-place is paced */
+        g_redial_at_ms = now + redial_delay_ms();
+        hold_fifos(1); /* keep ffmpeg fed across the pause (the new call's taps release it) */
+        slog("[station] camera: no media -> placing the call again in %lld ms (%d left)\n",
+             redial_delay_ms(), g_cam_dial_tries);
+      }
       bye_call(lc);
     }
     /* Station ended the call on its own (or our BYE for a switch was answered). */
@@ -884,6 +1138,19 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
         slog("[station] camera switch: re-placed call ended before media -> retrying in %lld ms (%d left)\n",
              wait, g_redial_tries);
         bye_call(lc);
+      } else if (!g_redialing && g_call_is_camera && g_cam_on && !g_cam_live && g_cam_dial_tries > 0) {
+        /* A camera call the station declined (placed during its release cooldown): re-place it with
+         * the same pacing as a switch's re-dial instead of ending the picture. Once re-placed, the
+         * switch machinery above retries it; an exhausted g_redialing chain is NOT re-scheduled
+         * (the give-up below reports CAMERA fail, keeping the whole attempt inside the caller's
+         * camera-reply window). */
+        g_cam_dial_tries--;
+        g_cam_pending = 1; /* bye_call keeps the camera and its targets; the re-place is paced */
+        g_redial_at_ms = now + redial_delay_ms();
+        hold_fifos(1); /* keep ffmpeg fed across the pause (the new call's taps release it) */
+        slog("[station] camera: the call ended before any picture -> placing it again in %lld ms (%d left)\n",
+             redial_delay_ms(), g_cam_dial_tries);
+        bye_call(lc);
       } else {
         for (int i = 0; i < qn; i++) slog("RESULT %c fail\n", queue[i]);
         qn = 0;
@@ -892,11 +1159,15 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
                g_talk_active ? " mid-clip" : " before the clip started");
         g_talk_waiting = 0;
         talk_deadline = 0;
-        if (g_redialing || g_switching) {
+        if (g_redialing || g_switching || g_switch_settle || g_n_waiting) {
           g_redialing = g_switching = 0;
+          g_cam_steps = 0;
+          g_switch_vfu_until = 0; /* the picture this window was recovering goes away with the call */
           answer_switches("fail", "the call ended before the switch");
           hold_fifos(0);
         }
+        if (g_call_is_camera && g_cam_on && !g_cam_live)
+          camera_fail("the station declined the camera call"); /* instead of an end with no retry left */
         bye_call(lc);
       }
     }
@@ -905,8 +1176,13 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
      * P-frames of a stream we hold no keyframe for. Never hangs up: the call is fine either way. */
     if (g_call && g_streams && g_cam_on && g_switch_vfu_until) {
       time_t tnow = time(NULL);
-      if (tnow >= g_switch_vfu_until) g_switch_vfu_until = 0;
-      else if (tnow != g_last_vfu) { /* rate-limit to ~1/s */
+      if (tnow >= g_switch_vfu_until) {
+        g_switch_vfu_until = 0;
+        if (g_switch_settle) /* no IDR in the window: the '3' went out, report best effort */
+          answer_switches("ok", NULL);
+      } else if (g_switch_settle && g_keyframe_seen) {
+        answer_switches("ok", NULL); /* the new panel's picture is up: the switch really happened */
+      } else if (tnow != g_last_vfu) { /* rate-limit to ~1/s */
         g_last_vfu = tnow;
         nudge_keyframe(g_call, "after the camera switch");
       }
@@ -934,17 +1210,20 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
     }
     /* Camera idle: no reader drained the FIFO for g_idle_seconds -- the viewer is really gone, not
      * just a go2rtc probe / WebRTC reconnect blip. The picture stops; a camera call then ends after
-     * the keep-alive (a viewer coming straight back rides it: instant flip-back). */
+     * the keep-alive (a viewer coming straight back rides it: instant flip-back). A reader-less hold
+     * (the "open camera" button) suspends this: the automation's window, whatever the drain state. */
     const int cam_watched = g_cam_on && g_last_drain && time(NULL) - g_last_drain < g_idle_seconds;
-    if (g_cam_on && g_last_drain && !cam_watched) {
+    const int cam_held = g_cam_on && g_cam_hold_until && now < g_cam_hold_until;
+    if (g_cam_on && g_last_drain && !cam_watched && !cam_held) {
       camera_off("no FIFO reader for a while");
       last_activity = now;
     }
     /* Idle -> release the bus/monitor. A pre-warm holds the call up until warm_deadline even with no
      * tone yet (last_activity stays 0), so require both the keep-alive idle AND the warm window past.
-     * A watched camera keeps its call up; a camera call waiting for its first picture too. */
+     * A watched camera keeps its call up; a camera call waiting for its first picture, or held
+     * without a reader, too. */
     const int cam_pending_picture = g_cam_on && g_call_is_camera && !g_cam_live;
-    if (g_call && g_streams && !g_talk_active && !cam_watched && !cam_pending_picture &&
+    if (g_call && g_streams && !g_talk_active && !cam_watched && !cam_pending_picture && !cam_held &&
         now - last_activity > keepalive_ms && now > warm_deadline && now > talk_deadline) {
       slog("[station] keep-alive idle -> hanging up\n");
       bye_call(lc);
@@ -960,24 +1239,44 @@ int main(int argc, char **argv) {
             "  Registers ONCE, then reads commands from stdin, one per line, until stdin closes:\n"
             "    '1' / '2'  open the door / gate: a tone on the station call (placed if none is up);\n"
             "               answered with 'RESULT <d> ok|fail' on stdout, in the order received\n"
-            "    'N'        next camera: '3' on the live call (or a re-dial when its audio is open);\n"
-            "               answered with 'RESULT N ok|fail'\n"
+            "    'N [panel]' next camera / position: bare sends one '3' on the live call (or re-dials\n"
+            "               when its audio is open); with a 0-based panel it cycles to that entrance\n"
+            "               absolutely (the position is counted since the call began) and answers\n"
+            "               'RESULT N ok|fail' once the panel's picture is up (~5 s at the latest).\n"
+            "               With STATION_SWITCH_CONFIRM_MS > 0 an absolute positioning is CONFIRMED:\n"
+            "               each '3' must prove the mux moved via the tap's SPS cadence (a camera\n"
+            "               re-keys every ~1 s; a camera-less panel is encoded static that keys only\n"
+            "               every ~5-7 s: the gap stretching = a camera-less position, two SPS close\n"
+            "               together = a camera is back);\n"
+            "               an ignored '3' is resent and a never-proven switch answers fail, so a\n"
+            "               tone never goes out on the wrong panel (bare 'N' is never confirmed)\n"
             "    'A'        open the station's audio ('4') on the call, once its media runs\n"
-            "    'W'        pre-warm: open the call now, no tone (held STATION_PREWARM_HOLD_MS)\n"
+            "    'W'        pre-warm: open the call now, no tone (held STATION_PREWARM_HOLD_MS);\n"
+            "               with STATION_VIDEO the offer carries the camera, as the app's view\n"
             "    'H'        release: hang up the call now (and stop the camera)\n"
             "    'T'        announcement: hold a call for a clip read from STATION_AUDIO_IN (s16le 8 kHz\n"
             "               mono PCM); STATION_TALK_DTMF = open-audio digit to send first (empty = none),\n"
             "               STATION_TALK_START_MS = how long the clip may take to start\n"
-            "    'V <h264 fifo> <pcm fifo>'  camera: tap the call's video/audio into those FIFOs (on the\n"
-            "               held ring with early media, on the call up, or on a camera call placed for\n"
-            "               it); answered with 'CAMERA ok|fail <why>', then 'CAMERA live' at the first\n"
-            "               keyframe and 'CAMERA end' when the picture stops\n"
+            "    'V <h264 fifo> <pcm fifo> [hold sec]'  camera: tap the call's video/audio into those\n"
+            "               FIFOs (on the held ring with early media, on the call up, or on a camera\n"
+            "               call placed for it); answered with 'CAMERA ok|fail <why>', then 'CAMERA\n"
+            "               live' at the first keyframe and 'CAMERA end' when the picture stops.\n"
+            "               hold sec: keep the picture up that long even with no FIFO reader (the\n"
+            "               automation \"open camera\" window), until 'H' or a real reader returns\n"
             "  STATION_KEEPALIVE_MS: keep the call up this long after the last activity (min 500 ms).\n"
             "  STATION_IDLE_SECONDS: the camera stops when no reader drains its FIFO this long (10).\n"
             "  STATION_ANSWER_RING=1: hold a doorbell ring unanswered ('RING held' / 'RING gone');\n"
             "    an announcement or door press during it answers it.\n"
             "  STATION_OPEN_AUDIO_AT_START=1: open the audio on every camera call (the entrance sound;\n"
             "    next camera then re-dials). STATION_MAC: phase-B station (dial with a `mac` header).\n"
+            "  STATION_SWITCH_CONFIRM_MS: per-'3' deadline proving an absolute 'N <panel>' moved the\n"
+            "    mux (see the switch confirm block; 0 = off, the default: only for stations with\n"
+            "    camera-less positions -- where every position has a camera it never confirms).\n"
+            "  STATION_SWITCH_CONFIRM_ALIVE_MS/_GAP_MS/_STEADY_MS/_WAIT_PICTURE_MS/_RETRIES: retune\n"
+            "    the confirm's measured thresholds (2200/3000/4000/20000/2). Keep ALIVE well below\n"
+            "    GAP, and the deadline (CONFIRM_MS) above GAP + the mux's lag (~2.5 s).\n"
+            "  STATION_VIDEO=1: video is on for this place -- the pre-warm's INVITE offers the camera\n"
+            "    (audio closed), so an open-entrance pressed during its hold rides the live call.\n"
             "  env: STATION_DATA_DIR=<dir> (unique per place), STATION_UUID, SIP_REALM, STATION_DEBUG=1\n"
             "    (per-second audio level + liblinphone warnings), STATION_TRACE=1 (liblinphone's full trace)\n",
             argv[0]);
@@ -988,6 +1287,24 @@ int main(int argc, char **argv) {
   const char *out_uri = argv[3];
   g_idle_seconds = (int)env_ms("STATION_IDLE_SECONDS", 10);
   g_audio_at_start = getenv("STATION_OPEN_AUDIO_AT_START") != NULL;
+  g_sps_alive_ms = env_ms("STATION_SWITCH_CONFIRM_ALIVE_MS", SWITCH_SPS_ALIVE_MS);
+  g_sps_gap_ms = env_ms("STATION_SWITCH_CONFIRM_GAP_MS", SWITCH_SPS_GAP_MS);
+  g_steady_ms = env_ms("STATION_SWITCH_CONFIRM_STEADY_MS", SWITCH_STEADY_MS);
+  g_wait_picture_ms = env_ms("STATION_SWITCH_CONFIRM_WAIT_PICTURE_MS", SWITCH_WAIT_PICTURE_MS);
+  {
+    const int retries = (int)env_ms("STATION_SWITCH_CONFIRM_RETRIES", SWITCH_CONFIRM_RETRIES);
+    if (retries >= 0) g_confirm_retries = retries;
+  }
+  /* A nonsensical tuning (alive above gap: the proofs contradict each other; a picture budget
+   * below the steady time: nothing could ever become steady in time) falls back to the defaults. */
+  if (g_sps_alive_ms <= 0 || g_sps_gap_ms <= g_sps_alive_ms ||
+      g_steady_ms < 0 || g_wait_picture_ms < g_steady_ms) {
+    slog("[station] switch confirm: nonsensical STATION_SWITCH_CONFIRM_* tuning -> measured defaults\n");
+    g_sps_alive_ms = SWITCH_SPS_ALIVE_MS;
+    g_sps_gap_ms = SWITCH_SPS_GAP_MS;
+    g_steady_ms = SWITCH_STEADY_MS;
+    g_wait_picture_ms = SWITCH_WAIT_PICTURE_MS;
+  }
   lp_talk_env = "STATION_AUDIO_IN";
   lp_atap_adopt = 1; /* the camera FIFO can be named while a call is already up */
 

@@ -1,6 +1,9 @@
 // MQTT bridge: publishes Home Assistant MQTT-discovery entities and routes their command topics.
 //   button  one per openable relay (door/gate of each IPERCOM entrance; door + gate per 2Voice place),
-//           plus per place "ready" (2Voice pre-warm), "hang up" and "next camera" when video is on
+//           plus per place "ready" (2Voice pre-warm), "hang up" and "next camera" when video is on,
+//           "open camera" (2Voice, opt-in `open_camera_2voice`) to hold the picture with no viewer,
+//           and "open entrance N" (2Voice, opt-in `open_camera_2voice_entrances`): picture, panel N,
+//           tone — a whole entrance open in one press, no automation needed
 //   event   one doorbell per entrance/panel (device_class doorbell), firing `ring`
 //   notify  announcements: one per 2Voice place, and one per Ipercom camera when video is on
 // The strike is momentary with no state feedback, so a stateless button models it (no lock state).
@@ -373,6 +376,78 @@ export class MqttBridge {
       );
     }
     log.info(`published ${places.length} next-camera button(s)`);
+  }
+
+  /** One "open camera" `button` per 2Voice place with video, published only when the user opted in
+   *  (`open_camera_2voice`): brings the camera call up and holds the picture `open_camera_2voice_hold`
+   *  seconds with NO viewer, so an automation can switch panels ("next camera") and open
+   *  (door/gate) without anyone watching the stream. `handler` resolves whether the request was
+   *  taken. */
+  publishOpenCamera(places: HangupPlace[], handler: (placeId: string) => Promise<boolean>) {
+    for (const p of places) {
+      const name = `${p.name} open camera`;
+      this.publishEntity(
+        "button",
+        sanitize(`urmet_${p.placeId}_open_camera`),
+        {
+          name,
+          payload_press: "OPEN",
+          icon: "mdi:video",
+          device: this.deviceFor(p.placeId, p.name, p.model),
+        },
+        async (payload) => {
+          log.info(`press ${payload} for ${name}`);
+          try {
+            const held = await handler(p.placeId);
+            log.info(`open camera ${p.name}: ${held ? "requested" : "not requested (no camera stream)"}`);
+          } catch (e) {
+            log.error(`open camera ${p.name} FAILED:`, (e as Error).message);
+          }
+        },
+      );
+    }
+    log.info(`published ${places.length} open-camera button(s)`);
+  }
+
+  /** The opt-in "open entrance N" `button`s (2Voice, `open_camera_2voice_entrances`): one per
+   *  entrance, in panel order — the `tones` list maps each button to its relay code. A press brings
+   *  the picture up (reader-less hold), positions the call on that entrance's panel and sends its
+   *  tone: the whole open without an automation. `handler` resolves whether the sequence went
+   *  through. */
+  publishOpenEntrances(
+    places: HangupPlace[],
+    tones: string[],
+    handler: (placeId: string, idx: number) => Promise<boolean>,
+  ) {
+    for (const p of places) {
+      // (idx, not the tone value: index.ts closes over its own tones list when calling the handler)
+      for (const [idx] of tones.entries()) {
+        const n = idx + 1;
+        const name = `${p.name} open entrance ${n}`;
+        this.publishEntity(
+          "button",
+          sanitize(`urmet_${p.placeId}_open_entrance_${n}`),
+          {
+            name,
+            payload_press: "ENTRANCE",
+            icon: "mdi:door-open",
+            device: this.deviceFor(p.placeId, p.name, p.model),
+          },
+          async (payload) => {
+            log.info(`press ${payload} for ${name}`);
+            try {
+              const ok = await handler(p.placeId, idx);
+              log.info(
+                `open entrance ${n} ${p.name}: ${ok ? "done" : "not done (no camera stream, or a step failed)"}`,
+              );
+            } catch (e) {
+              log.error(`open entrance ${n} ${p.name} FAILED:`, (e as Error).message);
+            }
+          },
+        );
+      }
+    }
+    log.info(`published ${places.length} open-entrance button set(s), ${tones.length} entrance(s)`);
   }
 
   private publishDoorbell(

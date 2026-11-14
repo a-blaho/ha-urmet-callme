@@ -16,7 +16,7 @@ import { macHeaderOf, Place } from "./place.js";
 import type { TalkTarget } from "./announce.js";
 import { listenControl, makeFifos, type ControlHandler } from "./cameraPipeline.js";
 import { Go2rtcPorts, Go2rtcProcess, go2rtcConfig } from "./go2rtc.js";
-import { cameraCommand, HelperCommand, parseHelperLine } from "./helperProtocol.js";
+import { cameraCommand, HelperCommand, nextCameraCommand, parseHelperLine } from "./helperProtocol.js";
 import { isDebug, logger } from "./logger.js";
 import { ChildLike, waitForExit } from "./proc.js";
 import { camFifos, sanitize, stableUuid } from "./util.js";
@@ -43,8 +43,10 @@ const OPEN_TIMEOUT_MS = 45000;
 const SWITCH_TIMEOUT_MS = 45000;
 // How long a camera request may wait for the helper's CAMERA reply. The helper reads stdin only once
 // registered, and right after a (re)spawn that takes up to 15 s (station.c lp_wait_registered), so a
-// request queued meanwhile is answered late, not never; stream.sh's curl gives /call 20 s.
-const CAMERA_REPLY_MS = 18000;
+// request queued meanwhile is answered late, not never; stream.sh's curl gives /call 20 s. A camera
+// call the station declines (placed during its release cooldown) is re-placed with pacing inside the
+// helper, which can take ~25 s before CAMERA ok or fail -- hence the generous ceiling.
+const CAMERA_REPLY_MS = 45000;
 const RESPAWN_MS = 3000; // auto-restart a helper that died (e.g. registration dropped)
 const RESTART_EXIT_MS = 3000; // how long a restart waits for the old helper to exit before SIGKILL
 
@@ -126,6 +128,10 @@ export interface TwoVoiceStationOptions {
   prewarmHoldMs: number; // how long a prewarm() (ready button) keeps the call open
   talkDtmf: string; // announcements: the open-audio digit sent first ("" = none)
   audioAtStart: boolean; // `video_2voice_audio`: open the station's audio on every camera call
+  cameraHoldSeconds: number; // `open_camera_2voice_hold`: how long cameraHold() keeps the picture up
+  camCycle?: number; // `open_camera_2voice_positions`: how many panels the station's '3' cycles (helper default 4)
+  switchConfirmMs?: number; // `open_camera_2voice_confirm`: >0 proves each absolute 'N <panel>'; 0/absent = off
+  video?: boolean; // video is on: the pre-warm offers the camera, so an "open entrance" during its hold rides the live call
   timing?: Partial<HelperTiming>; // test seam
   procs?: HelperProcs; // test seam
 }
@@ -297,6 +303,9 @@ export class TwoVoiceStation {
       // Hold a doorbell ring so an announcement / door press during it can answer it (the station
       // refuses new calls while it rings) and the camera can show it. A pre-warm never answers it.
       STATION_ANSWER_RING: "1",
+      ...(this.opts.camCycle ? { STATION_CAM_CYCLE: String(this.opts.camCycle) } : {}),
+      ...(this.opts.switchConfirmMs ? { STATION_SWITCH_CONFIRM_MS: String(this.opts.switchConfirmMs) } : {}),
+      ...(this.opts.video ? { STATION_VIDEO: "1" } : {}),
       ...(mac ? { STATION_MAC: mac } : {}),
       // The entrance sound on the camera stream; without it the audio stays closed like the app's,
       // so next camera is a live '3' instead of a new call.
@@ -427,8 +436,10 @@ export class TwoVoiceStation {
   }
 
   /** Pre-warm a place's call (the "ready" button): open the station call NOW, with no tone, so the
-   *  unlock press moments later rides an already-established call (instant). Fire-and-forget; the
-   *  helper releases the bus on its own if no press follows, and does nothing when a call is up. */
+   *  unlock press moments later rides an already-established call (instant). With video the call
+   *  carries the camera offer (as the app's auto_insertion), so an "open entrance" during the hold
+   *  rides it too instead of BYE+re-dialing. Fire-and-forget; the helper releases the bus on its
+   *  own if no press follows, and does nothing when a call is up. */
   prewarm(placeId: string): boolean {
     const h = this.helpers.get(placeId);
     if (!h || !h.child || !h.child.stdin?.writable) return false;
@@ -541,8 +552,9 @@ export class TwoVoiceStation {
 
   /** Ask the place's helper to feed camera i: the picture of the call it has (the held ring with early
    *  media, as the app's "view camera"; the call being viewed or held) or of a camera call it places.
-   *  Idempotent while the picture is on. */
-  private camera(i: number): Promise<void> {
+   *  `holdSeconds` keeps the picture up that long with no FIFO reader (the "open camera" button's
+   *  viewer-less window). Idempotent while the picture is on. */
+  private camera(i: number, holdSeconds?: number): Promise<void> {
     const cam = this.cams[i];
     const h = this.helperReady(cam.place.id);
     if (h.camOn) return Promise.resolve();
@@ -571,7 +583,7 @@ export class TwoVoiceStation {
         finish("no reply from the station helper");
       }, this.t.cameraReplyMs);
       h.camWaiters.push(finish);
-      if (!pending) h.child!.stdin!.write(cameraCommand(cam.h264, cam.pcm) + "\n");
+      if (!pending) h.child!.stdin!.write(cameraCommand(cam.h264, cam.pcm, holdSeconds) + "\n");
     });
   }
 
@@ -582,9 +594,10 @@ export class TwoVoiceStation {
 
   /** Switch the place's live call to the station's next entrance panel (issue #20): the helper sends
    *  the '3' on the live call while its audio is closed (like the app), or re-dials when the audio is
-   *  open. False when no call is up (a new call starts on the first panel anyway) or the switch did
-   *  not go out. */
-  async nextCamera(placeId: string): Promise<boolean> {
+   *  open. With `target`, cycles to that panel absolutely (0-based; the helper counts positions since
+   *  the call began) and the reply comes once the target panel's picture is up. False when no call is
+   *  up (a new call starts on the first panel anyway) or the switch did not go out. */
+  async nextCamera(placeId: string, target?: number): Promise<boolean> {
     const h = this.helpers.get(placeId);
     if (!h?.child?.stdin?.writable) return false;
     if (!h.camOn) {
@@ -594,10 +607,58 @@ export class TwoVoiceStation {
       return false;
     }
     try {
-      await this.command(h, h.switches, HelperCommand.NEXT_CAMERA, this.t.switchTimeoutMs);
+      await this.command(h, h.switches, nextCameraCommand(target), this.t.switchTimeoutMs);
       return true;
     } catch (e) {
       log.info(`next camera on ${h.place.name}: ${(e as Error).message}`);
+      return false;
+    }
+  }
+
+  /** Open the place's camera WITHOUT a viewer (the opt-in "open camera" button): the picture of a
+   *  camera call, held for `cameraHoldSeconds` even though nobody drains the FIFOs. An automation
+   *  then switches panels (nextCamera) and opens (open) while it is up; the "hang up" button ends it
+   *  early, and with no further request the picture ends when the hold expires (the call, after the
+   *  keep-alive). A real viewer joining mid-hold takes over: the taps write to whoever drains.
+   *  Resolves when the helper took the request (or immediately when the picture is already on);
+   *  false when there is no camera for the place or the request failed. */
+  async cameraHold(placeId: string): Promise<boolean> {
+    const i = this.cams.findIndex((c) => c.place.id === placeId);
+    const name = this.helpers.get(placeId)?.place.name ?? placeId;
+    if (i < 0) {
+      log.info(`open camera on ${name}: the place has no camera stream (video off?)`);
+      return false;
+    }
+    try {
+      await this.camera(i, this.opts.cameraHoldSeconds);
+      return true;
+    } catch (e) {
+      log.info(`open camera on ${name}: ${(e as Error).message}`);
+      return false;
+    }
+  }
+
+  /** The opt-in "open entrance N" buttons: bring the picture up (with the reader-less hold), cycle
+   *  the call to entrance `panel` (0-based, absolute — the helper counts the '3's since the call
+   *  began and answers once that panel's picture is up), then send the entrance's tone `digit`. Each
+   *  step failing fails the press (logged, false): the tone never goes out on an unverified panel. */
+  async openEntrance(placeId: string, panel: number, digit: string): Promise<boolean> {
+    const i = this.cams.findIndex((c) => c.place.id === placeId);
+    const name = this.helpers.get(placeId)?.place.name ?? placeId;
+    if (i < 0) {
+      log.info(`open entrance ${panel + 1} on ${name}: the place has no camera stream (video off?)`);
+      return false;
+    }
+    try {
+      await this.camera(i, this.opts.cameraHoldSeconds);
+      const h = this.helperReady(placeId);
+      await this.command(h, h.switches, nextCameraCommand(panel), this.t.switchTimeoutMs);
+      log.info(`2Voice ${name}: on entrance panel ${panel} (open entrance ${panel + 1})`);
+      await this.command(h, h.tones, digit, this.t.openTimeoutMs);
+      log.info(`open entrance ${panel + 1} on 2Voice place ${placeId} (${name}): tone '${digit}' sent`);
+      return true;
+    } catch (e) {
+      log.info(`open entrance ${panel + 1} on ${name}: ${(e as Error).message}`);
       return false;
     }
   }

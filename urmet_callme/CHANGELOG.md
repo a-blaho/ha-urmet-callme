@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.3.1
+
+- **2Voice: one-press "… open entrance N" buttons (opt-in).** With
+  `open_camera_2voice_entrances: "1,2"` (new option, default empty — without it nothing is
+  published; env `CALLME_OPEN_CAMERA_2VOICE_ENTRANCES`), each 2Voice place with video gets a button
+  per entrance, in **panel order**: the press brings the picture up (with the reader-less hold of
+  `open_camera_2voice_hold`), cycles the call to that entrance's panel and sends its relay code —
+  the whole open of an entrance nobody is watching, no HA automation needed. The codes are the
+  relay digits ("1" door / "2" gate) ordered as the station shows the panels (panel 1 = what a
+  fresh call shows first; check on your system with the stream). Up to 4 entrances; anything else
+  in the option is rejected with a warning rather than guessed.
+- **2Voice: the camera switch answers only when the picture is really on the target panel.** The
+  switch command now takes an absolute panel (`N <panel>` on the helper wire) and its `RESULT` comes
+  when the new panel's first keyframe arrives (~5 s at the latest, was: immediately after the tone).
+  The "… open entrance" sequence is paced by the picture itself — no fixed delays anywhere.
+- Note: the station itself ends a camera call after ~60 s (observed; the app behaves the same), so
+  holds beyond about a minute are cut short by the intercom — keep `open_camera_2voice_hold` at or
+  below ~45 s.
+- **2Voice: `open_camera_2voice_positions` (new option, default 4)** tells the add-on how many
+  panels the station's camera cycles through (a 1760/16U with two cameras cycles four). A station
+  with one camera and one camera-less position cycles 2, so "… open entrance 2" is one '3' instead
+  of three.
+- **2Voice: the "… open entrance" switch can be confirmed before its relay code goes out (opt-in).**
+  The station ignores the in-call '3' (next panel) with no acknowledgement roughly a third of the
+  time, and a switch sent blind can leave the tone acting on the wrong panel. With
+  `open_camera_2voice_confirm: true` (new option, default off; env
+  `CALLME_OPEN_CAMERA_2VOICE_CONFIRM`), an absolute switch must prove the mux moved through the
+  video tap's SPS cadence. Measured on a real station: a wired camera re-keys every ~1 s, while a
+  camera-less position (the panel's "snow") is encoded static — real video, but it only re-keys
+  every ~5-7 s. So the re-key GAP stretching out proves the switch onto a camera-less position,
+  and two SPS arriving close together prove a camera's cadence is back (the switch off it). The
+  confirmed '3' only goes out once the picture's cadence is alive (the station drops a '3' sent
+  before its first frame, and a confirm computed on no cadence mis-reads the camera's first
+  routine SPS as proof); a position already proven camera-less starts at once, and a picture that
+  never comes up fails the press after 20 s. An ignored '3' is resent (up to 2 retries per step,
+  6 s window each); a switch that is never proven fails and its entrance press sends no tone.
+  Only for stations with camera-less positions: where every position has a camera all re-key gaps
+  stay short, so confirm would fail every absolute switch (bare "… next camera" is never
+  confirmed and behaves exactly as before).
+- The confirm's measured thresholds (alive 2.2 s / gap 3 s / steady 4 s / picture budget 20 s /
+  2 retries) can be retuned on a live station with the helper's `STATION_SWITCH_CONFIRM_*`
+  environment variables; a nonsensical set (alive ≥ gap, picture budget below the steady time)
+  falls back to the measured defaults.
+- **2Voice: a declined camera call is retried.** A camera call placed during the station's release
+  cooldown (right after a previous call) is answered 486 Busy; the picture used to end right there.
+  The helper now re-places it with the same pacing as a switch's re-dial (up to 5 attempts) before
+  reporting failure, and the "open camera"/"open entrance" wait was widened accordingly (45 s).
+- **2Voice: the "… ready" pre-warm carries the camera when video is on.** It used to place an
+  audio-only call, so an "… open entrance" pressed during its hold ended it and dialled a camera
+  call (~5 s, plus the watch-then-cycle pause on the fresh picture). The pre-warm now places the
+  camera call (as the app's own preview), and the entrance press rides it: picture shown in place,
+  the confirm's steady-picture wait already satisfied. Without video the pre-warm is unchanged.
+- **2Voice: switch state no longer leaks across calls.** A switch still waiting for its picture
+  when the call ends used to survive the teardown and answer `RESULT N ok` on the NEXT call (and
+  run its keyframe nudges against a fresh picture). Every call end now answers pending switches
+  with a fail instead.
+- Note: on stations like the above (audio-only door/gate buttons ring the internal phones), the
+  reliable way to open is an "… open entrance" button: it brings the camera call up, moves it to
+  the entrance's panel and only then sends the relay code.
+- **2Voice: automations without a viewer — the opt-in "… open camera" button.** A 2Voice camera call
+  used to exist only while someone watched the stream: with nobody draining it, the picture ended
+  after ~10 s and "… next camera" / the door buttons had nothing to act on. With
+  `open_camera_2voice: true` (new option, default off — without it nothing is published), each 2Voice
+  place with video gets an **"… open camera"** `button` that brings the camera call up and holds the
+  picture `open_camera_2voice_hold` seconds (new option, default 30) even though no one is watching.
+  An automation can then switch panels ("… next camera") and open the shown entrance (door/gate)
+  unattended; the call closes on its own when the hold expires, or immediately via "… hang up". A
+  real viewer joining mid-hold takes the picture over as usual. Ipercom (a different camera
+  pipeline) is not included.
+
 ## 1.3.0
 
 - **Ipercom: announcements ([#24](https://github.com/a-blaho/ha-urmet-callme/issues/24)).** With

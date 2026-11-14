@@ -5,12 +5,16 @@
 //
 // stdin commands (a line each):
 //   1 / 2   door / gate tone on the station call (placed first if none is up)   -> RESULT 1|2 ok|fail
-//   N       next camera: '3' on the live call, or a re-dial when its audio is open   -> RESULT N ok|fail
+//   N [panel]  next camera: '3' on the live call, or a re-dial when its audio is open; with a
+//              panel (0-based), position to that entrance panel absolutely (the helper tracks the
+//              position since the call began) and answer once its picture is up -> RESULT N ok|fail
 //   A       open the station's audio ('4') once the call's media runs            -> no reply
 //   W       pre-warm: open the station call now, no tone                        -> no reply
 //   H       release: hang up the station call now (the camera stops with it)     -> no reply
 //   T       announcement: place/hold a call for a clip from the talk FIFO        -> no reply
-//   V <h264 fifo> <pcm fifo>  camera: tap the station call into those FIFOs  -> CAMERA ok|fail <why>
+//   V <h264 fifo> <pcm fifo> [hold sec]  camera: tap the station call into those FIFOs; with hold
+//                             sec, the picture stays up that long even with no FIFO reader (the
+//                             "open camera" button: automations without a viewer)  -> CAMERA ok|fail <why>
 // stdout machine lines:
 //   RESULT <1|2|N> ok|fail[ (reason)]   one per tone/switch command, in the order received
 //   RING held | RING gone               the helper holds / released a doorbell ring (*_ANSWER_RING)
@@ -45,9 +49,23 @@ export function parseRecvRing(line: string): { held: boolean; panel: string } | 
 
 export type ToneDigit = "1" | "2" | "N";
 
-/** The `V <h264> <pcm>` command line (without the trailing newline). */
-export function cameraCommand(h264Fifo: string, pcmFifo: string): string {
-  return `${HelperCommand.CAMERA} ${h264Fifo} ${pcmFifo}`;
+/** The `N[ <panel>]` command line (without the trailing newline). Bare, it is the classic next
+ *  camera; with a panel it positions the call absolutely (0-based, the helper counts the '3's since
+ *  the call began) — the "open entrance" buttons use it, and the reply only comes once the target
+ *  panel's picture is up. */
+export function nextCameraCommand(target?: number): string {
+  return target !== undefined && Number.isInteger(target) && target >= 0
+    ? `${HelperCommand.NEXT_CAMERA} ${target}`
+    : HelperCommand.NEXT_CAMERA;
+}
+
+/** The `V <h264> <pcm>[ <hold seconds>]` command line (without the trailing newline). `holdSeconds`
+ *  keeps the picture up that long even with no FIFO reader (the opt-in "open camera" button), so an
+ *  automation can switch panels and open without a viewer; without it the picture ends, as always,
+ *  when no reader drains the FIFOs for STATION_IDLE_SECONDS. */
+export function cameraCommand(h264Fifo: string, pcmFifo: string, holdSeconds?: number): string {
+  const hold = holdSeconds && holdSeconds > 0 ? ` ${Math.round(holdSeconds)}` : "";
+  return `${HelperCommand.CAMERA} ${h264Fifo} ${pcmFifo}${hold}`;
 }
 
 /** The `RESULT <cmd> ok|fail` line the helpers print per command: door/gate tones '1'/'2' (the station helper

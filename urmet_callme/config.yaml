@@ -1,5 +1,5 @@
 name: Urmet CallMe (Unofficial)
-version: "1.3.0"
+version: "1.3.1"
 slug: urmet_callme
 description: Control your Urmet intercom from Home Assistant
 url: "https://github.com/a-blaho/ha-urmet-callme"
@@ -38,12 +38,21 @@ options:
   password: ""
   doorbell: true
   video: false
+  open_camera_2voice: false
+  open_camera_2voice_entrances: ""
+  open_camera_2voice_positions: 4
+  open_camera_2voice_confirm: false
   log_level: info
 schema:
   email: str
   password: password
   doorbell: bool
   video: bool
+  open_camera_2voice: "bool?"
+  open_camera_2voice_hold: "int(5,120)?"
+  open_camera_2voice_entrances: "str?"
+  open_camera_2voice_positions: "int(2,8)?"
+  open_camera_2voice_confirm: "bool?"
   video_2voice_audio: "bool?"
   go2rtc_api_port: "int(1,65535)?"
   go2rtc_rtsp_port: "int(1,65535)?"

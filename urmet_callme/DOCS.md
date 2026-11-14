@@ -125,6 +125,74 @@ well (a 1760/16U with two cameras cycles four: two cameras, then a frozen and a 
 pressing to get back to the first panel. The button does nothing when no camera call is up (the log
 says so) ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).
 
+**"… open camera" button (2Voice, opt-in).** A camera call exists only while someone watches the
+stream: with nobody draining it the picture ends after ~10 s, and "… next camera" and the door/gate
+buttons have nothing to act on. Turn on `open_camera_2voice` and each 2Voice place with video also
+gets an **"… open camera"** `button` that brings the camera call up and holds the picture
+`open_camera_2voice_hold` seconds (default 30) **with no viewer at all**, so an automation can do
+the whole sequence unattended - open, cycle, unlock:
+
+```yaml
+action:
+  - action: button.press
+    target: { entity_id: button.home_open_camera }
+  - delay: "00:00:10"                     # first picture takes ~6-10 s
+  - action: button.press                  # once per position to skip, 1-2 s apart
+    target: { entity_id: button.home_next_camera }
+  - delay: "00:00:02"
+  - action: button.press                  # opens the panel being shown
+    target: { entity_id: button.home_door }
+```
+
+While the hold is on, the intercom is busy exactly as when you watch, and the door/gate press acts
+on the panel currently shown (see the cycle notes above). The picture ends when the hold expires
+(the call follows a few seconds later); "… hang up" ends it right away; a viewer who opens the
+stream mid-hold takes the picture over as usual. Without `open_camera_2voice` no button is
+published and nothing changes. Ipercom is not included (a different camera pipeline).
+
+**"… open entrance N" buttons (2Voice, opt-in).** If the whole sequence above is the goal, skip the
+automation: set `open_camera_2voice_entrances` to the relay codes of your entrances **in panel
+order** - e.g. `"1,2"` (door, gate) - and each 2Voice place with video gets a **"… open entrance N"**
+button per entrance. One press brings the picture up (the reader-less hold), cycles the call to that
+entrance's panel and sends its relay code: the entrance opens with nobody watching and no automation
+on the Home Assistant side. The switch is paced by the picture itself (the panel change is confirmed
+on the stream's keyframe, not by a fixed delay), so there is nothing to tune; the whole sequence
+takes ~15-25 s. Notes:
+
+- **Panel order is your system's.** Panel 1 is what a *fresh call* shows first (usually the main
+  entrance); press the buttons once and watch the stream / the log to confirm which entrance sits
+  where, then reorder the codes if yours differ ("2,1" for gate first). Up to 4 entrances.
+- **The relay code opens whatever the panel being shown is wired to**, and the panel is the button's
+  position in the list - so the same code may legitimately repeat. A station with one camera and a
+  camera-less position (the panel shows "snow" where a second entrance's panel would be) opens both
+  of its entrances with the door relay: `"1,1"` - entrance 1 is the camera's panel, entrance 2 the
+  snow one, and the code acts on whichever of the two is being shown at that moment.
+- **`open_camera_2voice_positions` (default 4)** is how many panels the station cycles through with
+  its next-camera tone (a 1760/16U with two cameras cycles four, two of them empty). On the
+  one-camera-plus-snow kind of system above it is `2`, which also makes every switch one tone
+  instead of three.
+- **`open_camera_2voice_confirm` (default `false`)** makes an entrance switch *prove* it moved the
+  panel before sending the relay code, instead of assuming. The station ignores the switch tone with
+  no acknowledgement a third of the time on some systems; when a position has **no camera** the
+  proof is in the stream itself: a wired camera re-keys every second, while the snow (real encoded
+  static) only re-keys every ~5-7 s - so the re-key pause stretching out proves the switch onto it,
+  and the camera's brisk cadence returning proves the switch off it. The switch tone is only sent
+  once the picture is actually up (a switch tone sent before the first frame is dropped by the
+  station, and the app does the same: it watches, then cycles) — so a press takes a couple of
+  seconds longer, and a picture that never comes up fails the press after ~20 s. An ignored tone is
+  re-sent automatically (up to twice, ~6 s each), and a switch that is never proven fails - the
+  button then sends **no** relay code at all, rather than risking the wrong entrance. Enable it
+  **only if your station has camera-less positions**: where every position has a camera the pause
+  never comes and every entrance switch would fail. "… next camera" is never confirmed and behaves
+  the same either way.
+- The intercom is busy while the sequence runs, exactly as when watching.
+- The station itself ends a camera call after ~60 s (the app behaves the same), so keep
+  `open_camera_2voice_hold` at or below ~45 s - a longer hold is cut short by the intercom.
+- A camera call placed right after another one is sometimes declined by the station (it has not
+  released the line yet); the add-on re-dials on its own with the same pause the app keeps, so a
+  press that lands right after a previous call still opens.
+- Ipercom is not included (a different camera pipeline). Without the option no button is published.
+
 **Door / gate while watching.** On Ipercom the door command is a cloud message, independent of the
 camera call, so unlocking never disturbs the picture. On 2Voice the camera and the door are the *same*
 call, and a door/gate press while the camera is open is sent as a tone on that call (the official app
@@ -155,16 +223,20 @@ your installation has wired.
 the call to the entrance takes a couple of seconds before the open tone can be sent; presses on an
 already-open call are near-instant. Each 2Voice place therefore also gets a **"… ready"** button that
 opens the call ahead of time (no tone) and holds it for `door_open_2voice_prewarm_hold` seconds, so a
-door/gate press right after is instant. Trigger it from any automation - for example a doorbell ring,
-or opening your entry dashboard - so the call is already up when you unlock. If you don't press within
-the hold window, the call releases on its own.
+door/gate press right after is instant. With video on, the held call carries the camera (as the app's
+own preview does), so an **"… open entrance"** press during the hold is fast too: it shows the call
+that is already up instead of hanging up and dialling a camera call (~5 s), and skips the
+watch-then-cycle pause the confirm needs on a fresh picture. Trigger it from any automation - for
+example a doorbell ring, or opening your entry dashboard - so the call is already up when you unlock.
+If you don't press within the hold window, the call releases on its own.
 
 **With video on (2Voice).** The camera stream and the door open are the *same* call to the station, so
 the add-on never holds two. While the camera is open, a door/gate press sends its tone on the live
 camera call (as the app does when you unlock while viewing), so the picture stays up; a press during
 the camera's call setup waits for the media and goes out then. When no camera call is up, the press
-uses the door helper's own call as before. A camera about to connect first releases a call the door
-helper is holding (a "… ready" pre-warm, or the short keep-alive after an unlock), and "… ready" does
+uses the door helper's own call as before. A camera about to connect first releases an audio-only
+call the door helper is holding (the short keep-alive after an unlock, or a pre-warm without video;
+with video the pre-warm already carries the camera and the picture is shown in place), and "… ready" does
 nothing while the camera is up - the call is already there. This mirrors the app's behaviour and is
 confirmed on a cloud-listed 2Voice station: the gate opened and the video continued uninterrupted. If
 a press during a preview does not open the door on yours, please open an issue with a
@@ -256,6 +328,11 @@ on **Show unused optional configuration options** to set one.
 | `doorbell`                                     | Expose a doorbell `event` entity per panel (default `true`; requires monitor set to "remote")                                                  |
 | `video`                                        | Stream entrance cameras via embedded liblinphone + go2rtc (default `false`)                                                                    |
 | `video_2voice_audio`                           | 2Voice: open the station's sound on every camera call, for the entrance sound; "next camera" then re-dials (default `false`)                   |
+| `open_camera_2voice`                           | 2Voice: publish an **"… open camera"** button that holds the picture with no viewer, for automations (default `false`; needs `video: true`)    |
+| `open_camera_2voice_hold`                      | 2Voice: seconds "… open camera" holds the picture without a viewer (default `30`; ~60 s is the intercom's own limit)                           |
+| `open_camera_2voice_entrances`                 | 2Voice: relay codes of the entrances in panel order, e.g. `"1,2"` -> one **"… open entrance N"** button per entrance, the whole open in one press (default: empty, no buttons; needs `video: true`) |
+| `open_camera_2voice_positions`                 | 2Voice: how many panels the station's camera cycles through with its switch tone (default `4`; a one-camera-plus-snow station is `2`)          |
+| `open_camera_2voice_confirm`                   | 2Voice: prove each entrance switch on the stream before sending its relay code; ignored tones are re-sent, unproven switches fail without any tone. Only for stations with camera-less positions (default `false`) |
 | `door_open_2voice_keepalive`                   | 2Voice: seconds to keep the call open after an unlock so a follow-up (e.g. door → gate) is instant (default `4`; `0` = a fresh call per press) |
 | `door_open_2voice_prewarm_hold`                | 2Voice: seconds a **"… ready"** (pre-warm) button press keeps the call open, so a following door/gate press is instant (default `15`)          |
 | `announce_tts_engine`                          | Announcements: TTS entity for spoken messages, e.g. `tts.piper` (default: the first one Home Assistant has)                                    |

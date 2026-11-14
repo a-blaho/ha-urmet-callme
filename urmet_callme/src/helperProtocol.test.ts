@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cameraCommand, HelperCommand, parseHelperLine, parseRecvRing, parseResult } from "./helperProtocol.js";
+import {
+  cameraCommand,
+  HelperCommand,
+  nextCameraCommand,
+  parseHelperLine,
+  parseRecvRing,
+  parseResult,
+} from "./helperProtocol.js";
 
 // Both helpers' tone replies must parse, whatever surrounds the RESULT token.
 test("parseResult reads the station's and recv's RESULT lines", () => {
@@ -58,6 +65,16 @@ test("the stdin command alphabet is pinned", () => {
     CAMERA: "V",
   });
   assert.equal(cameraCommand("/tmp/a.h264", "/tmp/a.pcm"), "V /tmp/a.h264 /tmp/a.pcm");
+  // N is bare next-camera; with a panel it positions absolutely (0-based)
+  assert.equal(nextCameraCommand(), "N");
+  assert.equal(nextCameraCommand(0), "N 0");
+  assert.equal(nextCameraCommand(2), "N 2");
+  assert.equal(cameraCommand("/tmp/a.h264", "/tmp/a.pcm", 30), "V /tmp/a.h264 /tmp/a.pcm 30");
+  assert.equal(
+    cameraCommand("/tmp/a.h264", "/tmp/a.pcm", 0),
+    "V /tmp/a.h264 /tmp/a.pcm",
+    "no hold: the line is exactly as it always was",
+  );
 });
 
 test("parseRecvRing reads recv's ring lines and nothing else", () => {

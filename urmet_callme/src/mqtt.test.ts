@@ -124,6 +124,67 @@ test("2Voice places get door, gate, ready buttons and a doorbell keyed on the st
   assert.deepEqual(calls, ["open p2 gate", "warm p2"]);
 });
 
+test("the opt-in open camera button requests a held picture for its place", async () => {
+  const fake = new FakeMqtt();
+  const { b } = bridge(fake);
+  await b.start([]);
+  const held: string[] = [];
+  b.publishOpenCamera(
+    [{ placeId: "p2", name: "Garden", model: "CallMe / 2Voice" }],
+    async (placeId) => (held.push(placeId), true),
+  );
+  const btn = fake.config("button", "urmet_p2_open_camera")!;
+  assert.equal(btn.name, "Garden open camera");
+  assert.equal(btn.payload_press, "OPEN");
+  assert.equal(btn.icon, "mdi:video");
+  assert.equal((btn.device as any).model, "CallMe / 2Voice");
+  fake.message("urmet/callme/urmet_p2_open_camera/set", "OPEN");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(held, ["p2"]);
+});
+
+test("open entrance buttons: one per relay code in panel order, routed with their index", async () => {
+  const fake = new FakeMqtt();
+  const { b } = bridge(fake);
+  await b.start([]);
+  const presses: [string, number][] = [];
+  b.publishOpenEntrances(
+    [{ placeId: "p2", name: "Garden", model: "CallMe / 2Voice" }],
+    ["1", "2"],
+    async (placeId, idx) => (presses.push([placeId, idx]), true),
+  );
+  const first = fake.config("button", "urmet_p2_open_entrance_1")!;
+  const second = fake.config("button", "urmet_p2_open_entrance_2")!;
+  assert.equal(first.name, "Garden open entrance 1");
+  assert.equal(second.name, "Garden open entrance 2");
+  assert.equal(second.payload_press, "ENTRANCE");
+  assert.equal(second.icon, "mdi:door-open");
+  assert.equal((second.device as any).model, "CallMe / 2Voice");
+  fake.message("urmet/callme/urmet_p2_open_entrance_2/set", "ENTRANCE");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(presses, [["p2", 1]], "the second button routes index 1 (panel 2, tone 2)");
+});
+
+test("open entrance buttons: repeated relay codes are two entrances on different panels", async () => {
+  const fake = new FakeMqtt();
+  const { b } = bridge(fake);
+  await b.start([]);
+  const presses: [string, number][] = [];
+  // A one-camera station whose second position is camera-less ("snow"): both entrances open with
+  // the door relay; the difference is the panel the sequence brings up, not the code.
+  b.publishOpenEntrances(
+    [{ placeId: "p2", name: "Garden", model: "CallMe / 2Voice" }],
+    ["1", "1"],
+    async (placeId, idx) => (presses.push([placeId, idx]), true),
+  );
+  assert.equal(fake.config("button", "urmet_p2_open_entrance_1")!.name, "Garden open entrance 1");
+  assert.equal(fake.config("button", "urmet_p2_open_entrance_2")!.name, "Garden open entrance 2");
+  fake.message("urmet/callme/urmet_p2_open_entrance_1/set", "ENTRANCE");
+  fake.message("urmet/callme/urmet_p2_open_entrance_2/set", "ENTRANCE");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(presses, [["p2", 0], ["p2", 1]], "each button routes its own panel index");
+});
+
 test("Ipercom cameras get an announce notify entity each, routed to that camera's target", async () => {
   const fake = new FakeMqtt();
   const said: string[] = [];

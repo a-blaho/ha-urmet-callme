@@ -437,12 +437,14 @@ static void lp_add_account(LinphoneCore *lc, const char *tag, const char *user, 
 static LinphoneCore *lp_create_core(const LpSetup *s, LinphoneCoreCbs *cbs) {
   LinphoneFactory *factory = linphone_factory_get();
   g_lp_debug = s->debug;
-  /* liblinphone's own log: its warnings and errors at debug (a failed REGISTER, a refused SRTP, a
-   * codec mismatch say why in there), the full message trace only when asked for by name - at
-   * ~100 lines/s it pushed the add-on's own lines out of the Supervisor log window in under a minute. */
-  if (s->trace || s->debug) {
+  /* liblinphone's own log: silenced by default -- its chatter (SRTP teardown complaints, ortp
+   * queue floods, belle-sip noise) buried the helper's own lines, which already tell the whole
+   * functional story. Warnings come back with STATION_DEBUG=1; the full message trace only when
+   * asked for by name - at ~100 lines/s it pushed everything out of the Supervisor log window. */
+  {
     LinphoneLoggingService *ls = linphone_logging_service_get();
-    linphone_logging_service_set_log_level(ls, s->trace ? LinphoneLogLevelDebug : LinphoneLogLevelWarning);
+    linphone_logging_service_set_log_level(ls,
+      s->trace ? LinphoneLogLevelDebug : (s->debug ? LinphoneLogLevelWarning : LinphoneLogLevelFatal));
   }
 
   /* Give liblinphone writable dirs; otherwise it errors opening its sqlite DB, which can stall the

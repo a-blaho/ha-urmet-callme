@@ -21,6 +21,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* STATION_TAP_VERBOSE: log the stream's SPS/IDR/P cadence and sizes for the whole call, not just
+ * the first NALs -- the evidence a switch confirmation reads (see the NAL log site below). */
+static int tap_verbose(void) {
+  static int v = -1;
+  if (v < 0) v = getenv("STATION_TAP_VERBOSE") ? 1 : 0;
+  return v;
+}
 #include <unistd.h>
 
 #ifndef TAP_LOG
@@ -58,6 +66,14 @@ static volatile time_t g_last_drain = 0;
  * (see g_video_deadline). The nudge matters mainly when two cameras stream at once -- the panel
  * doesn't reliably send each a start-of-call IDR then (single-camera it does). */
 static volatile int g_keyframe_seen = 0;
+
+/* Count of SPS NALs (type 7) seen on the wire by the tap, i.e. from the station's camera mux as it
+ * is right now. The main thread uses it to detect that a camera switch happened WITHOUT any positive
+ * in-stream signal: a wired camera re-keys (SPS+PPS+IDR) every ~0.8 s forever, while a position with
+ * no camera (the panel's "snow") emits no SPS at all -- so the counter going quiet for >2 s means
+ * the mux is now showing the camera-less position. The canned priming frame is written downstream
+ * of this point and never counts. Set by the ticker thread, read by the main thread. */
+static volatile long g_sps_seen = 0;
 
 /* A canned black H.264 keyframe (SPS+PPS+IDR, generated at image build -- see Dockerfile), loaded
  * once at startup. The tap writes it to the output FIFO at the START of each call, BEFORE the real
@@ -239,7 +255,12 @@ static void tap_process(MSFilter *f) {
       size_t n = msgdsize(nal);
       int type = (n > 0) ? (nal->b_rptr[0] & 0x1F) : -1;
       if (type == 5) g_keyframe_seen = 1; /* IDR -> a decodable picture is now on the wire */
-      if (s->nalus < 12) { /* diagnostic: log first NALs' type + size */
+      if (type == 7) g_sps_seen++; /* re-key cadence: silent on camera-less positions (see above) */
+      /* Diagnostic: the first NALs always, and with STATION_TAP_VERBOSE the whole SPS/IDR cadence
+       * plus one P-frame per second (a camera-less panel still keys: its "snow" is encoded video,
+       * so switches are proven by the stream's SHAPE, not by silence). */
+      if (s->nalus < 12 ||
+          (tap_verbose() && (type == 5 || type == 7 || (type == 1 && s->nalus % 25 == 0)))) {
         TAP_LOG("[tap] NAL #%ld type=%d size=%zu\n", s->nalus, type, n);
         fflush(stderr);
       }
