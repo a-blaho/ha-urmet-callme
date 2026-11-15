@@ -1,6 +1,28 @@
 # Changelog
 
-## 1.3.0
+## 1.4.0
+
+Opening a second entrance on 2Voice, the way the official app does it
+([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).
+
+- **2Voice: entrances by name on 1760 stations with newer firmware (untested on hardware).** The app
+  lists a 1760 station's entrances and opens each with a cloud message (no call, no camera switching)
+  from firmware 1.5.0-13 (1760/15, /16, /18, /19, /941) or 5.0.0-4 (1760/31, /32, /33). The add-on
+  now asks such a station for its firmware at start and, where the app would, publishes a door/gate
+  button per listed entrance, like Ipercom. The in-call door/gate buttons stay. Other 2Voice stations
+  are unchanged.
+- **2Voice: "next camera" works without anyone watching.** With video on, "… ready" now opens the
+  camera call (sound off, like the app's camera screen) instead of a door-only call, and "… next
+  camera" switches whatever call the station helper holds. An automation can do ready → next camera
+  → gate, as you would in the app. The switch is still unconfirmed: the station gives no
+  acknowledgement, in the app too.
+- **2Voice: the app's 3 s pause after a camera switch.** The app hides its door slider and next arrow
+  for 3 s after each switch. A door/gate press or another "next camera" during that pause now waits
+  for it to end instead of going out while the station is still switching.
+- **2Voice: "next camera" refuses to cut an announcement.** During an announcement, or with the sound
+  open on a call that shows no picture, a switch would have re-dialled and cut the call. It now fails
+  with a log line instead.
+
 
 - **Ipercom: announcements ([#24](https://github.com/a-blaho/ha-urmet-callme/issues/24)).** With
   `video: true`, each Ipercom camera gets a **"… announce"** `notify` entity that speaks a TTS message

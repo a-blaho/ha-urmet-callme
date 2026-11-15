@@ -122,8 +122,33 @@ station's relays click. While a panel is shown, the door/gate buttons open *that
 (the tone goes on the camera call). A door/gate press with the camera closed always reaches the first
 panel, and a new camera call always starts on it. The station may cycle through empty positions as
 well (a 1760/16U with two cameras cycles four: two cameras, then a frozen and a black picture), so keep
-pressing to get back to the first panel. The button does nothing when no camera call is up (the log
-says so) ([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).
+pressing to get back to the first panel. The button does nothing when no call is up (the log says so)
+([#20](https://github.com/a-blaho/ha-urmet-callme/issues/20)).
+
+Like the app, each switch is followed by a **3 s pause** (the app hides its door slider and next arrow
+meanwhile): a door/gate press or another "next camera" during it waits until the pause is over, then
+goes out on the panel now shown.
+
+**Opening another entrance from an automation (2Voice).** Nobody has to watch the stream: with video
+on, the **"… ready"** button opens the camera call itself (sound off, like the app's camera screen), and
+"… next camera" switches *that* call. So an automation can do what you would do in the app - open the
+camera, switch to the entrance, open it:
+
+```yaml
+- action: button.press
+  target: { entity_id: button.urmet_garden_ready }        # the camera call comes up
+- delay: 6                                                # call set-up + a steady picture
+- action: button.press
+  target: { entity_id: button.urmet_garden_next_camera }  # the station shows the next entrance
+- action: button.press
+  target: { entity_id: button.urmet_garden_gate }         # sent once the 3 s switch pause is over
+```
+
+(Use your own entity ids; `door_open_2voice_prewarm_hold` must cover the whole sequence, 15 s by
+default.) The station gives no acknowledgement of a switch, and it sometimes ignores one; the official
+app has the same blind spot and relies on you looking at the picture. If an entrance does not open,
+look at the stream once to see which panel the station really shows. Where your station lists its
+entrances by name (newer 1760 firmware, see below), use those buttons instead: they need no switching.
 
 **Door / gate while watching.** On Ipercom the door command is a cloud message, independent of the
 camera call, so unlocking never disturbs the picture. On 2Voice the camera and the door are the *same*
@@ -150,6 +175,16 @@ reuses the embedded liblinphone engine, so it works whether or not `video` is on
 
 Each 2Voice place gets a **door** button (DTMF `1`) and a **gate** button (DTMF `2`) - use whichever
 your installation has wired.
+
+**Entrances by name (1760 stations, newer firmware).** A 1760 station on firmware **1.5.0-13** or later
+(1760/15, /16, /18, /19, /941 and their U versions) or **5.0.0-4** or later (1760/31, /32, /33 and U
+versions) lists its entrances to the official app, which then opens each one directly with a cloud
+message, with no call and no camera switching. The add-on does the same: at start it asks the station
+for its firmware version and, where the app would, adds a door/gate button per listed entrance (named
+after the entrance, e.g. "Back gate gate"), next to the in-call door and gate buttons, which stay. The
+log says what it found (`2Voice place … entrance(s) opened by message`) or why not. This is the app's
+path, but it is untested on real 1760 hardware so far: if a listed entrance does not open, please
+report it with a `log_level: debug` log.
 
 **"… ready" (pre-warm) button.** The very first press after a while is slower (~5 s), because placing
 the call to the entrance takes a couple of seconds before the open tone can be sent; presses on an

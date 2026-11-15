@@ -1,5 +1,6 @@
 // MQTT bridge: publishes Home Assistant MQTT-discovery entities and routes their command topics.
-//   button  one per openable relay (door/gate of each IPERCOM entrance; door + gate per 2Voice place),
+//   button  one per openable relay (door/gate of each IPERCOM entrance, and of each entrance a 1760
+//           2Voice station lists on new enough firmware; door + gate in-call tones per 2Voice place),
 //           plus per place "ready" (2Voice pre-warm), "hang up" and "next camera" when video is on
 //   event   one doorbell per entrance/panel (device_class doorbell), firing `ring`
 //   notify  announcements: one per 2Voice place, and one per Ipercom camera when video is on
@@ -200,11 +201,22 @@ export class MqttBridge {
     }
   }
 
-  /** One `button` entity PER openable relay (door/gate) of an IPERCOM entrance. The relay is a
-   *  momentary door strike with no state feedback, so a stateless button (press = open pulse)
-   *  models it honestly - no fabricated locked/unlocked state. */
+  /** Whether a place is 2Voice (its listed entrances join the 2Voice device; its ring is matched on
+   *  the station, not on a door's topology). */
+  private isTwoVoice(placeId: string): boolean {
+    return this.callme.places.find((p) => p.id === placeId)?.family === "twovoice";
+  }
+
+  /** One `button` entity PER openable relay (door/gate) of a listed entrance: every IPERCOM entrance,
+   *  and the entrances a 1760 2Voice station lists (opened by message, like the app's doors list).
+   *  The relay is a momentary door strike with no state feedback, so a stateless button (press =
+   *  open pulse) models it honestly - no fabricated locked/unlocked state. */
   private publishDoors(doors: Door[]) {
     for (const d of doors) {
+      // A 2Voice entrance joins its place's existing device under that device's own name and model.
+      const tv = this.isTwoVoice(d.placeId);
+      const model = tv ? MODEL_TWOVOICE : MODEL_IPERCOM;
+      const deviceName = tv ? (this.callme.places.find((p) => p.id === d.placeId)?.name ?? d.name) : d.name;
       const relays: Array<"door" | "gate"> = [];
       if (d.hasDoor) relays.push("door");
       if (d.hasGate) relays.push("gate");
@@ -218,7 +230,7 @@ export class MqttBridge {
             name,
             payload_press: "OPEN",
             icon: type === "gate" ? "mdi:door-sliding" : "mdi:door",
-            device: this.deviceFor(d.placeId, d.name),
+            device: this.deviceFor(d.placeId, deviceName, model),
           },
           (payload) => {
             log.info(`press ${payload} for ${name}`);
@@ -396,7 +408,8 @@ export class MqttBridge {
   /** One doorbell `event` entity (device_class doorbell) PER door/panel, keyed by
    *  topological code so a ring routes to the exact entrance. */
   private publishDoorbells(doors: Door[]) {
-    for (const d of doors)
+    // A 2Voice place already has its doorbell keyed on the station (publishTwoVoiceDoorbells).
+    for (const d of doors.filter((x) => !this.isTwoVoice(x.placeId)))
       this.publishDoorbell(
         sanitize(`urmet_${d.placeId}_${d.doorId}_doorbell`),
         d.placeId,
