@@ -126,6 +126,7 @@ export interface TwoVoiceStationOptions {
   prewarmHoldMs: number; // how long a prewarm() (ready button) keeps the call open
   talkDtmf: string; // announcements: the open-audio digit sent first ("" = none)
   audioAtStart: boolean; // `video_2voice_audio`: open the station's audio on every camera call
+  video?: boolean; // 2Voice video is on: the pre-warm places the camera call (the app's camera screen)
   timing?: Partial<HelperTiming>; // test seam
   procs?: HelperProcs; // test seam
 }
@@ -298,6 +299,9 @@ export class TwoVoiceStation {
       // refuses new calls while it rings) and the camera can show it. A pre-warm never answers it.
       STATION_ANSWER_RING: "1",
       ...(mac ? { STATION_MAC: mac } : {}),
+      // With video, "ready" opens the camera call (audio closed), so "next camera" and the door tones
+      // can act on it with nobody watching, in the app's order: picture, '3', pause, tone.
+      ...(this.opts.video ? { STATION_VIDEO: "1" } : {}),
       // The entrance sound on the camera stream; without it the audio stays closed like the app's,
       // so next camera is a live '3' instead of a new call.
       ...(this.opts.audioAtStart ? { STATION_OPEN_AUDIO_AT_START: "1" } : {}),
@@ -580,19 +584,16 @@ export class TwoVoiceStation {
     return this.helpers.get(placeId)?.camOn ?? false;
   }
 
-  /** Switch the place's live call to the station's next entrance panel (issue #20): the helper sends
-   *  the '3' on the live call while its audio is closed (like the app), or re-dials when the audio is
-   *  open. False when no call is up (a new call starts on the first panel anyway) or the switch did
-   *  not go out. */
+  /** Switch the place's call to the station's next entrance panel (issue #20, the app's next arrow):
+   *  the helper sends the '3' on the call it holds while its audio is closed, or re-dials when the
+   *  audio is open on a call that shows the picture. Nobody has to watch: on a "ready" (pre-warm)
+   *  call an automation can switch and then open the entrance shown, the helper holding the tone
+   *  through the app's 3 s swap pause. False when no call is up (a new call starts on the first panel
+   *  anyway), the audio is open with no picture (an announcement's call), or the switch did not go
+   *  out; the helper says which. */
   async nextCamera(placeId: string): Promise<boolean> {
     const h = this.helpers.get(placeId);
     if (!h?.child?.stdin?.writable) return false;
-    if (!h.camOn) {
-      // The helper may hold a door, pre-warm or announcement call; the switch would re-dial that one
-      // (cutting an announcement) for a picture nobody watches. Documented: no-op without a camera.
-      log.info(`next camera on ${h.place.name}: no camera picture is up; nothing to switch`);
-      return false;
-    }
     try {
       await this.command(h, h.switches, HelperCommand.NEXT_CAMERA, this.t.switchTimeoutMs);
       return true;

@@ -35,7 +35,8 @@
  *        STATION_KEEPALIVE_MS, STATION_PREWARM_HOLD_MS, STATION_IDLE_SECONDS, STATION_MAC,
  *        STATION_AUDIO_IN, STATION_TALK_DTMF, STATION_TALK_START_MS, STATION_ANSWER_RING,
  *        STATION_OPEN_AUDIO_AT_START, STATION_SWITCH_GAP_MS, STATION_CAM_CYCLE,
- *        STATION_REDIAL_DELAY_MS, STATION_DEBUG, STATION_TRACE, SIP_REALM, RECV_BLACK_FRAME (h264tap.h)
+ *        STATION_REDIAL_DELAY_MS, STATION_SWAP_DEBOUNCE_MS, STATION_VIDEO, STATION_DEBUG,
+ *        STATION_TRACE, SIP_REALM, RECV_BLACK_FRAME (h264tap.h)
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -100,6 +101,11 @@ static int g_hold_fd[2] = {-1, -1};   /* our own writer on the FIFOs across a re
 static long long g_redial_at_ms = 0;  /* don't place the re-dial before this */
 static int g_redial_tries = 0;        /* re-dial attempts left for this switch */
 #define REDIAL_TRIES 3
+/* The app's swap pause (Uin CallStateSwapCamerasTwoVoice): after each '3' it waits 3 s before it is
+ * back on the camera, and meanwhile refuses door/gate (out of context) and hides the slider and the
+ * next arrow. Here a door/gate tone or a further '3' asked for inside the window waits until it ends,
+ * which puts the same sequence on the wire as a person pressing again once the app allows it. */
+static long long g_swap_until_ms = 0;
 
 static long long env_ms(const char *name, long long dflt) {
   const char *e = getenv(name);
@@ -119,6 +125,11 @@ static int cam_cycle(void) {
  * the previous one ended (it hasn't released the line yet; issue #20, 1.0.18), and declines again if
  * we retry too soon, so each retry waits one more pause. */
 static long long redial_delay_ms(void) { return env_ms("STATION_REDIAL_DELAY_MS", 2500); }
+/* The swap pause above (STATION_SWAP_DEBOUNCE_MS, the app's 3 s). */
+static long long swap_debounce_ms(void) { return env_ms("STATION_SWAP_DEBOUNCE_MS", 3000); }
+/* Video is on for this place (STATION_VIDEO=1): the pre-warm then places the camera call, the call the
+ * app's camera screen holds, so "next camera" and the door tones act on it with nobody watching. */
+static int prewarm_camera(void) { return getenv("STATION_VIDEO") != NULL; }
 
 /* Phase-B (1083/58A family) is identified by STATION_MAC. Those stations accept an audio-only INVITE
  * with a `mac` header; cloud-listed 2Voice panels 403 an audio-only offer (observed on a 1760/16) and
@@ -378,6 +389,7 @@ static LinphoneCall *place_call(LinphoneCore *lc, const char *out_uri, const cha
   }
   g_call_is_ring = 0;
   g_call_is_camera = camera;
+  g_swap_until_ms = 0;
   g_streams = 0;
   g_ended = 0;
   g_audio_opened = 0;
@@ -444,6 +456,7 @@ static void bye_call(LinphoneCore *lc) {
   g_streams = 0;
   g_ended = 0; /* consume: place_call sets it fresh for the next call */
   g_audio_opened = 0;
+  g_swap_until_ms = 0;
   /* A camera switch re-dial and a camera call pending after an audio-only one keep the camera on and
    * its targets: the next call carries the picture. The pending one waits the re-dial pause from
    * here: the station declines a call placed right after the last one ended. */
@@ -664,13 +677,18 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
       if (n < 0) break;                     /* EAGAIN: nothing more right now */
       if (c == 'W') {
         /* Pre-warm (doorbell ring): open the call NOW, no tone, so the unlock press moments later
-         * rides an already-established call (instant). Hold it for prewarm_hold; if no tone comes,
-         * the idle check below releases the bus. */
+         * rides an already-established call (instant). With video on it is the camera call, as the app
+         * opens its camera screen before the slider and the next arrow are usable: "next camera" then
+         * switches it with nobody watching. Its audio stays closed like the app's (a '4' would make
+         * the station ignore the '3'). Hold it for prewarm_hold; if no tone comes, the idle check
+         * below releases the bus. */
         warm_deadline = now + prewarm_hold;
         if (!g_call && !g_redial_req && !g_redialing) {
-          if (place_call(lc, out_uri, NULL, 0)) {
+          if (place_call(lc, out_uri, NULL, prewarm_camera())) {
             call_placed_at = now;
-            slog("[station] pre-warm: opening call (hold %llds)\n", prewarm_hold / 1000);
+            g_audio_want = 0;
+            slog("[station] pre-warm: opening %s (hold %llds)\n",
+                 prewarm_camera() ? "the camera call" : "call", prewarm_hold / 1000);
           }
         } else slog("[station] pre-warm: a call is already up\n");
         continue;
@@ -722,6 +740,12 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
           slog("RESULT N fail (no call up)\n");
           continue;
         }
+        if (g_audio_opened && (g_talk_active || g_talk_waiting || !g_cam_on)) {
+          /* The open audio means a switch has to re-dial (see g_cam_pos), which here would cut an
+           * announcement, or place a camera call for a picture nobody asked for. */
+          slog("RESULT N fail (the audio is open on this call and no picture is up)\n");
+          continue;
+        }
         g_n_waiting++;
         if (g_redial_req || g_redialing || g_switching) {
           /* A switch is already under way: one more position on top of it. */
@@ -731,9 +755,18 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
           continue;
         }
         if (!g_audio_opened) {
-          if (g_streams) {
+          if (g_streams && now < g_swap_until_ms) {
+            /* Inside the app's swap pause after the previous '3': this one goes out when it ends
+             * (the switch loop below), as the app's next arrow comes back only then. */
+            g_switching = 1;
+            g_switch_left = 1;
+            g_switch_next_ms = g_swap_until_ms;
+            slog("[station] next camera requested during the swap pause -> '3' in %lld ms\n",
+                 g_swap_until_ms - now);
+          } else if (g_streams) {
             LinphoneStatus st = linphone_call_send_dtmf(g_call, '3');
             g_cam_pos = (g_cam_pos + 1) % cam_cycle();
+            g_swap_until_ms = now + swap_debounce_ms();
             slog("[station] next-camera DTMF '3' sent on the live call (SIP INFO) -> %s\n",
                  st == 0 ? "ok" : "FAILED");
             answer_switches(st == 0 ? "ok" : "fail", st == 0 ? NULL : "DTMF not sent");
@@ -756,10 +789,13 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
         continue;
       }
       if (c != '1' && c != '2') continue;
-      if (g_call && g_streams && !g_switching) {
+      if (g_call && g_streams && !g_switching && now >= g_swap_until_ms) {
         send_tone(c, &last_activity, now); /* call up -> instant */
       } else {
-        if (qn < (int)sizeof queue) queue[qn++] = c; /* queue until media */
+        /* Queued until media, the end of a switch, or the end of the swap pause after a '3'. */
+        if (qn < (int)sizeof queue) queue[qn++] = c;
+        if (g_call && g_streams && now < g_swap_until_ms)
+          slog("[station] '%c' during the swap pause -> sent in %lld ms\n", c, g_swap_until_ms - now);
         /* A re-dial in flight counts as a call coming: the re-placed call carries the tone. */
         if (!g_call && !g_redial_req && !g_redialing) {
           if (place_call(lc, out_uri, c == '1' ? "door" : "gate", 0)) call_placed_at = now;
@@ -798,12 +834,15 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
 
     /* Call reached media -> the '3's of a switch, then the audio and the queued tones. */
     if (g_call && g_streams && g_switching && now >= g_switch_next_ms) {
-      if (g_switch_left > 0) {
+      if (g_switch_left > 0 && now < g_swap_until_ms) {
+        g_switch_next_ms = g_swap_until_ms; /* the previous '3''s swap pause first */
+      } else if (g_switch_left > 0) {
         LinphoneStatus st = linphone_call_send_dtmf(g_call, '3');
         slog("[station] next-camera DTMF '3' sent (SIP INFO) -> %s (%d left)\n",
              st == 0 ? "ok" : "FAILED", g_switch_left - 1);
         g_switch_left--;
         g_cam_pos = (g_cam_pos + 1) % cam_cycle();
+        g_swap_until_ms = now + swap_debounce_ms();
         g_switch_next_ms = now + switch_gap_ms();
       } else {
         g_switching = 0;
@@ -815,7 +854,7 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
     }
     if (g_call && g_streams && !g_switching) {
       if (g_audio_want && !g_audio_opened) open_audio_now(g_call, g_talk_waiting || g_talk_active);
-      if (qn > 0) {
+      if (qn > 0 && now >= g_swap_until_ms) {
         for (int i = 0; i < qn; i++) send_tone(queue[i], &last_activity, now);
         qn = 0;
       }
@@ -944,7 +983,7 @@ static void command_loop(LinphoneCore *lc, const char *out_uri, long long keepal
      * tone yet (last_activity stays 0), so require both the keep-alive idle AND the warm window past.
      * A watched camera keeps its call up; a camera call waiting for its first picture too. */
     const int cam_pending_picture = g_cam_on && g_call_is_camera && !g_cam_live;
-    if (g_call && g_streams && !g_talk_active && !cam_watched && !cam_pending_picture &&
+    if (g_call && g_streams && !g_talk_active && !cam_watched && !cam_pending_picture && qn == 0 &&
         now - last_activity > keepalive_ms && now > warm_deadline && now > talk_deadline) {
       slog("[station] keep-alive idle -> hanging up\n");
       bye_call(lc);
@@ -961,9 +1000,11 @@ int main(int argc, char **argv) {
             "    '1' / '2'  open the door / gate: a tone on the station call (placed if none is up);\n"
             "               answered with 'RESULT <d> ok|fail' on stdout, in the order received\n"
             "    'N'        next camera: '3' on the live call (or a re-dial when its audio is open);\n"
-            "               answered with 'RESULT N ok|fail'\n"
+            "               answered with 'RESULT N ok|fail'. After each '3' the app's swap pause\n"
+            "               (STATION_SWAP_DEBOUNCE_MS, 3000) holds door/gate tones and further '3's\n"
             "    'A'        open the station's audio ('4') on the call, once its media runs\n"
-            "    'W'        pre-warm: open the call now, no tone (held STATION_PREWARM_HOLD_MS)\n"
+            "    'W'        pre-warm: open the call now, no tone (held STATION_PREWARM_HOLD_MS); with\n"
+            "               STATION_VIDEO=1 it is the camera call, audio closed, so 'N' can switch it\n"
             "    'H'        release: hang up the call now (and stop the camera)\n"
             "    'T'        announcement: hold a call for a clip read from STATION_AUDIO_IN (s16le 8 kHz\n"
             "               mono PCM); STATION_TALK_DTMF = open-audio digit to send first (empty = none),\n"

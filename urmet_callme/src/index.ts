@@ -8,6 +8,7 @@ import { Go2rtcPorts } from "./go2rtc.js";
 import { startIngressServer } from "./ingress.js";
 import { logger, setLevel } from "./logger.js";
 import { MqttBridge } from "./mqtt.js";
+import { twoVoiceDoorRequests, twoVoiceGroupOf } from "./place.js";
 import { TwoVoiceDoor, TwoVoiceStation } from "./twoVoiceStation.js";
 import { VideoService } from "./video.js";
 
@@ -170,6 +171,38 @@ async function main() {
   }
   if (ipercomPlaces.length && !doors.length && lastError) throw lastError;
 
+  // 2Voice entrances, the app's way: a 1760 station on new enough firmware lists its entrances
+  // (`residentDoors`) and opens each with `open_door_req`, with no call and no camera switching, so
+  // a second gate gets its own button. Only where the app does it (place.ts twoVoiceDoorRequests);
+  // every other 2Voice place keeps the in-call door/gate tones, which stay published here too (the
+  // app offers both: the doors list, and the slider on a call). A station that does not answer is
+  // logged and keeps the tones only.
+  for (const place of twoVoicePlaces) {
+    if (!twoVoiceGroupOf(place.uidType) || !place.outgoingUser) continue;
+    try {
+      const fw = await callme.twoVoiceFirmware(place.id);
+      if (!twoVoiceDoorRequests(place.uidType, fw)) {
+        log.info(
+          `2Voice place ${place.id} (${place.name}): firmware ${fw || "(not reported)"} has no door ` +
+            "requests (the app opens it in-call too); door/gate stay the in-call tones",
+        );
+        continue;
+      }
+      const found = await callme.listDoors(place.id);
+      doors.push(...found);
+      log.info(
+        `2Voice place ${place.id} (${place.name}), firmware ${fw}: ${found.length} entrance(s) ` +
+          "opened by message: " +
+          found.map((d) => `${d.doorId}:${d.name}(door=${d.hasDoor},gate=${d.hasGate})`).join(", "),
+      );
+    } catch (e) {
+      log.warn(
+        `2Voice place ${place.id} (${place.name}): entrance discovery failed (${(e as Error).message}); ` +
+          "door/gate stay the in-call tones",
+      );
+    }
+  }
+
   // 2Voice doorbells: a doorbell `event` entity per 2Voice place (its ring arrives on the channel
   // account with the OUT/calling-station username in the From). Independent of 2Voice door-open.
   const twoVoiceDoorbells = twoVoicePlaces.map((p) => ({
@@ -197,6 +230,8 @@ async function main() {
       prewarmHoldMs: cfg.door2voicePrewarmHoldMs,
       talkDtmf: cfg.announceOpenAudio ? "4" : "",
       audioAtStart: cfg.video2voiceAudio,
+      // 2Voice video runs only on an account without Ipercom places (they share go2rtc; see below).
+      video: cfg.video && !ipercomPlaces.length,
     });
     log.info(
       `2Voice announcements enabled: TTS engine ${cfg.announceTtsEngine ?? "(first found)"}` +

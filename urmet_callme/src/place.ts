@@ -18,6 +18,41 @@ export function familyOf(uidType: string): Family {
   return "unknown";
 }
 
+/** The official app's firmware compare (`Utils.compareVersions`): split on every non-digit and
+ *  compare the numbers left to right, a missing part counting as 0 ("1.5.0-13" vs "1.5.0_13" are
+ *  equal). An empty part (a leading or doubled separator) counts as 0 too, where the app would throw. */
+export function compareVersions(a: string, b: string): number {
+  const pa = a.split(/[^0-9]/);
+  const pb = b.split(/[^0-9]/);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = parseInt(pa[i] ?? "", 10) || 0;
+    const y = parseInt(pb[i] ?? "", 10) || 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+/** The app's 2Voice place group for a 1760 `uid_type` (`IPlace.Model.getGroup`): the two 1760
+ *  families have different firmware lines, so the door-request threshold differs. Other 2Voice
+ *  models (1083/83, the phase-B call-forwarding devices) have no door requests in the app. */
+export function twoVoiceGroupOf(uidType: string): "1760_16" | "1760_31" | undefined {
+  const u = (uidType || "").toUpperCase().replace(/\s+/g, "").replace(/_/g, "/");
+  if (["1760/15", "1760/16", "1760/15U", "1760/16U", "1760/941", "1760/18", "1760/19"].includes(u))
+    return "1760_16";
+  if (["1760/31", "1760/33", "1760/31U", "1760/33U", "1760/32"].includes(u)) return "1760_31";
+  return undefined;
+}
+
+/** Whether the app lists a 1760 station's entrances (`residentDoors`) and opens them with
+ *  `open_door_req`, without a call: `SUPPORTS_DOORS_REQUESTS` from
+ *  `IPlace.Group.getAdditionalCapabilities`, firmware >= 1.5.0-13 (1760/16 group) or >= 5.0.0-4
+ *  (1760/31 group), the version read with `get_fw_upgrade_status_req`. */
+export function twoVoiceDoorRequests(uidType: string, fwVersion: string): boolean {
+  const group = twoVoiceGroupOf(uidType);
+  if (!group || !fwVersion) return false;
+  return compareVersions(fwVersion, group === "1760_16" ? "1.5.0-13" : "5.0.0-4") >= 0;
+}
+
 /** The station's MAC in `mac`-header form (colons), when its account IS a MAC. Those are the "phase B"
  *  devices (the 1083/58A family): the cloud does not list them, the app builds their account from the
  *  MAC it learns at introduction, and it dials them with a `mac` header instead of `auto_insertion:

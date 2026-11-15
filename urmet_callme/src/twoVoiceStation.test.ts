@@ -10,6 +10,7 @@ import {
   HelperTiming,
   talkFifoOf,
   TwoVoiceStation,
+  TwoVoiceStationOptions,
 } from "./twoVoiceStation.js";
 
 /** A stand-in for the station helper process: records what the service writes to its stdin and
@@ -84,7 +85,7 @@ function place(over: Partial<PlaceData> = {}): Place {
   );
 }
 
-function service(p: Place, timing: Partial<HelperTiming> = {}) {
+function service(p: Place, timing: Partial<HelperTiming> = {}, opts: Partial<TwoVoiceStationOptions> = {}) {
   const procs = new FakeProcs();
   const svc = new TwoVoiceStation([p], REALM, {
     keepaliveMs: 4000,
@@ -93,6 +94,7 @@ function service(p: Place, timing: Partial<HelperTiming> = {}) {
     audioAtStart: false,
     timing: { respawnMs: 10, restartExitMs: 20, cameraReplyMs: 50, openTimeoutMs: 200, switchTimeoutMs: 200, ...timing },
     procs,
+    ...opts,
   });
   return { svc, procs };
 }
@@ -113,6 +115,16 @@ test("start() spawns one helper per place with the channel account, the station 
   assert.equal(c.env.STATION_MAC, "00:1E:E0:03:38:F8");
   assert.equal(c.env.STATION_AUDIO_IN, talkFifoOf(p.id));
   assert.ok(procs.fifos.includes(talkFifoOf(p.id)), "the announcement FIFO is (re)created");
+});
+
+test("video on: the helper gets STATION_VIDEO, so its pre-warm is the camera call", () => {
+  const p = place();
+  const off = service(p);
+  off.svc.start();
+  assert.equal(off.procs.spawns[0].env.STATION_VIDEO, undefined, "video off: the pre-warm is unchanged");
+  const on = service(p, {}, { video: true });
+  on.svc.start();
+  assert.equal(on.procs.spawns[0].env.STATION_VIDEO, "1");
 });
 
 test("a place without a station gets no helper until placesRefreshed() or stationLearned() sees one", () => {
@@ -241,23 +253,27 @@ test("a restart fails the commands queued on the old helper instead of leaving t
   await assert.rejects(pending, /restarting/);
 });
 
-test("CAMERA lines drive the camera flag; next camera is a no-op without a picture", async () => {
+test("CAMERA lines drive the camera flag; next camera goes to the helper with or without a viewer", async () => {
   const p = place();
   const { svc, procs } = service(p);
   svc.start();
   const c = procs.spawns[0];
 
-  assert.equal(await svc.nextCamera(p.id), false);
-  assert.equal(c.cmds, "", "no 'N' goes out while nothing is being watched");
+  // Nobody watching: the helper decides (a "ready" call can be switched; no call at all cannot).
+  const unwatched = svc.nextCamera(p.id);
+  await flush();
+  assert.equal(c.cmds, "N\n", "the switch goes out although no picture is being fed");
+  c.say("RESULT N fail (no call up)");
+  assert.equal(await unwatched, false, "the helper's fail is the answer");
   assert.equal(svc.hangup(p.id), false, "hang-up reports no picture was up");
-  assert.equal(c.cmds, "H\n");
+  assert.equal(c.cmds, "N\nH\n");
 
   c.say("CAMERA ok");
   await flush();
   assert.equal(svc.hasCall(p.id), true);
   const switched = svc.nextCamera(p.id);
   await flush();
-  assert.equal(c.cmds, "H\nN\n");
+  assert.equal(c.cmds, "N\nH\nN\n");
   c.say("RESULT N ok");
   assert.equal(await switched, true);
 

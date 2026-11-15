@@ -97,6 +97,35 @@ test("routes a press to the right relay and ignores unknown topics", async () =>
   assert.deepEqual(opened, [[7, "gate", "dev-1"]]);
 });
 
+test("a 2Voice station's listed entrances get message-opened buttons on the place device, no extra doorbell", async () => {
+  const fake = new FakeMqtt();
+  const opened: unknown[][] = [];
+  const callme = {
+    places: [{ id: "p2", name: "Garden", family: "twovoice" }],
+    open: async (...args: unknown[]) => void opened.push(args),
+  } as unknown as CallMe;
+  const b = new MqttBridge("mqtt://fake", { connect: () => fake }, callme);
+  await b.start(
+    [{ placeId: "p2", doorId: 3, name: "Back gate", hasDoor: false, hasGate: true, topology: "0.1" }],
+    [],
+    [{ placeId: "p2", name: "Garden", station: "out-user" }],
+  );
+  const gate = fake.config("button", "urmet_p2_3_gate")!;
+  assert.equal(gate.name, "Back gate gate");
+  assert.deepEqual(gate.device, {
+    identifiers: ["urmet_p2"],
+    name: "Urmet Garden",
+    manufacturer: "Urmet",
+    model: "CallMe / 2Voice",
+  });
+  assert.equal(fake.config("button", "urmet_p2_3_door"), undefined, "no door_name, no door button");
+  assert.equal(fake.config("event", "urmet_p2_3_doorbell"), undefined, "the station-keyed doorbell is the place's");
+  assert.ok(fake.config("event", "urmet_p2_2voice_doorbell"));
+  fake.message("urmet/callme/urmet_p2_3_gate/set", "OPEN");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(opened, [[3, "gate", "p2"]]);
+});
+
 test("2Voice places get door, gate, ready buttons and a doorbell keyed on the station", async () => {
   const fake = new FakeMqtt();
   const calls: string[] = [];

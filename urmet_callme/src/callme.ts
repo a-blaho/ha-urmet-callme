@@ -157,12 +157,16 @@ export class CallMe {
     return p;
   }
 
-  // ---- IPERCOM gateway protocol, by place id (ipercom.ts) ----
+  // ---- IPERCOM gateway protocol, by place id (ipercom.ts); the door requests also serve the 1760
+  // 2Voice stations that support them ----
   resolveGateway(placeId?: string, force = false): Promise<string> {
     return this.gateway.resolveGateway(this.place(placeId), force);
   }
   listDoors(placeId?: string): Promise<Door[]> {
     return this.gateway.listDoors(this.place(placeId));
+  }
+  twoVoiceFirmware(placeId?: string): Promise<string> {
+    return this.gateway.twoVoiceFirmware(this.place(placeId));
   }
   listDevices(placeId?: string): Promise<AvailableDevice[]> {
     return this.gateway.listDevices(this.place(placeId));

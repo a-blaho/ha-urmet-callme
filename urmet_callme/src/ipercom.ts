@@ -3,6 +3,10 @@
 // OUTGOING account, then ask the gateway for its entrances (`residentDoors`), its cameras
 // (`get_available_devices_req`), to open a door (`open_door_req`) or to have a camera call us back
 // (`call_device_req` / `cancel_call_req`). Replies are separate inbound MESSAGEs correlated by body id.
+// A 1760 2Voice station on new enough firmware speaks the same door requests (the app's doors list:
+// `residentDoors` + `open_door_req`), addressed to its OUTGOING account directly - the app resolves a
+// gateway only for Ipercom (`CallMeCommand.Kind.getDestination`) - after `get_fw_upgrade_status_req`
+// tells the firmware version (place.ts twoVoiceDoorRequests).
 import { logger } from "./logger.js";
 import { Place } from "./place.js";
 import { buildBody, randId } from "./query.js";
@@ -113,8 +117,23 @@ export class IpercomGateway {
     return gw;
   }
 
+  /** Where a place's door requests go: the resolved gateway (Ipercom), or the station's OUTGOING
+   *  account itself (2Voice). */
+  private doorTarget(place: Place, force = false): Promise<string> {
+    return place.family === "twovoice"
+      ? Promise.resolve(place.outgoingUri)
+      : this.resolveGateway(place, force);
+  }
+
+  /** A 2Voice station's firmware version (`get_fw_upgrade_status_req` to its OUTGOING account, as
+   *  the app's BrokerInfoQuery does for the 1760 groups); "" when the reply carries none. */
+  async twoVoiceFirmware(place: Place): Promise<string> {
+    const reply = await this.query(place.outgoingUri, "get_fw_upgrade_status_req", place);
+    return typeof reply?.fw_version === "string" ? reply.fw_version : "";
+  }
+
   async listDoors(place: Place): Promise<Door[]> {
-    const gw = await this.resolveGateway(place);
+    const gw = await this.doorTarget(place);
     const reply = await this.query(gw, "configuration_read_req", place, {
       data: { request: [{ id: randId(), type: "residentDoors" }] },
     });
@@ -185,25 +204,26 @@ export class IpercomGateway {
     return status;
   }
 
-  /** Open a door/gate. Retries once with a fresh gateway. */
+  /** Open a door/gate. Retries once with a fresh gateway (Ipercom; a 2Voice station has no gateway
+   *  to re-resolve, so it gets one plain retry). */
   async open(
     doorId: number,
     doorType: "door" | "gate",
     place: Place,
     retry = true,
   ): Promise<any> {
-    let gw = await this.resolveGateway(place);
+    let gw = await this.doorTarget(place);
     let reply: any;
     try {
       reply = await this.query(gw, "open_door_req", place, { door_id: doorId, door_type: doorType });
     } catch (e) {
       if (!retry) throw e;
-      gw = await this.resolveGateway(place, true);
+      gw = await this.doorTarget(place, true);
       reply = await this.query(gw, "open_door_req", place, { door_id: doorId, door_type: doorType });
     }
     if (reply?.result !== 0) {
       if (retry) {
-        await this.resolveGateway(place, true);
+        await this.doorTarget(place, true);
         return this.open(doorId, doorType, place, false);
       }
       throw new Error(`open failed: ${JSON.stringify(reply)}`);
