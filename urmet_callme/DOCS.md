@@ -22,7 +22,16 @@ Your entrances appear automatically as `button` entities (one per door/gate, nam
 
 ### Doorbell (event entity)
 
-Each entrance/panel gets its own **doorbell `event` entity** (`device_class: doorbell`, named from your own devices - one _"… doorbell"_ per entrance) that fires a **`ring`** event when **that** panel rings - routed to the correct door by its topological code, so an automation can open the matching camera. The event's attributes include `caller`, `topological_code`, and `matched`. Each ring is recorded in the HA logbook; automations trigger on the event.
+Each entrance/panel gets its own **doorbell `event` entity** (`device_class: doorbell`, named from your own devices - one _"… doorbell"_ per entrance) that fires a **`ring`** event when **that** panel rings - routed to the correct door by its topological code, so an automation can open the matching camera. The event's attributes include `caller`, `topological_code`, and `matched`. When the ring carries a `Subject` header, the event also has `caller_id` and `caller_type`, the calling device as the intercom names it. On a 2Voice station every ring comes from the indoor station, so its one doorbell fires for all entrance panels; `caller_id` is what tells them apart (for example `mcp` and `mcs` on a two-panel 1760/16). The add-on logs the id with each ring (`DOORBELL RING … [callingstation_caller mcs]`), so ring each panel once to learn its id, then condition on it:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: event.casa_doorbell
+conditions:
+  - condition: template
+    value_template: "{{ trigger.to_state.attributes.caller_id == 'mcp' }}"
+``` Each ring is recorded in the HA logbook; automations trigger on the event.
 
 **Important - this only works when your indoor monitor is set to "remote".** The panel forwards the ring to the CallMe account only in remote mode; in home mode it rings locally and nothing reaches the add-on (or the app). Set the monitor to remote for HA to receive doorbell rings.
 

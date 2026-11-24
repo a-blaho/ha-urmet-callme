@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.0
+
+- **Doorbell: which panel rang.** The `ring` event now carries `caller_id` and `caller_type` from the
+  ring's `Subject` header when it has one. A 2Voice station's rings all come from the indoor station,
+  so this is what tells its entrance panels apart (`mcp` / `mcs` on a two-panel 1760/16). Existing
+  attributes and entity ids are unchanged.
+
 ## 1.4.0
 
 Opening a second entrance on 2Voice, the way the official app does it
@@ -22,7 +29,6 @@ Opening a second entrance on 2Voice, the way the official app does it
 - **2Voice: "next camera" refuses to cut an announcement.** During an announcement, or with the sound
   open on a call that shows no picture, a switch would have re-dialled and cut the call. It now fails
   with a log line instead.
-
 
 - **Ipercom: announcements ([#24](https://github.com/a-blaho/ha-urmet-callme/issues/24)).** With
   `video: true`, each Ipercom camera gets a **"… announce"** `notify` entity that speaks a TTS message
@@ -99,7 +105,7 @@ Opening a second entrance on 2Voice, the way the official app does it
   camera sound option also applies when the camera joins a call that is already up; a camera asked
   for during an announcement keeps its targets until its own call comes up.
 - **Readable logs with video on.** The media helper's per-second audio level line (`[atap] audio
-  ~1s: …`) now prints only at `log_level: debug`; it used to run at every level for the whole call.
+~1s: …`) now prints only at `log_level: debug`; it used to run at every level for the whole call.
   `debug` no longer dumps liblinphone's full trace, which at ~100 lines a second pushed the add-on's
   own lines out of the Supervisor log window in under a minute: it logs liblinphone's warnings
   instead, and the full trace is a developer switch (`RECV_TRACE` / `STATION_TRACE`).
@@ -214,7 +220,7 @@ Opening a second entrance on 2Voice, the way the official app does it
 - **Door and gate work while the camera is open (2Voice).** On 2Voice the camera and the door are
   the same call: the station carries its video on the `auto_insertion` call the door tone is sent
   on, and the official app unlocks by sending the tone on the call it is viewing. The add-on used to
-  place a *second* call to the station for a press while the camera call was up, and the two could
+  place a _second_ call to the station for a press while the camera call was up, and the two could
   only collide there. A door/gate press now goes out as a tone on the live camera call when one is up
   (a press during call setup is queued until the media runs) and falls back to the door helper's own
   call when no camera call is up. In the other direction, a camera about to call first releases a
@@ -289,12 +295,12 @@ Opening a second entrance on 2Voice, the way the official app does it
   deep by default. That was too shallow here: a few seconds in, the demux thread stopped draining
   the media helper's audio FIFO, so every decoded buffer was refused with EAGAIN and dropped. The
   panel's audio was arriving and being decoded correctly the whole time and simply thrown away,
-  which is why the picture kept updating while the sound died, and why the stream still *looks*
+  which is why the picture kept updating while the sound died, and why the stream still _looks_
   healthy: the resampler fills the gap with silence. Both inputs now get a 512-packet queue.
   Measured on a real panel: audio used to stop for good after about 9.5 s, and now streams cleanly
   for about 50 s, after which any drop recovers instead of sticking. ffmpeg diagnosed this itself
   once its output was visible: `Thread message queue blocking; consider raising the
-  thread_queue_size option (current value: 8)`.
+thread_queue_size option (current value: 8)`.
 - **The camera stream no longer uses the removed `-vsync` option.** It had been there since the
   first release and worked only because the image's ffmpeg (6.1) still tolerates the deprecated
   spelling. On ffmpeg 7 or newer the option is gone and the producer dies instantly with
@@ -330,8 +336,8 @@ Opening a second entrance on 2Voice, the way the official app does it
 
 - **2Voice camera audio** (the "video works but the sound is silence" report on 2Voice stations).
   Two things were unlike the official app's camera call: the add-on offered audio recvonly, which
-  the station answered with sendonly (liblinphone then reported *PausedByRemote* right after
-  *Connected*) and never sent audio for, and the station keeps its microphone closed until the
+  the station answered with sendonly (liblinphone then reported _PausedByRemote_ right after
+  _Connected_) and never sent audio for, and the station keeps its microphone closed until the
   viewer "opens the audio", which the app does by sending an in-call DTMF `4` (`1`/`2` are door
   and gate, `3` the next camera). The camera call now offers audio sendrecv like the app and sends
   the open-audio digit once the streams are running. Ipercom panels were never affected. This
@@ -363,7 +369,7 @@ Opening a second entrance on 2Voice, the way the official app does it
 - Switch timing is logged at `info` (BYE round-trip, re-call gap, time to media) for diagnosis.
 - **Earlier picture on a cold open / switch.** The media helper's black priming stream (which lets
   ffmpeg and go2rtc set up the track before the panel's first keyframe) could not start until the
-  panel's first packet arrived, which *is* the keyframe, so it bought ~30 ms. The tap now runs as a
+  panel's first packet arrived, which _is_ the keyframe, so it bought ~30 ms. The tap now runs as a
   pump filter and primes from the moment the call's media starts, ~2 s earlier.
 - **Withheld INVITE is retried once.** When the panel does not send the camera call within 8 s
   (typically the Urmet app briefly holding that camera), the add-on cancels the ringing attempt and
@@ -397,7 +403,7 @@ Opening a second entrance on 2Voice, the way the official app does it
 
 - **Stable SIP instance id for the liblinphone helpers** - liblinphone was inventing a new
   `+sip.instance` UUID on every start (its config lives in `/tmp` and is wiped with the container),
-  so each restart *added* a registrar binding instead of replacing ours. Dead contacts lingered for
+  so each restart _added_ a registrar binding instead of replacing ours. Dead contacts lingered for
   the full expiry and Flexisip forked incoming calls to all of them. Both the 2Voice door helper
   (`opendoor`) and, with video on, the media receiver (`recv`) now get a deterministic UUID derived
   from the account, like the Node SIP client already does - and the two use distinct ids so the door

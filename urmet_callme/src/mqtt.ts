@@ -446,6 +446,10 @@ export class MqttBridge {
       caller: ring.caller,
       topological_code: topo,
       matched: matched.length > 0,
+      // Which device rang, from the INVITE's Subject (e.g. "mcp" / "mcs" for the two entrance panels
+      // of a 2Voice station, whose rings all come From the indoor station). Only when present.
+      ...(ring.callerId ? { caller_id: ring.callerId } : {}),
+      ...(ring.callerType ? { caller_type: ring.callerType } : {}),
     });
     for (const t of targets)
       this.client.publish(`urmet/callme/${t.uid}/event`, payload);

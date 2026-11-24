@@ -35,6 +35,29 @@ export function callerName(from: string): string {
   return name ? `${name} (${uri})` : uri;
 }
 
+/** The calling device from an INVITE's `Subject` header (compact form `s`), a JSON object such as
+ *  `{"type":"standard_call","from":{"type":"callingstation_caller","id":"mcp"},"to":{...}}`. A 2Voice
+ *  ring always comes From the indoor station, so `from.id` is what tells its entrance panels apart
+ *  (observed: `mcp` / `mcs` on a two-panel 1760/16). The official app reads `from.alias` and
+ *  `from.type` (SubjectHeader / HeaderDeviceInfo); `id` is the same object's third field. Returns {}
+ *  when the header is absent or not that JSON. */
+export function subjectCaller(headers: Record<string, string>): {
+  id?: string;
+  type?: string;
+  alias?: string;
+} {
+  const raw = headers["subject"] ?? headers["s"];
+  if (!raw) return {};
+  try {
+    const from = (JSON.parse(raw) as { from?: Record<string, unknown> } | null)?.from;
+    if (!from || typeof from !== "object") return {};
+    const str = (v: unknown) => (typeof v === "string" && v ? v : undefined);
+    return { id: str(from.id), type: str(from.type), alias: str(from.alias) };
+  } catch {
+    return {};
+  }
+}
+
 /** User part of a SIP header's URI: `"Panel" <sip:abc@host>` -> `abc`. On a panel's INVITE this is
  *  the calling station's account - the 2Voice door-open target. */
 export function uriUser(header: string): string {

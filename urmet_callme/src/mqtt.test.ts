@@ -202,6 +202,29 @@ test("ringDoorbell fires the matching entrance, else every doorbell of the place
   assert.equal(events()[0][1].matched, false);
 });
 
+test("ringDoorbell adds the Subject's caller id and type when the ring carries them", async () => {
+  const fake = new FakeMqtt();
+  const { b } = bridge(fake);
+  await b.start([], [], [{ placeId: "dev-1", name: "Casa", station: "st" }]);
+  const ring = () => {
+    const p = fake.published.filter((x) => x.topic.endsWith("/event") && x.payload).pop()!;
+    return [p.topic, JSON.parse(p.payload)];
+  };
+  b.ringDoorbell({
+    placeId: "dev-1",
+    from: '"Casa" <sip:st@sip.urmet.com>',
+    caller: "Casa",
+    callerId: "mcs",
+    callerType: "callingstation_caller",
+  });
+  const [topic, ev] = ring();
+  assert.equal(topic, "urmet/callme/urmet_dev_1_2voice_doorbell/event");
+  assert.equal(ev.caller_id, "mcs");
+  assert.equal(ev.caller_type, "callingstation_caller");
+  b.ringDoorbell({ placeId: "dev-1", from: '"Casa" <sip:st@sip.urmet.com>', caller: "Casa" });
+  assert.ok(!("caller_id" in ring()[1]), "no Subject, no extra attributes");
+});
+
 test("stop publishes a retained offline before disconnecting", async () => {
   const fake = new FakeMqtt();
   const { b } = bridge(fake);

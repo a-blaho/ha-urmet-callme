@@ -1,8 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { callerName, SipClient, SipSocket, uriUser } from "./sipClient.js";
+import { callerName, SipClient, SipSocket, subjectCaller, uriUser } from "./sipClient.js";
 import { stableUuid } from "./util.js";
+
+test("subjectCaller reads the calling device from the Subject header", () => {
+  const subj = (from: object) =>
+    JSON.stringify({ type: "standard_call", from, to: { type: "mobile" } });
+  assert.deepEqual(subjectCaller({ subject: subj({ type: "callingstation_caller", id: "mcp" }) }), {
+    id: "mcp",
+    type: "callingstation_caller",
+    alias: undefined,
+  });
+  assert.equal(subjectCaller({ s: subj({ id: "mcs" }) }).id, "mcs", "compact header form");
+  assert.equal(subjectCaller({ subject: subj({ id: "" }) }).id, undefined, "empty id is no id");
+  assert.equal(subjectCaller({ subject: subj({ alias: "Gate" }) }).alias, "Gate");
+  assert.deepEqual(subjectCaller({}), {});
+  assert.deepEqual(subjectCaller({ subject: "Doorbell" }), {}, "not JSON");
+  assert.deepEqual(subjectCaller({ subject: "null" }), {});
+  assert.deepEqual(subjectCaller({ subject: '{"from":"x"}' }), {});
+});
 
 test("callerName formats display name + uri", () => {
   assert.equal(

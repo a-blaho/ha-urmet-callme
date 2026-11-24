@@ -5,7 +5,7 @@
 // handled by StationDiscovery, not here.
 import { logger } from "./logger.js";
 import { Place } from "./place.js";
-import { callerName, SipClient } from "./sipClient.js";
+import { callerName, SipClient, subjectCaller } from "./sipClient.js";
 
 const log = logger("doorbell");
 
@@ -13,6 +13,10 @@ export interface DoorbellRing {
   placeId: string;
   from: string; // raw From header of the panel's INVITE
   caller: string; // human-readable caller (name/uri)
+  // The calling device from the INVITE's Subject header (see subjectCaller): on a 2Voice station with
+  // several entrance panels, `callerId` is what tells them apart. Absent when the header is.
+  callerId?: string;
+  callerType?: string;
 }
 
 export class DoorbellListeners {
@@ -29,9 +33,12 @@ export class DoorbellListeners {
     sip.onInvite = ({ headers, callId }) => {
       const from = headers["from"] || "";
       const caller = callerName(from);
-      log.info(`DOORBELL RING on place ${place.id}: ${caller} (call ${callId})`);
+      const subj = subjectCaller(headers);
+      log.info(
+        `DOORBELL RING on place ${place.id}: ${caller}${subj.id ? ` [${subj.type ?? "?"} ${subj.id}]` : ""} (call ${callId})`,
+      );
       try {
-        this.onRing({ placeId: place.id, from, caller });
+        this.onRing({ placeId: place.id, from, caller, callerId: subj.id, callerType: subj.type });
       } catch (e) {
         log.error(`doorbell handler error: ${(e as Error).message}`);
       }

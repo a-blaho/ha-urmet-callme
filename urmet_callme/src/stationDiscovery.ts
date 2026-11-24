@@ -11,7 +11,7 @@ import { DoorbellRing } from "./doorbell.js";
 import { logger } from "./logger.js";
 import { macHeaderOf, Place } from "./place.js";
 import { buildBody } from "./query.js";
-import { callerName, SipClient, uriUser } from "./sipClient.js";
+import { callerName, SipClient, subjectCaller, uriUser } from "./sipClient.js";
 import { loadStation, saveStation } from "./station.js";
 
 const log = logger("station");
@@ -90,10 +90,13 @@ export class StationDiscovery {
       sip.onInvite = ({ headers, callId }) => {
         const from = headers["from"] || "";
         const caller = callerName(from);
-        log.info(`DOORBELL RING on the instance account (place ${place.id}): ${caller} (call ${callId})`);
+        const subj = subjectCaller(headers);
+        log.info(
+          `DOORBELL RING on the instance account (place ${place.id}): ${caller}${subj.id ? ` [${subj.type ?? "?"} ${subj.id}]` : ""} (call ${callId})`,
+        );
         this.setStation(place, uriUser(from), "ring");
         try {
-          onRing({ placeId: place.id, from, caller });
+          onRing({ placeId: place.id, from, caller, callerId: subj.id, callerType: subj.type });
         } catch (e) {
           log.error(`doorbell handler error: ${(e as Error).message}`);
         }
